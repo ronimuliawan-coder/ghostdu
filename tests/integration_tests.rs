@@ -190,6 +190,21 @@ fn test_app_state_and_navigation() {
     assert_eq!(app.pending_action, Some(ghostdu::ui::ConfirmAction::PermanentDelete));
     app.cancel_modal();
     assert_eq!(app.active_view, ghostdu::ui::ActiveView::Filesystem);
+
+    // Test page down / up and bounds
+    app.cursor_to_end();
+    assert_eq!(app.cursor_index, 1);
+    app.cursor_to_start();
+    assert_eq!(app.cursor_index, 0);
+    app.page_down(10);
+    assert_eq!(app.cursor_index, 1);
+    app.page_up(10);
+    assert_eq!(app.cursor_index, 0);
+
+    // Test parent ascension when at root of scan
+    let parent = app.go_up();
+    assert!(parent.is_some());
+    assert_eq!(parent.unwrap(), base.parent().unwrap());
 }
 
 // Minimal exposure for integration testing

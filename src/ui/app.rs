@@ -4,6 +4,7 @@ use crate::ghost::{
     DockerDiskInfo,
 };
 use crate::ops::{move_to_trash, permanently_delete};
+use std::cell::Cell;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
@@ -85,7 +86,7 @@ pub struct App {
     pub sort_mode: SortMode,
     pub apparent_size: bool,
     pub cursor_index: usize,
-    pub scroll_offset: usize,
+    pub scroll_offset: Cell<usize>,
     pub search_query: String,
     pub is_searching: bool,
     pub status_message: Option<(String, std::time::Instant)>,
@@ -98,6 +99,8 @@ pub struct App {
     pub deleted_open_files: Vec<DeletedOpenFile>,
     pub ghost_tab_index: usize, // 0 = Docker, 1 = Deleted-Open Files
     pub ghost_cursor_index: usize,
+    pub ghost_docker_scroll_offset: Cell<usize>,
+    pub ghost_deleted_scroll_offset: Cell<usize>,
 }
 
 impl App {
@@ -115,7 +118,7 @@ impl App {
             sort_mode: SortMode::BySizeDesc,
             apparent_size: false,
             cursor_index: 0,
-            scroll_offset: 0,
+            scroll_offset: Cell::new(0),
             search_query: String::new(),
             is_searching: false,
             status_message: None,
@@ -126,6 +129,8 @@ impl App {
             deleted_open_files,
             ghost_tab_index: 0,
             ghost_cursor_index: 0,
+            ghost_docker_scroll_offset: Cell::new(0),
+            ghost_deleted_scroll_offset: Cell::new(0),
         }
     }
 
@@ -264,6 +269,65 @@ impl App {
         }
     }
 
+    /// Page down
+    pub fn page_down(&mut self, step: usize) {
+        if self.active_view == ActiveView::GhostInspector {
+            let max = if self.ghost_tab_index == 0 {
+                self.docker_info.items.len()
+            } else {
+                self.deleted_open_files.len()
+            };
+            if max > 0 {
+                self.ghost_cursor_index = (self.ghost_cursor_index + step).min(max - 1);
+            }
+            return;
+        }
+
+        let total = self.visible_children().len();
+        if total > 0 {
+            self.cursor_index = (self.cursor_index + step).min(total - 1);
+        }
+    }
+
+    /// Page up
+    pub fn page_up(&mut self, step: usize) {
+        if self.active_view == ActiveView::GhostInspector {
+            self.ghost_cursor_index = self.ghost_cursor_index.saturating_sub(step);
+            return;
+        }
+
+        self.cursor_index = self.cursor_index.saturating_sub(step);
+    }
+
+    /// Jump to start / top
+    pub fn cursor_to_start(&mut self) {
+        if self.active_view == ActiveView::GhostInspector {
+            self.ghost_cursor_index = 0;
+            return;
+        }
+        self.cursor_index = 0;
+    }
+
+    /// Jump to end / bottom
+    pub fn cursor_to_end(&mut self) {
+        if self.active_view == ActiveView::GhostInspector {
+            let max = if self.ghost_tab_index == 0 {
+                self.docker_info.items.len()
+            } else {
+                self.deleted_open_files.len()
+            };
+            if max > 0 {
+                self.ghost_cursor_index = max - 1;
+            }
+            return;
+        }
+
+        let total = self.visible_children().len();
+        if total > 0 {
+            self.cursor_index = total - 1;
+        }
+    }
+
     /// Enter directory
     pub fn enter_selected(&mut self) {
         let visible = self.visible_children();
@@ -275,20 +339,29 @@ impl App {
                 if let Some(orig_idx) = current.children.iter().position(|c| c.path == target_path) {
                     self.path_stack.push(orig_idx);
                     self.cursor_index = 0;
-                    self.scroll_offset = 0;
+                    self.scroll_offset.set(0);
                     self.search_query.clear();
                 }
             }
         }
     }
 
-    /// Navigate to parent directory
-    pub fn go_up(&mut self) {
+    /// Navigate to parent directory, or return parent path to rescan if at root
+    pub fn go_up(&mut self) -> Option<PathBuf> {
         if !self.path_stack.is_empty() {
             let last_idx = self.path_stack.pop().unwrap_or(0);
             self.cursor_index = last_idx;
-            self.scroll_offset = 0;
+            self.scroll_offset.set(0);
             self.search_query.clear();
+            None
+        } else {
+            // At root of current scan: if parent exists, return it to allow ascending
+            if let Some(parent) = self.root_entry.path.parent() {
+                if parent != self.root_entry.path && parent.exists() {
+                    return Some(parent.to_path_buf());
+                }
+            }
+            None
         }
     }
 

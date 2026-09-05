@@ -1,10 +1,12 @@
 use crate::ui::app::{ActiveView, App};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use std::path::PathBuf;
 
 pub enum EventResult {
     Continue,
     Exit,
     RescanRequested,
+    RescanPath(PathBuf),
 }
 
 pub fn handle_key_event(app: &mut App, key: KeyEvent) -> EventResult {
@@ -63,6 +65,18 @@ fn handle_ghost_keys(app: &mut App, key: KeyEvent) -> EventResult {
         KeyCode::Char('k') | KeyCode::Up => {
             app.cursor_up();
         }
+        KeyCode::PageDown => {
+            app.page_down(10);
+        }
+        KeyCode::PageUp => {
+            app.page_up(10);
+        }
+        KeyCode::Home => {
+            app.cursor_to_start();
+        }
+        KeyCode::End => {
+            app.cursor_to_end();
+        }
         KeyCode::Char('p') | KeyCode::Char('P') => {
             if app.ghost_tab_index == 0 && app.docker_info.is_available {
                 app.prompt_docker_prune();
@@ -105,6 +119,21 @@ fn handle_filesystem_keys(app: &mut App, key: KeyEvent) -> EventResult {
         return EventResult::Continue;
     }
 
+    // Ctrl shortcuts
+    if key.modifiers.contains(KeyModifiers::CONTROL) {
+        match key.code {
+            KeyCode::Char('d') => {
+                app.page_down(15);
+                return EventResult::Continue;
+            }
+            KeyCode::Char('u') => {
+                app.page_up(15);
+                return EventResult::Continue;
+            }
+            _ => {}
+        }
+    }
+
     // 2. Normal filesystem navigation
     match key.code {
         KeyCode::Char('q') => EventResult::Exit,
@@ -118,24 +147,42 @@ fn handle_filesystem_keys(app: &mut App, key: KeyEvent) -> EventResult {
             app.cursor_up();
             EventResult::Continue
         }
+        KeyCode::PageDown => {
+            app.page_down(15);
+            EventResult::Continue
+        }
+        KeyCode::PageUp => {
+            app.page_up(15);
+            EventResult::Continue
+        }
         KeyCode::Enter | KeyCode::Char('l') | KeyCode::Right => {
             app.enter_selected();
             EventResult::Continue
         }
         KeyCode::Backspace | KeyCode::Char('h') | KeyCode::Left => {
-            app.go_up();
-            EventResult::Continue
+            if let Some(parent) = app.go_up() {
+                EventResult::RescanPath(parent)
+            } else {
+                EventResult::Continue
+            }
         }
         KeyCode::Home => {
-            app.cursor_index = 0;
+            app.cursor_to_start();
             EventResult::Continue
         }
         KeyCode::End => {
-            let total = app.visible_children().len();
-            if total > 0 {
-                app.cursor_index = total - 1;
-            }
+            app.cursor_to_end();
             EventResult::Continue
+        }
+        KeyCode::Char('\\') => {
+            EventResult::RescanPath(PathBuf::from("/"))
+        }
+        KeyCode::Char('~') => {
+            if let Ok(home) = std::env::var("HOME") {
+                EventResult::RescanPath(PathBuf::from(home))
+            } else {
+                EventResult::Continue
+            }
         }
 
         // Selection

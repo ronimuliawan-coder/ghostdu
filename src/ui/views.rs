@@ -5,7 +5,8 @@ use ratatui::{
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{
-        Block, BorderType, Borders, Clear, Paragraph, Row, Table, Tabs, Wrap,
+        Block, BorderType, Borders, Clear, Paragraph, Row, Scrollbar, ScrollbarOrientation,
+        ScrollbarState, Table, Tabs, Wrap,
     },
     Frame,
 };
@@ -115,6 +116,27 @@ fn render_header(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(header_widget, area);
 }
 
+fn compute_scroll_window(
+    cursor: usize,
+    current_offset: usize,
+    viewport_height: usize,
+    total_items: usize,
+) -> usize {
+    if total_items == 0 || viewport_height == 0 {
+        return 0;
+    }
+    let mut offset = current_offset;
+    if cursor < offset {
+        offset = cursor;
+    } else if cursor >= offset + viewport_height {
+        offset = cursor + 1 - viewport_height;
+    }
+    if offset > total_items.saturating_sub(viewport_height) {
+        offset = total_items.saturating_sub(viewport_height);
+    }
+    offset
+}
+
 fn render_filesystem_view(f: &mut Frame, app: &App, area: Rect) {
     let visible = app.visible_children();
     let current_dir = app.current_dir_entry();
@@ -131,9 +153,21 @@ fn render_filesystem_view(f: &mut Frame, app: &App, area: Rect) {
         (area, None)
     };
 
+    let total_items = visible.len();
+    let viewport_height = table_area.height.saturating_sub(4).max(1) as usize;
+    let scroll_offset = compute_scroll_window(
+        app.cursor_index,
+        app.scroll_offset.get(),
+        viewport_height,
+        total_items,
+    );
+    app.scroll_offset.set(scroll_offset);
+
     let rows: Vec<Row> = visible
         .iter()
         .enumerate()
+        .skip(scroll_offset)
+        .take(viewport_height)
         .map(|(idx, entry)| {
             let is_cursor = idx == app.cursor_index;
             let is_selected = app.selected_paths.contains(&entry.path);
@@ -281,16 +315,46 @@ fn render_filesystem_view(f: &mut Frame, app: &App, area: Rect) {
             .add_modifier(Modifier::BOLD),
     );
 
+    let scroll_indicator = if total_items > viewport_height {
+        if scroll_offset > 0 && scroll_offset + viewport_height < total_items {
+            format!(" [{}/{} items ↕] ", app.cursor_index + 1, total_items)
+        } else if scroll_offset > 0 {
+            format!(" [{}/{} items ▲] ", app.cursor_index + 1, total_items)
+        } else {
+            format!(" [{}/{} items ▼] ", app.cursor_index + 1, total_items)
+        }
+    } else if total_items > 0 {
+        format!(" [{}/{} items] ", app.cursor_index + 1, total_items)
+    } else {
+        " [0 items] ".to_string()
+    };
+
     let table = Table::new(rows, widths)
         .header(header_row)
         .block(
             Block::default()
                 .borders(Borders::ALL)
                 .border_type(BorderType::Rounded)
-                .border_style(Style::default().fg(Color::DarkGray)),
+                .border_style(Style::default().fg(Color::DarkGray))
+                .title(Line::from(vec![
+                    Span::styled(" Directory Contents", Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+                    Span::styled(scroll_indicator, Style::default().fg(Color::LightYellow)),
+                ])),
         );
 
     f.render_widget(table, table_area);
+
+    if total_items > viewport_height {
+        let mut scrollbar_state = ScrollbarState::new(total_items).position(app.cursor_index);
+        f.render_stateful_widget(
+            Scrollbar::default()
+                .orientation(ScrollbarOrientation::VerticalRight)
+                .begin_symbol(Some("▲"))
+                .end_symbol(Some("▼")),
+            table_area,
+            &mut scrollbar_state,
+        );
+    }
 
     // Render search prompt if active
     if let Some(s_area) = search_area {
@@ -374,11 +438,23 @@ fn render_docker_tab(f: &mut Frame, app: &App, area: Rect) {
         return;
     }
 
+    let total_items = app.docker_info.items.len();
+    let viewport_height = area.height.saturating_sub(3).max(1) as usize;
+    let scroll_offset = compute_scroll_window(
+        app.ghost_cursor_index,
+        app.ghost_docker_scroll_offset.get(),
+        viewport_height,
+        total_items,
+    );
+    app.ghost_docker_scroll_offset.set(scroll_offset);
+
     let rows: Vec<Row> = app
         .docker_info
         .items
         .iter()
         .enumerate()
+        .skip(scroll_offset)
+        .take(viewport_height)
         .map(|(idx, item)| {
             let is_cursor = idx == app.ghost_cursor_index;
             let cursor = if is_cursor { "▶ " } else { "  " };
@@ -425,16 +501,39 @@ fn render_docker_tab(f: &mut Frame, app: &App, area: Rect) {
     let header = Row::new(vec!["Category", "ID / Name", "Size", "Status", "Details"])
         .style(Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD));
 
+    let scroll_indicator = if total_items > viewport_height {
+        format!(" [{}/{}] ↕ ", app.ghost_cursor_index + 1, total_items)
+    } else if total_items > 0 {
+        format!(" [{}/{}] ", app.ghost_cursor_index + 1, total_items)
+    } else {
+        String::new()
+    };
+
     let table = Table::new(rows, widths)
         .header(header)
         .block(
             Block::default()
                 .borders(Borders::ALL)
                 .border_type(BorderType::Rounded)
-                .title(" Docker Artifacts & Volumes "),
+                .title(Line::from(vec![
+                    Span::styled(" Docker Artifacts & Volumes", Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+                    Span::styled(scroll_indicator, Style::default().fg(Color::LightYellow)),
+                ])),
         );
 
     f.render_widget(table, area);
+
+    if total_items > viewport_height {
+        let mut scrollbar_state = ScrollbarState::new(total_items).position(app.ghost_cursor_index);
+        f.render_stateful_widget(
+            Scrollbar::default()
+                .orientation(ScrollbarOrientation::VerticalRight)
+                .begin_symbol(Some("▲"))
+                .end_symbol(Some("▼")),
+            area,
+            &mut scrollbar_state,
+        );
+    }
 }
 
 fn render_docker_summary(f: &mut Frame, app: &App, area: Rect) {
@@ -479,10 +578,22 @@ fn render_deleted_open_tab(f: &mut Frame, app: &App, area: Rect) {
         return;
     }
 
+    let total_items = app.deleted_open_files.len();
+    let viewport_height = area.height.saturating_sub(3).max(1) as usize;
+    let scroll_offset = compute_scroll_window(
+        app.ghost_cursor_index,
+        app.ghost_deleted_scroll_offset.get(),
+        viewport_height,
+        total_items,
+    );
+    app.ghost_deleted_scroll_offset.set(scroll_offset);
+
     let rows: Vec<Row> = app
         .deleted_open_files
         .iter()
         .enumerate()
+        .skip(scroll_offset)
+        .take(viewport_height)
         .map(|(idx, item)| {
             let is_cursor = idx == app.ghost_cursor_index;
             let cursor = if is_cursor { "▶ " } else { "  " };
@@ -513,16 +624,39 @@ fn render_deleted_open_tab(f: &mut Frame, app: &App, area: Rect) {
     let header = Row::new(vec!["PID", "Process", "Held Size", "Original File Path (deleted)"])
         .style(Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD));
 
+    let scroll_indicator = if total_items > viewport_height {
+        format!(" [{}/{}] ↕ ", app.ghost_cursor_index + 1, total_items)
+    } else if total_items > 0 {
+        format!(" [{}/{}] ", app.ghost_cursor_index + 1, total_items)
+    } else {
+        String::new()
+    };
+
     let table = Table::new(rows, widths)
         .header(header)
         .block(
             Block::default()
                 .borders(Borders::ALL)
                 .border_type(BorderType::Rounded)
-                .title(" Open Unlinked Files Holding Space "),
+                .title(Line::from(vec![
+                    Span::styled(" Open Unlinked Files Holding Space", Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+                    Span::styled(scroll_indicator, Style::default().fg(Color::LightYellow)),
+                ])),
         );
 
     f.render_widget(table, area);
+
+    if total_items > viewport_height {
+        let mut scrollbar_state = ScrollbarState::new(total_items).position(app.ghost_cursor_index);
+        f.render_stateful_widget(
+            Scrollbar::default()
+                .orientation(ScrollbarOrientation::VerticalRight)
+                .begin_symbol(Some("▲"))
+                .end_symbol(Some("▼")),
+            area,
+            &mut scrollbar_state,
+        );
+    }
 }
 
 fn render_deleted_open_summary(f: &mut Frame, app: &App, area: Rect) {
@@ -679,8 +813,12 @@ fn render_help_modal(f: &mut Frame, screen: Rect) {
         Line::from(Span::styled("NAVIGATION & BROWSING", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))),
         Line::from("  j / Down       Move cursor down"),
         Line::from("  k / Up         Move cursor up"),
+        Line::from("  PgDn / Ctrl+d  Page down (15 items)"),
+        Line::from("  PgUp / Ctrl+u  Page up (15 items)"),
         Line::from("  Enter / l      Enter / drill down into directory"),
-        Line::from("  Backspace / h  Go up to parent directory"),
+        Line::from("  Backspace / h  Go up to parent directory (ascends to root /)"),
+        Line::from("  \\              Jump directly to root filesystem (/)"),
+        Line::from("  ~              Jump directly to home directory (~/)"),
         Line::from("  Home / End     Jump to top / bottom"),
         Line::from(""),
         Line::from(Span::styled("SELECTION & WASTEBIN / REMOVAL", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))),
