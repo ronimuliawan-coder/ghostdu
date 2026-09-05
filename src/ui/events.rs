@@ -18,6 +18,7 @@ pub fn handle_key_event(app: &mut App, key: KeyEvent) -> EventResult {
     match app.active_view {
         ActiveView::ConfirmModal => handle_confirm_keys(app, key),
         ActiveView::HelpModal => handle_help_keys(app, key),
+        ActiveView::ItemInfoModal => handle_item_info_keys(app, key),
         ActiveView::GhostInspector => handle_ghost_keys(app, key),
         ActiveView::Filesystem => handle_filesystem_keys(app, key),
     }
@@ -39,6 +40,16 @@ fn handle_confirm_keys(app: &mut App, key: KeyEvent) -> EventResult {
 fn handle_help_keys(app: &mut App, key: KeyEvent) -> EventResult {
     match key.code {
         KeyCode::Char('?') | KeyCode::Char('q') | KeyCode::Esc => {
+            app.active_view = app.previous_view;
+        }
+        _ => {}
+    }
+    EventResult::Continue
+}
+
+fn handle_item_info_keys(app: &mut App, key: KeyEvent) -> EventResult {
+    match key.code {
+        KeyCode::Char('i') | KeyCode::Char('I') | KeyCode::Char('q') | KeyCode::Esc | KeyCode::Enter => {
             app.active_view = app.previous_view;
         }
         _ => {}
@@ -239,6 +250,10 @@ fn handle_filesystem_keys(app: &mut App, key: KeyEvent) -> EventResult {
         }
 
         // Utilities
+        KeyCode::Char('i') | KeyCode::Char('I') => {
+            app.open_item_info();
+            EventResult::Continue
+        }
         KeyCode::Char('r') => EventResult::RescanRequested,
         KeyCode::Char('?') => {
             app.previous_view = app.active_view;

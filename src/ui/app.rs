@@ -1,4 +1,5 @@
 use crate::fs::entry::FileEntry;
+use crate::fs::mount_info::{get_detailed_item_info, query_fs_info, DetailedItemInfo, FsMountInfo};
 use crate::ghost::{
     fetch_docker_disk_info, prune_docker_dangling, scan_deleted_open_files, DeletedOpenFile,
     DockerDiskInfo,
@@ -14,6 +15,7 @@ pub enum ActiveView {
     GhostInspector,
     HelpModal,
     ConfirmModal,
+    ItemInfoModal,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -101,12 +103,17 @@ pub struct App {
     pub ghost_cursor_index: usize,
     pub ghost_docker_scroll_offset: Cell<usize>,
     pub ghost_deleted_scroll_offset: Cell<usize>,
+
+    // Global Filesystem and Detailed Item Info
+    pub fs_info: Option<FsMountInfo>,
+    pub item_info: Option<DetailedItemInfo>,
 }
 
 impl App {
     pub fn new(root_entry: FileEntry) -> Self {
         let docker_info = fetch_docker_disk_info();
         let deleted_open_files = scan_deleted_open_files();
+        let fs_info = query_fs_info(&root_entry.path);
 
         Self {
             root_entry,
@@ -131,6 +138,8 @@ impl App {
             ghost_cursor_index: 0,
             ghost_docker_scroll_offset: Cell::new(0),
             ghost_deleted_scroll_offset: Cell::new(0),
+            fs_info,
+            item_info: None,
         }
     }
 
@@ -341,6 +350,7 @@ impl App {
                     self.cursor_index = 0;
                     self.scroll_offset.set(0);
                     self.search_query.clear();
+                    self.refresh_fs_info();
                 }
             }
         }
@@ -353,6 +363,7 @@ impl App {
             self.cursor_index = last_idx;
             self.scroll_offset.set(0);
             self.search_query.clear();
+            self.refresh_fs_info();
             None
         } else {
             // At root of current scan: if parent exists, return it to allow ascending
@@ -363,6 +374,22 @@ impl App {
             }
             None
         }
+    }
+
+    /// Open detailed Item & Filesystem info modal (ncdu 'i' key)
+    pub fn open_item_info(&mut self) {
+        let visible = self.visible_children();
+        if let Some(target) = visible.get(self.cursor_index) {
+            self.item_info = get_detailed_item_info(&target.path, target.items_count);
+            self.previous_view = self.active_view;
+            self.active_view = ActiveView::ItemInfoModal;
+        }
+    }
+
+    /// Refresh filesystem stats for current directory
+    pub fn refresh_fs_info(&mut self) {
+        let current_path = self.current_dir_entry().path.clone();
+        self.fs_info = query_fs_info(&current_path);
     }
 
     /// Toggle selection of current item or marked set

@@ -205,6 +205,16 @@ fn test_app_state_and_navigation() {
     let parent = app.go_up();
     assert!(parent.is_some());
     assert_eq!(parent.unwrap(), base.parent().unwrap());
+
+    // Test item info modal ('i' key)
+    assert!(app.fs_info.is_some(), "app.fs_info should be loaded on init");
+    app.open_item_info();
+    assert_eq!(app.active_view, ghostdu::ui::ActiveView::ItemInfoModal);
+    assert!(app.item_info.is_some());
+    let item_info = app.item_info.as_ref().unwrap();
+    assert_eq!(item_info.name, "dir_b");
+    assert!(item_info.is_dir);
+    assert!(item_info.fs_info.is_some());
 }
 
 // Minimal exposure for integration testing

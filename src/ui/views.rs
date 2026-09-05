@@ -17,7 +17,7 @@ pub fn render_ui(f: &mut Frame, app: &App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3), // Header
+            Constraint::Length(5), // Header: 3 content lines + 2 border lines
             Constraint::Min(5),    // Main content
             Constraint::Length(1), // Footer / Keybindings
         ])
@@ -41,6 +41,10 @@ pub fn render_ui(f: &mut Frame, app: &App) {
             render_filesystem_view(f, app, chunks[1]);
             render_help_modal(f, size);
         }
+        ActiveView::ItemInfoModal => {
+            render_filesystem_view(f, app, chunks[1]);
+            render_item_info_modal(f, app, size);
+        }
     }
 
     render_footer(f, app, chunks[2]);
@@ -49,8 +53,6 @@ pub fn render_ui(f: &mut Frame, app: &App) {
 fn render_header(f: &mut Frame, app: &App, area: Rect) {
     let current_dir = app.current_dir_entry();
     let current_path = current_dir.path.to_string_lossy();
-    let dir_size = current_dir.display_size(app.apparent_size);
-    let size_str = format_size(dir_size);
     let count_str = format_count(current_dir.items_count);
 
     let (sel_count, sel_size) = app.selection_summary();
@@ -98,10 +100,14 @@ fn render_header(f: &mut Frame, app: &App, area: Rect) {
     }
     let title_line = Line::from(title_spans);
 
-    let subtitle_line = Line::from(vec![
-        Span::styled(format!("Size: {}", size_str), Style::default().fg(Color::Green)),
+    // Line 2: Folder statistics (ncdu style: total disk usage, apparent size, total items)
+    let folder_stat_line = Line::from(vec![
+        Span::styled("📊 Folder Usage: ", Style::default().fg(Color::DarkGray)),
+        Span::styled(format!("{} (disk)", format_size(current_dir.disk_usage)), Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
         Span::raw(" │ "),
-        Span::styled(format!("Items: {}", count_str), Style::default().fg(Color::Gray)),
+        Span::styled(format!("{} (apparent)", format_size(current_dir.size)), Style::default().fg(Color::Cyan)),
+        Span::raw(" │ "),
+        Span::styled(format!("{} items", count_str), Style::default().fg(Color::White)),
         Span::raw(" │ "),
         Span::styled(format!("Sort: {}", app.sort_mode.label()), Style::default().fg(Color::LightYellow)),
         filter_span,
@@ -109,7 +115,47 @@ fn render_header(f: &mut Frame, app: &App, area: Rect) {
         selection_span,
     ]);
 
-    let header_widget = Paragraph::new(vec![title_line, subtitle_line])
+    // Line 3: Global filesystem statistics (mount point, total capacity, used with bar, free space left)
+    let fs_line = if let Some(ref fs) = app.fs_info {
+        let bar_len = 10;
+        let filled_len = ((fs.use_percent / 100.0) * bar_len as f64).round() as usize;
+        let bar_filled = "█".repeat(filled_len.min(bar_len));
+        let bar_empty = "░".repeat(bar_len.saturating_sub(filled_len));
+        let bar_color = if fs.use_percent >= 90.0 {
+            Color::Red
+        } else if fs.use_percent >= 75.0 {
+            Color::Yellow
+        } else {
+            Color::Green
+        };
+
+        Line::from(vec![
+            Span::styled("💾 Global Disk: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(format!("{} ({})", fs.device, fs.fs_type), Style::default().fg(Color::White)),
+            Span::styled(format!(" on {}", fs.mount_point.display()), Style::default().fg(Color::DarkGray)),
+            Span::raw(" │ "),
+            Span::styled(format!("Total: {}", format_size(fs.total_bytes)), Style::default().fg(Color::White)),
+            Span::raw(" │ "),
+            Span::styled(format!("Used: {}", format_size(fs.used_bytes)), Style::default().fg(Color::LightRed)),
+            Span::raw(" "),
+            Span::styled(
+                format!("[{}{}] {:.1}%", bar_filled, bar_empty, fs.use_percent),
+                Style::default().fg(bar_color).add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" │ "),
+            Span::styled(
+                format!("Free Left: {}", format_size(fs.avail_bytes)),
+                Style::default().fg(Color::LightGreen).add_modifier(Modifier::BOLD),
+            ),
+        ])
+    } else {
+        Line::from(vec![
+            Span::styled("💾 Global Disk: ", Style::default().fg(Color::DarkGray)),
+            Span::styled("Filesystem mount info unavailable", Style::default().fg(Color::DarkGray)),
+        ])
+    };
+
+    let header_widget = Paragraph::new(vec![title_line, folder_stat_line, fs_line])
         .block(
             Block::default()
                 .borders(Borders::ALL)
@@ -837,6 +883,7 @@ fn render_help_modal(f: &mut Frame, screen: Rect) {
         Line::from("  p              Prune Docker dangling resources (in Ghost view)"),
         Line::from(""),
         Line::from(Span::styled("DISPLAY & UTILITIES", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD))),
+        Line::from("  i              Show detailed item & filesystem info (ncdu style)"),
         Line::from("  s              Cycle sort order (Size desc, Size asc, Name, Items)"),
         Line::from("  A              Toggle Apparent size vs Actual block disk usage"),
         Line::from("  /              Interactive live search / filter"),
@@ -858,6 +905,131 @@ fn render_help_modal(f: &mut Frame, screen: Rect) {
     f.render_widget(help_widget, area);
 }
 
+fn render_item_info_modal(f: &mut Frame, app: &App, screen: Rect) {
+    let popup_width = 76.min(screen.width.saturating_sub(4));
+    let popup_height = 20.min(screen.height.saturating_sub(2));
+
+    let area = Rect {
+        x: (screen.width.saturating_sub(popup_width)) / 2,
+        y: (screen.height.saturating_sub(popup_height)) / 2,
+        width: popup_width,
+        height: popup_height,
+    };
+
+    f.render_widget(Clear, area);
+
+    let info = match &app.item_info {
+        Some(i) => i,
+        None => return,
+    };
+
+    let mut lines = Vec::new();
+
+    // Section 1: Item Identification
+    let type_badge = if info.is_symlink {
+        Span::styled(" SYMLINK ", Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD))
+    } else if info.is_dir {
+        Span::styled(" DIRECTORY ", Style::default().fg(Color::Black).bg(Color::Blue).add_modifier(Modifier::BOLD))
+    } else {
+        Span::styled(" FILE ", Style::default().fg(Color::White).bg(Color::DarkGray))
+    };
+
+    lines.push(Line::from(vec![
+        Span::styled("Name: ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+        Span::styled(&info.name, Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+        Span::raw("  "),
+        type_badge,
+    ]));
+
+    lines.push(Line::from(vec![
+        Span::styled("Path: ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+        Span::styled(info.full_path.to_string_lossy(), Style::default().fg(Color::White)),
+    ]));
+
+    lines.push(Line::from(""));
+
+    // Section 2: Size & Items (ncdu exact metrics)
+    lines.push(Line::from(vec![
+        Span::styled("Disk Usage:    ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            format!("{} ({} B, {} 512-B blocks)", format_size(info.disk_usage), info.disk_usage, info.blocks_512),
+            Style::default().fg(Color::White),
+        ),
+    ]));
+
+    lines.push(Line::from(vec![
+        Span::styled("Apparent Size: ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            format!("{} ({} B)", format_size(info.apparent_size), info.apparent_size),
+            Style::default().fg(Color::White),
+        ),
+    ]));
+
+    if info.is_dir {
+        lines.push(Line::from(vec![
+            Span::styled("Items Inside:  ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Span::styled(format!("{} items", format_count(info.items_count)), Style::default().fg(Color::White)),
+        ]));
+    }
+
+    lines.push(Line::from(""));
+
+    // Section 3: Metadata & Permissions
+    lines.push(Line::from(vec![
+        Span::styled("Mode: ", Style::default().fg(Color::Green)),
+        Span::styled(format!("{} (octal {:04o})", info.mode_str, info.mode_octal), Style::default().fg(Color::White)),
+        Span::raw("  │  "),
+        Span::styled("Owner: ", Style::default().fg(Color::Green)),
+        Span::styled(format!("UID {} / GID {}", info.uid, info.gid), Style::default().fg(Color::White)),
+    ]));
+
+    lines.push(Line::from(vec![
+        Span::styled("Inode: ", Style::default().fg(Color::Green)),
+        Span::styled(format!("{}", info.ino), Style::default().fg(Color::White)),
+        Span::raw("  │  "),
+        Span::styled("Device ID: ", Style::default().fg(Color::Green)),
+        Span::styled(format!("{}", info.dev), Style::default().fg(Color::White)),
+        Span::raw("  │  "),
+        Span::styled("Modified: ", Style::default().fg(Color::Green)),
+        Span::styled(&info.modified_str, Style::default().fg(Color::White)),
+    ]));
+
+    // Section 4: Filesystem Details
+    if let Some(ref fs) = info.fs_info {
+        lines.push(Line::from(""));
+        lines.push(Line::from(vec![
+            Span::styled("Filesystem: ", Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD)),
+            Span::styled(&fs.device, Style::default().fg(Color::White)),
+            Span::styled(format!(" ({}) mounted on {}", fs.fs_type, fs.mount_point.display()), Style::default().fg(Color::DarkGray)),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled("Capacity: ", Style::default().fg(Color::Magenta)),
+            Span::styled(format_size(fs.total_bytes), Style::default().fg(Color::White)),
+            Span::raw("  │  "),
+            Span::styled("Used: ", Style::default().fg(Color::Magenta)),
+            Span::styled(format!("{} ({:.1}%)", format_size(fs.used_bytes), fs.use_percent), Style::default().fg(Color::White)),
+            Span::raw("  │  "),
+            Span::styled("Free Left: ", Style::default().fg(Color::Magenta)),
+            Span::styled(format_size(fs.avail_bytes), Style::default().fg(Color::LightGreen).add_modifier(Modifier::BOLD)),
+        ]));
+    }
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "Press 'i', 'q', Enter, or Esc to close",
+        Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
+    )));
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(Color::Cyan))
+        .title(" ℹ Item & Filesystem Information ");
+
+    let widget = Paragraph::new(lines).block(block);
+    f.render_widget(widget, area);
+}
+
 fn render_footer(f: &mut Frame, app: &App, area: Rect) {
     if let Some(status) = app.current_status() {
         let status_line = Line::from(vec![
@@ -871,6 +1043,8 @@ fn render_footer(f: &mut Frame, app: &App, area: Rect) {
     let footer_spans = match app.active_view {
         ActiveView::Filesystem => vec![
             Span::styled(" [?] Help ", Style::default().fg(Color::White).bg(Color::DarkGray)),
+            Span::raw(" "),
+            Span::styled(" [i] Info ", Style::default().fg(Color::Black).bg(Color::Cyan)),
             Span::raw(" "),
             Span::styled(" [Bksp] Up ", Style::default().fg(Color::White).bg(Color::Rgb(60, 60, 75))),
             Span::raw(" "),
@@ -910,6 +1084,9 @@ fn render_footer(f: &mut Frame, app: &App, area: Rect) {
         ],
         ActiveView::HelpModal => vec![
             Span::styled(" [? / Esc] Close Help ", Style::default().fg(Color::White).bg(Color::DarkGray)),
+        ],
+        ActiveView::ItemInfoModal => vec![
+            Span::styled(" [i / q / Esc] Close Info ", Style::default().fg(Color::White).bg(Color::DarkGray)),
         ],
     };
 

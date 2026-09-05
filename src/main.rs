@@ -246,10 +246,27 @@ fn run_headless_summary(target_path: PathBuf) -> Result<(), Box<dyn std::error::
 
     let docker_info = ghostdu::ghost::fetch_docker_disk_info();
     let deleted_open = ghostdu::ghost::scan_deleted_open_files();
+    let fs_info = ghostdu::fs::query_fs_info(&root_entry.path);
 
     println!();
     println!("════════════════════════════════════════════════════════════════════════════════");
     println!("  📂 PATH: {}", root_entry.path.to_string_lossy());
+    if let Some(ref fs) = fs_info {
+        let percent = fs.use_percent;
+        let bar_len = 10;
+        let filled_len = ((percent / 100.0) * bar_len as f64).round() as usize;
+        let bar_filled = "█".repeat(filled_len.min(bar_len));
+        let bar_empty = "░".repeat(bar_len.saturating_sub(filled_len));
+        println!("  💾 FILESYSTEM: {} ({} on {})", fs.device, fs.fs_type, fs.mount_point.display());
+        println!("     Capacity: {} | Used: {} [{}{}] {:.1}% | Free Space: {}",
+            format_size(fs.total_bytes),
+            format_size(fs.used_bytes),
+            bar_filled,
+            bar_empty,
+            percent,
+            format_size(fs.avail_bytes),
+        );
+    }
     println!("  📊 TOTAL DISK USAGE: {} (Apparent: {})", format_size(root_entry.disk_usage), format_size(root_entry.size));
     println!("  📦 TOTAL ITEMS: {}", format_count(root_entry.items_count));
     println!("════════════════════════════════════════════════════════════════════════════════");
