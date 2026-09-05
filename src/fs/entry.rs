@@ -1,0 +1,170 @@
+use std::path::PathBuf;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+pub enum GhostKind {
+    None,
+    DockerOverlay,
+    DockerVolume,
+    DockerContainer,
+    DockerBuildkit,
+    DockerUser,
+    PodmanUser,
+    BuildCache,
+    PackageCache,
+    DeletedOpen,
+}
+
+#[allow(dead_code)]
+impl GhostKind {
+    pub fn is_ghost(&self) -> bool {
+        !matches!(self, GhostKind::None)
+    }
+
+    pub fn is_docker(&self) -> bool {
+        matches!(
+            self,
+            GhostKind::DockerOverlay
+                | GhostKind::DockerVolume
+                | GhostKind::DockerContainer
+                | GhostKind::DockerBuildkit
+                | GhostKind::DockerUser
+                | GhostKind::PodmanUser
+        )
+    }
+
+    pub fn label(&self) -> &'static str {
+        match self {
+            GhostKind::None => "",
+            GhostKind::DockerOverlay => "🐳 Docker-Overlay",
+            GhostKind::DockerVolume => "🐳 Docker-Volume",
+            GhostKind::DockerContainer => "🐳 Docker-Container",
+            GhostKind::DockerBuildkit => "🐳 Docker-Buildkit",
+            GhostKind::DockerUser => "🐳 Docker-User",
+            GhostKind::PodmanUser => "🦭 Podman",
+            GhostKind::BuildCache => "👻 Build-Cache",
+            GhostKind::PackageCache => "📦 Pkg-Cache",
+            GhostKind::DeletedOpen => "👻 Deleted-Open",
+        }
+    }
+
+    pub fn badge(&self) -> &'static str {
+        match self {
+            GhostKind::None => "",
+            GhostKind::DockerOverlay
+            | GhostKind::DockerVolume
+            | GhostKind::DockerContainer
+            | GhostKind::DockerBuildkit
+            | GhostKind::DockerUser => "🐳 DOCKER",
+            GhostKind::PodmanUser => "🦭 PODMAN",
+            GhostKind::BuildCache => "👻 CACHE",
+            GhostKind::PackageCache => "📦 PKG",
+            GhostKind::DeletedOpen => "👻 GHOST",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub struct FileEntry {
+    pub name: String,
+    pub path: PathBuf,
+    pub size: u64,           // Apparent file size in bytes
+    pub disk_usage: u64,     // Allocated disk space (blocks * 512)
+    pub items_count: usize,  // Total recursive items count
+    pub is_dir: bool,
+    pub is_symlink: bool,
+    pub dev: u64,
+    pub ino: u64,
+    pub ghost_kind: GhostKind,
+    pub has_err: bool,       // e.g. permission denied
+    pub children: Vec<FileEntry>,
+}
+
+impl FileEntry {
+    pub fn new_file(
+        name: String,
+        path: PathBuf,
+        size: u64,
+        disk_usage: u64,
+        is_symlink: bool,
+        dev: u64,
+        ino: u64,
+        ghost_kind: GhostKind,
+    ) -> Self {
+        Self {
+            name,
+            path,
+            size,
+            disk_usage,
+            items_count: 1,
+            is_dir: false,
+            is_symlink,
+            dev,
+            ino,
+            ghost_kind,
+            has_err: false,
+            children: Vec::new(),
+        }
+    }
+
+    pub fn new_dir(
+        name: String,
+        path: PathBuf,
+        dev: u64,
+        ino: u64,
+        ghost_kind: GhostKind,
+    ) -> Self {
+        Self {
+            name,
+            path,
+            size: 0,
+            disk_usage: 0,
+            items_count: 1,
+            is_dir: true,
+            is_symlink: false,
+            dev,
+            ino,
+            ghost_kind,
+            has_err: false,
+            children: Vec::new(),
+        }
+    }
+
+    pub fn display_size(&self, apparent: bool) -> u64 {
+        if apparent {
+            self.size
+        } else {
+            self.disk_usage
+        }
+    }
+}
+
+pub fn format_size(bytes: u64) -> String {
+    const KIB: u64 = 1024;
+    const MIB: u64 = KIB * 1024;
+    const GIB: u64 = MIB * 1024;
+    const TIB: u64 = GIB * 1024;
+
+    if bytes >= TIB {
+        format!("{:.2} TiB", bytes as f64 / TIB as f64)
+    } else if bytes >= GIB {
+        format!("{:.2} GiB", bytes as f64 / GIB as f64)
+    } else if bytes >= MIB {
+        format!("{:.1} MiB", bytes as f64 / MIB as f64)
+    } else if bytes >= KIB {
+        format!("{:.1} KiB", bytes as f64 / KIB as f64)
+    } else {
+        format!("{} B", bytes)
+    }
+}
+
+pub fn format_count(count: usize) -> String {
+    if count >= 1_000_000 {
+        format!("{:.1}M items", count as f64 / 1_000_000.0)
+    } else if count >= 1_000 {
+        format!("{:.1}k items", count as f64 / 1_000.0)
+    } else {
+        format!("{} items", count)
+    }
+}

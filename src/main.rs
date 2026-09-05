@@ -1,0 +1,331 @@
+use ghostdu::{fs, ui};
+
+use clap::Parser;
+use crossbeam_channel::unbounded;
+use crossterm::{
+    event::{self, Event, KeyCode, KeyModifiers},
+    execute,
+    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+};
+use fs::{format_count, format_size, scan_directory, ScanProgress};
+use ratatui::{
+    backend::CrosstermBackend,
+    layout::{Alignment, Rect},
+    style::{Color, Modifier, Style},
+    text::{Line, Span},
+    widgets::{Block, BorderType, Borders, Paragraph},
+    Terminal,
+};
+use std::{
+    io::{self, stdout},
+    path::PathBuf,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+    thread,
+    time::{Duration, Instant},
+};
+use ui::{handle_key_event, render_ui, App, EventResult};
+
+use std::io::IsTerminal;
+
+/// ghostdu: Modern, ultra-fast native Linux disk usage & ghost file analyzer
+#[derive(Parser, Debug)]
+#[command(name = "ghostdu", author = "Ron", version = "0.1.0")]
+#[command(about = "Modern, ultra-fast native Linux disk usage & ghost file analyzer with wastebin support")]
+struct Cli {
+    /// Directory to scan (defaults to current directory)
+    #[arg(default_value = ".")]
+    path: PathBuf,
+
+    /// Non-interactive summary report (auto-enabled if not running in an interactive terminal)
+    #[arg(short, long)]
+    summary: bool,
+}
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let cli = Cli::parse();
+    let target_path = cli.path;
+
+    if !target_path.exists() {
+        eprintln!("Error: Path {:?} does not exist", target_path);
+        std::process::exit(1);
+    }
+
+    // Auto-detect non-interactive terminal (e.g. piped or redirected)
+    let is_interactive = io::stdout().is_terminal() && io::stdin().is_terminal() && !cli.summary;
+
+    if !is_interactive {
+        run_headless_summary(target_path)?;
+        return Ok(());
+    }
+
+    // Set panic hook to cleanly restore terminal if something crashes
+    let original_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |panic_info| {
+        let _ = disable_raw_mode();
+        let _ = execute!(stdout(), LeaveAlternateScreen);
+        original_hook(panic_info);
+    }));
+
+    // Setup terminal
+    enable_raw_mode()?;
+    let mut stdout = stdout();
+    execute!(stdout, EnterAlternateScreen)?;
+    let backend = CrosstermBackend::new(stdout);
+    let mut terminal = Terminal::new(backend)?;
+
+    let app_result = run_app(&mut terminal, target_path);
+
+    // Cleanly restore terminal
+    disable_raw_mode()?;
+    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    terminal.show_cursor()?;
+
+    if let Err(err) = app_result {
+        eprintln!("ghostdu error: {}", err);
+        std::process::exit(1);
+    }
+
+    Ok(())
+}
+
+fn run_app<B: ratatui::backend::Backend>(
+    terminal: &mut Terminal<B>,
+    mut target_path: PathBuf,
+) -> Result<(), Box<dyn std::error::Error>> {
+    loop {
+        // Step 1: Progressive Scanning with Live Progress UI
+        let (progress_tx, progress_rx) = unbounded::<ScanProgress>();
+        let stop_signal = Arc::new(AtomicBool::new(false));
+        let stop_clone = stop_signal.clone();
+
+        let scan_path = target_path.clone();
+        let scan_handle = thread::spawn(move || {
+            scan_directory(&scan_path, Some(progress_tx), stop_clone)
+        });
+
+        let mut last_progress = ScanProgress {
+            files_scanned: 0,
+            bytes_scanned: 0,
+            current_path: target_path.clone(),
+            is_finished: false,
+        };
+
+        let scan_start = Instant::now();
+        let mut spinner_idx = 0;
+        let spinners = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
+        let root_entry = loop {
+            while let Ok(prog) = progress_rx.try_recv() {
+                last_progress = prog;
+            }
+
+            if scan_handle.is_finished() {
+                break match scan_handle.join() {
+                    Ok(res) => res?,
+                    Err(_) => return Err("Scan thread panicked".into()),
+                };
+            }
+
+            // Draw scanning progress screen
+            let spinner = spinners[spinner_idx % spinners.len()];
+            spinner_idx += 1;
+            let elapsed = scan_start.elapsed().as_secs_f32();
+
+            terminal.draw(|f| {
+                let size = f.area();
+                let area = centered_rect(60, 10, size);
+
+                let files_str = format_count(last_progress.files_scanned as usize);
+                let bytes_str = format_size(last_progress.bytes_scanned);
+                let path_str = last_progress.current_path.to_string_lossy();
+
+                let lines = vec![
+                    Line::from(vec![
+                        Span::styled(format!("{} ", spinner), Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+                        Span::styled("Analyzing disk usage & ghost files...", Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+                    ]),
+                    Line::from(""),
+                    Line::from(vec![
+                        Span::styled("Files Scanned: ", Style::default().fg(Color::DarkGray)),
+                        Span::styled(files_str, Style::default().fg(Color::LightGreen).add_modifier(Modifier::BOLD)),
+                        Span::raw("   "),
+                        Span::styled("Total Size: ", Style::default().fg(Color::DarkGray)),
+                        Span::styled(bytes_str, Style::default().fg(Color::LightCyan).add_modifier(Modifier::BOLD)),
+                        Span::raw("   "),
+                        Span::styled(format!("({:.1}s)", elapsed), Style::default().fg(Color::DarkGray)),
+                    ]),
+                    Line::from(""),
+                    Line::from(vec![
+                        Span::styled("Scanning: ", Style::default().fg(Color::DarkGray)),
+                        Span::styled(
+                            if path_str.len() > 44 {
+                                format!("...{}", &path_str[path_str.len() - 41..])
+                            } else {
+                                path_str.to_string()
+                            },
+                            Style::default().fg(Color::Yellow),
+                        ),
+                    ]),
+                    Line::from(""),
+                    Line::from(Span::styled("Press 'q' or Ctrl+C to cancel", Style::default().fg(Color::DarkGray))),
+                ];
+
+                let block = Block::default()
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .border_style(Style::default().fg(Color::LightCyan))
+                    .title(" 👻 ghostdu Scanner ");
+
+                f.render_widget(Paragraph::new(lines).block(block).alignment(Alignment::Left), area);
+            })?;
+
+            if event::poll(Duration::from_millis(60))? {
+                if let Event::Key(key) = event::read()? {
+                    if key.code == KeyCode::Char('q')
+                        || (key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c'))
+                    {
+                        stop_signal.store(true, Ordering::Relaxed);
+                        return Ok(());
+                    }
+                }
+            }
+        };
+
+        // Step 2: Main interactive loop
+        let mut app = App::new(root_entry);
+
+        let rescan_needed = loop {
+            terminal.draw(|f| render_ui(f, &app))?;
+
+            if event::poll(Duration::from_millis(100))? {
+                if let Event::Key(key) = event::read()? {
+                    match handle_key_event(&mut app, key) {
+                        EventResult::Exit => return Ok(()),
+                        EventResult::Continue => {}
+                        EventResult::RescanRequested => {
+                            target_path = app.current_dir_entry().path.clone();
+                            break true;
+                        }
+                    }
+                }
+            }
+        };
+
+        if !rescan_needed {
+            break;
+        }
+    }
+
+    Ok(())
+}
+
+fn centered_rect(width: u16, height: u16, r: Rect) -> Rect {
+    let popup_width = width.min(r.width.saturating_sub(2));
+    let popup_height = height.min(r.height.saturating_sub(2));
+
+    Rect {
+        x: (r.width.saturating_sub(popup_width)) / 2,
+        y: (r.height.saturating_sub(popup_height)) / 2,
+        width: popup_width,
+        height: popup_height,
+    }
+}
+
+fn run_headless_summary(target_path: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
+    println!("👻 ghostdu: Analyzing disk usage & ghost files for {:?}...", target_path);
+
+    let stop_signal = Arc::new(AtomicBool::new(false));
+    let root_entry = scan_directory(&target_path, None, stop_signal)?;
+
+    let docker_info = ghostdu::ghost::fetch_docker_disk_info();
+    let deleted_open = ghostdu::ghost::scan_deleted_open_files();
+
+    println!();
+    println!("════════════════════════════════════════════════════════════════════════════════");
+    println!("  📂 PATH: {}", root_entry.path.to_string_lossy());
+    println!("  📊 TOTAL DISK USAGE: {} (Apparent: {})", format_size(root_entry.disk_usage), format_size(root_entry.size));
+    println!("  📦 TOTAL ITEMS: {}", format_count(root_entry.items_count));
+    println!("════════════════════════════════════════════════════════════════════════════════");
+    println!("{:<4} {:<40} {:<12} {:<18} {:<12}", "SEL", "NAME", "SIZE", "USAGE BAR", "CATEGORY");
+    println!("────────────────────────────────────────────────────────────────────────────────");
+
+    let parent_size = root_entry.disk_usage.max(1);
+    for entry in root_entry.children.iter().take(20) {
+        let percent = ((entry.disk_usage as f64 / parent_size as f64) * 100.0).clamp(0.0, 100.0);
+        let bar_len = 10;
+        let filled_len = ((percent / 100.0) * bar_len as f64).round() as usize;
+        let bar_filled = "█".repeat(filled_len.min(bar_len));
+        let bar_empty = "░".repeat(bar_len.saturating_sub(filled_len));
+        let bar_text = format!("[{}{}] {:>5.1}%", bar_filled, bar_empty, percent);
+
+        let icon = if entry.is_dir { "📁 " } else { "📄 " };
+        let display_name = format!("{}{}", icon, entry.name);
+        let badge = entry.ghost_kind.badge();
+
+        println!(
+            "     {:<40} {:<12} {:<18} {:<12}",
+            if display_name.len() > 40 {
+                format!("{}...", &display_name[..37])
+            } else {
+                display_name
+            },
+            format_size(entry.disk_usage),
+            bar_text,
+            badge
+        );
+    }
+
+    if root_entry.children.len() > 20 {
+        println!("     ... and {} more items", root_entry.children.len() - 20);
+    }
+
+    // Ghost & Docker Summary
+    println!();
+    println!("════════════════════════════════════════════════════════════════════════════════");
+    println!("  🐳 DOCKER RECLAIMABLE STORAGE");
+    println!("════════════════════════════════════════════════════════════════════════════════");
+    if docker_info.is_available {
+        let total_docker = docker_info.images_total_size
+            + docker_info.containers_total_size
+            + docker_info.volumes_total_size
+            + docker_info.build_cache_total_size;
+
+        let total_reclaimable = docker_info.images_reclaimable_size
+            + docker_info.containers_reclaimable_size
+            + docker_info.volumes_reclaimable_size
+            + docker_info.build_cache_reclaimable_size;
+
+        println!("  Total Docker Space:       {}", format_size(total_docker));
+        println!("  Reclaimable Ghost Space:  {} (Images: {}, Containers: {}, Volumes: {}, BuildCache: {})",
+            format_size(total_reclaimable),
+            format_size(docker_info.images_reclaimable_size),
+            format_size(docker_info.containers_reclaimable_size),
+            format_size(docker_info.volumes_reclaimable_size),
+            format_size(docker_info.build_cache_reclaimable_size),
+        );
+        println!("  Images: {} | Containers: {} | Local Volumes: {}",
+            docker_info.images_count, docker_info.containers_count, docker_info.volumes_count);
+    } else {
+        println!("  Docker daemon: {}", docker_info.error_message.as_deref().unwrap_or("Not running"));
+    }
+
+    println!();
+    println!("════════════════════════════════════════════════════════════════════════════════");
+    println!("  👻 OPEN UNLINKED GHOST FILES (/proc/*/fd)");
+    println!("════════════════════════════════════════════════════════════════════════════════");
+    if deleted_open.is_empty() {
+        println!("  No open unlinked files currently holding significant disk space.");
+    } else {
+        let total_held: u64 = deleted_open.iter().map(|f| f.size).sum();
+        println!("  Total Ghost Space Held: {} ({} files)", format_size(total_held), deleted_open.len());
+        for item in deleted_open.iter().take(5) {
+            println!("  PID {:<7} | {:<16} | {:<10} | {}", item.pid, item.process_name, format_size(item.size), item.original_path);
+        }
+    }
+
+    println!("════════════════════════════════════════════════════════════════════════════════");
+    Ok(())
+}

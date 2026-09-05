@@ -1,0 +1,543 @@
+use crate::fs::entry::FileEntry;
+use crate::ghost::{
+    fetch_docker_disk_info, prune_docker_dangling, scan_deleted_open_files, DeletedOpenFile,
+    DockerDiskInfo,
+};
+use crate::ops::{move_to_trash, permanently_delete};
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActiveView {
+    Filesystem,
+    GhostInspector,
+    HelpModal,
+    ConfirmModal,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GhostFilterMode {
+    ShowAll,
+    HideGhost,
+    GhostOnly,
+}
+
+impl GhostFilterMode {
+    pub fn next(&self) -> Self {
+        match self {
+            GhostFilterMode::ShowAll => GhostFilterMode::HideGhost,
+            GhostFilterMode::HideGhost => GhostFilterMode::GhostOnly,
+            GhostFilterMode::GhostOnly => GhostFilterMode::ShowAll,
+        }
+    }
+
+    pub fn label(&self) -> &'static str {
+        match self {
+            GhostFilterMode::ShowAll => "All Files",
+            GhostFilterMode::HideGhost => "Ghost Files Hidden",
+            GhostFilterMode::GhostOnly => "Ghost Files ONLY",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SortMode {
+    BySizeDesc,
+    BySizeAsc,
+    ByName,
+    ByItems,
+}
+
+impl SortMode {
+    pub fn next(&self) -> Self {
+        match self {
+            SortMode::BySizeDesc => SortMode::BySizeAsc,
+            SortMode::BySizeAsc => SortMode::ByName,
+            SortMode::ByName => SortMode::ByItems,
+            SortMode::ByItems => SortMode::BySizeDesc,
+        }
+    }
+
+    pub fn label(&self) -> &'static str {
+        match self {
+            SortMode::BySizeDesc => "Size (desc)",
+            SortMode::BySizeAsc => "Size (asc)",
+            SortMode::ByName => "Name",
+            SortMode::ByItems => "Item Count",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfirmAction {
+    MoveToTrash,
+    PermanentDelete,
+    DockerPrune,
+}
+
+pub struct App {
+    pub root_entry: FileEntry,
+    pub path_stack: Vec<usize>, // Index stack navigating into child directories
+    pub selected_paths: HashSet<PathBuf>,
+    pub active_view: ActiveView,
+    pub previous_view: ActiveView,
+    pub ghost_filter: GhostFilterMode,
+    pub sort_mode: SortMode,
+    pub apparent_size: bool,
+    pub cursor_index: usize,
+    pub scroll_offset: usize,
+    pub search_query: String,
+    pub is_searching: bool,
+    pub status_message: Option<(String, std::time::Instant)>,
+    pub pending_action: Option<ConfirmAction>,
+    pub action_targets: Vec<PathBuf>,
+    pub action_total_size: u64,
+
+    // Ghost Inspector data
+    pub docker_info: DockerDiskInfo,
+    pub deleted_open_files: Vec<DeletedOpenFile>,
+    pub ghost_tab_index: usize, // 0 = Docker, 1 = Deleted-Open Files
+    pub ghost_cursor_index: usize,
+}
+
+impl App {
+    pub fn new(root_entry: FileEntry) -> Self {
+        let docker_info = fetch_docker_disk_info();
+        let deleted_open_files = scan_deleted_open_files();
+
+        Self {
+            root_entry,
+            path_stack: Vec::new(),
+            selected_paths: HashSet::new(),
+            active_view: ActiveView::Filesystem,
+            previous_view: ActiveView::Filesystem,
+            ghost_filter: GhostFilterMode::ShowAll,
+            sort_mode: SortMode::BySizeDesc,
+            apparent_size: false,
+            cursor_index: 0,
+            scroll_offset: 0,
+            search_query: String::new(),
+            is_searching: false,
+            status_message: None,
+            pending_action: None,
+            action_targets: Vec::new(),
+            action_total_size: 0,
+            docker_info,
+            deleted_open_files,
+            ghost_tab_index: 0,
+            ghost_cursor_index: 0,
+        }
+    }
+
+    /// Refresh Docker and deleted-open ghost file info
+    pub fn refresh_ghost_info(&mut self) {
+        self.docker_info = fetch_docker_disk_info();
+        self.deleted_open_files = scan_deleted_open_files();
+        self.set_status("Refreshed Docker & Ghost files data");
+    }
+
+    pub fn set_status(&mut self, msg: impl Into<String>) {
+        self.status_message = Some((msg.into(), std::time::Instant::now()));
+    }
+
+    pub fn current_status(&self) -> Option<&str> {
+        if let Some((ref msg, time)) = self.status_message {
+            if time.elapsed().as_secs() < 5 {
+                return Some(msg.as_str());
+            }
+        }
+        None
+    }
+
+    /// Retrieve the current directory node by traversing path_stack
+    pub fn current_dir_entry(&self) -> &FileEntry {
+        let mut curr = &self.root_entry;
+        for &idx in &self.path_stack {
+            if idx < curr.children.len() {
+                curr = &curr.children[idx];
+            } else {
+                break;
+            }
+        }
+        curr
+    }
+
+    /// Mutable traversal to current directory
+    #[allow(dead_code)]
+    pub fn current_dir_entry_mut(&mut self) -> &mut FileEntry {
+        let mut curr = &mut self.root_entry;
+        for &idx in &self.path_stack {
+            if idx < curr.children.len() {
+                curr = &mut curr.children[idx];
+            } else {
+                break;
+            }
+        }
+        curr
+    }
+
+    /// Filtered and sorted child list for display
+    pub fn visible_children(&self) -> Vec<&FileEntry> {
+        let current = self.current_dir_entry();
+        let mut list: Vec<&FileEntry> = current
+            .children
+            .iter()
+            .filter(|entry| {
+                // 1. Ghost filter
+                match self.ghost_filter {
+                    GhostFilterMode::ShowAll => true,
+                    GhostFilterMode::HideGhost => !entry.ghost_kind.is_ghost(),
+                    GhostFilterMode::GhostOnly => entry.ghost_kind.is_ghost(),
+                }
+            })
+            .filter(|entry| {
+                // 2. Search filter
+                if self.search_query.is_empty() {
+                    true
+                } else {
+                    entry
+                        .name
+                        .to_lowercase()
+                        .contains(&self.search_query.to_lowercase())
+                }
+            })
+            .collect();
+
+        // Sort items
+        match self.sort_mode {
+            SortMode::BySizeDesc => {
+                list.sort_by(|a, b| {
+                    let s_b = b.display_size(self.apparent_size);
+                    let s_a = a.display_size(self.apparent_size);
+                    s_b.cmp(&s_a)
+                });
+            }
+            SortMode::BySizeAsc => {
+                list.sort_by(|a, b| {
+                    let s_a = a.display_size(self.apparent_size);
+                    let s_b = b.display_size(self.apparent_size);
+                    s_a.cmp(&s_b)
+                });
+            }
+            SortMode::ByName => {
+                list.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+            }
+            SortMode::ByItems => {
+                list.sort_by(|a, b| b.items_count.cmp(&a.items_count));
+            }
+        }
+
+        list
+    }
+
+    /// Move cursor down
+    pub fn cursor_down(&mut self) {
+        if self.active_view == ActiveView::GhostInspector {
+            let max = if self.ghost_tab_index == 0 {
+                self.docker_info.items.len()
+            } else {
+                self.deleted_open_files.len()
+            };
+            if max > 0 && self.ghost_cursor_index + 1 < max {
+                self.ghost_cursor_index += 1;
+            }
+            return;
+        }
+
+        let total = self.visible_children().len();
+        if total > 0 && self.cursor_index + 1 < total {
+            self.cursor_index += 1;
+        }
+    }
+
+    /// Move cursor up
+    pub fn cursor_up(&mut self) {
+        if self.active_view == ActiveView::GhostInspector {
+            if self.ghost_cursor_index > 0 {
+                self.ghost_cursor_index -= 1;
+            }
+            return;
+        }
+
+        if self.cursor_index > 0 {
+            self.cursor_index -= 1;
+        }
+    }
+
+    /// Enter directory
+    pub fn enter_selected(&mut self) {
+        let visible = self.visible_children();
+        if let Some(target) = visible.get(self.cursor_index) {
+            if target.is_dir {
+                let target_path = target.path.clone();
+                // Locate original child index in parent
+                let current = self.current_dir_entry();
+                if let Some(orig_idx) = current.children.iter().position(|c| c.path == target_path) {
+                    self.path_stack.push(orig_idx);
+                    self.cursor_index = 0;
+                    self.scroll_offset = 0;
+                    self.search_query.clear();
+                }
+            }
+        }
+    }
+
+    /// Navigate to parent directory
+    pub fn go_up(&mut self) {
+        if !self.path_stack.is_empty() {
+            let last_idx = self.path_stack.pop().unwrap_or(0);
+            self.cursor_index = last_idx;
+            self.scroll_offset = 0;
+            self.search_query.clear();
+        }
+    }
+
+    /// Toggle selection of current item or marked set
+    pub fn toggle_selection(&mut self) {
+        let visible = self.visible_children();
+        if let Some(target) = visible.get(self.cursor_index) {
+            let p = target.path.clone();
+            if self.selected_paths.contains(&p) {
+                self.selected_paths.remove(&p);
+            } else {
+                self.selected_paths.insert(p);
+            }
+        }
+    }
+
+    /// Invert / select all in current visible directory
+    pub fn select_all_visible(&mut self) {
+        let paths: Vec<PathBuf> = self
+            .visible_children()
+            .into_iter()
+            .map(|e| e.path.clone())
+            .collect();
+        let all_selected = paths.iter().all(|p| self.selected_paths.contains(p));
+        if all_selected {
+            for p in &paths {
+                self.selected_paths.remove(p);
+            }
+        } else {
+            for p in paths {
+                self.selected_paths.insert(p);
+            }
+        }
+    }
+
+    /// Selected items count and total size
+    pub fn selection_summary(&self) -> (usize, u64) {
+        let count = self.selected_paths.len();
+        let mut total_size = 0u64;
+
+        // Traverse tree to calculate sizes
+        fn sum_selected(entry: &FileEntry, selected: &HashSet<PathBuf>, apparent: bool, sum: &mut u64) {
+            if selected.contains(&entry.path) {
+                *sum = sum.saturating_add(entry.display_size(apparent));
+            } else if entry.is_dir {
+                for child in &entry.children {
+                    sum_selected(child, selected, apparent, sum);
+                }
+            }
+        }
+
+        sum_selected(&self.root_entry, &self.selected_paths, self.apparent_size, &mut total_size);
+        (count, total_size)
+    }
+
+    /// Prepare Move to Wastebin confirmation
+    pub fn prompt_move_to_trash(&mut self) {
+        let mut targets = Vec::new();
+        let mut total_size = 0u64;
+
+        if !self.selected_paths.is_empty() {
+            targets = self.selected_paths.iter().cloned().collect();
+            let (_, sz) = self.selection_summary();
+            total_size = sz;
+        } else {
+            let visible = self.visible_children();
+            if let Some(entry) = visible.get(self.cursor_index) {
+                targets.push(entry.path.clone());
+                total_size = entry.display_size(self.apparent_size);
+            }
+        }
+
+        if targets.is_empty() {
+            self.set_status("No item selected to move to wastebin");
+            return;
+        }
+
+        self.action_targets = targets;
+        self.action_total_size = total_size;
+        self.pending_action = Some(ConfirmAction::MoveToTrash);
+        self.previous_view = self.active_view;
+        self.active_view = ActiveView::ConfirmModal;
+    }
+
+    /// Prepare Permanent Deletion confirmation
+    pub fn prompt_permanent_delete(&mut self) {
+        let mut targets = Vec::new();
+        let mut total_size = 0u64;
+
+        if !self.selected_paths.is_empty() {
+            targets = self.selected_paths.iter().cloned().collect();
+            let (_, sz) = self.selection_summary();
+            total_size = sz;
+        } else {
+            let visible = self.visible_children();
+            if let Some(entry) = visible.get(self.cursor_index) {
+                targets.push(entry.path.clone());
+                total_size = entry.display_size(self.apparent_size);
+            }
+        }
+
+        if targets.is_empty() {
+            self.set_status("No item selected to permanently delete");
+            return;
+        }
+
+        self.action_targets = targets;
+        self.action_total_size = total_size;
+        self.pending_action = Some(ConfirmAction::PermanentDelete);
+        self.previous_view = self.active_view;
+        self.active_view = ActiveView::ConfirmModal;
+    }
+
+    /// Prepare Docker Prune confirmation
+    pub fn prompt_docker_prune(&mut self) {
+        let total_reclaimable = self.docker_info.images_reclaimable_size
+            + self.docker_info.containers_reclaimable_size
+            + self.docker_info.volumes_reclaimable_size
+            + self.docker_info.build_cache_reclaimable_size;
+
+        self.action_targets.clear();
+        self.action_total_size = total_reclaimable;
+        self.pending_action = Some(ConfirmAction::DockerPrune);
+        self.previous_view = self.active_view;
+        self.active_view = ActiveView::ConfirmModal;
+    }
+
+    /// Execute pending action after user confirms
+    pub fn execute_pending_action(&mut self) {
+        let action = match self.pending_action.take() {
+            Some(a) => a,
+            None => {
+                self.active_view = self.previous_view;
+                return;
+            }
+        };
+
+        match action {
+            ConfirmAction::MoveToTrash => {
+                let targets = std::mem::take(&mut self.action_targets);
+                let result = move_to_trash(&targets);
+                let count = result.succeeded.len();
+                let failed_count = result.failed.len();
+
+                // Remove deleted paths from tree
+                for path in &result.succeeded {
+                    self.selected_paths.remove(path);
+                    self.remove_path_from_tree(path);
+                }
+
+                if failed_count == 0 {
+                    self.set_status(format!("✔ Moved {} items to Wastebin", count));
+                } else {
+                    self.set_status(format!(
+                        "Moved {} to wastebin, {} failed (permissions/cross-fs)",
+                        count, failed_count
+                    ));
+                }
+            }
+            ConfirmAction::PermanentDelete => {
+                let targets = std::mem::take(&mut self.action_targets);
+                let result = permanently_delete(&targets);
+                let count = result.succeeded.len();
+                let failed_count = result.failed.len();
+
+                // Remove deleted paths from tree
+                for path in &result.succeeded {
+                    self.selected_paths.remove(path);
+                    self.remove_path_from_tree(path);
+                }
+
+                if failed_count == 0 {
+                    self.set_status(format!("✔ Permanently removed {} items", count));
+                } else {
+                    self.set_status(format!(
+                        "Removed {} items, {} failed (permissions)",
+                        count, failed_count
+                    ));
+                }
+            }
+            ConfirmAction::DockerPrune => {
+                match prune_docker_dangling() {
+                    Ok(msg) => {
+                        self.set_status(format!("✔ Docker Prune: {}", msg));
+                        self.refresh_ghost_info();
+                    }
+                    Err(err) => {
+                        self.set_status(format!("❌ Docker Prune failed: {}", err));
+                    }
+                }
+            }
+        }
+
+        // Adjust cursor
+        let total = self.visible_children().len();
+        if self.cursor_index >= total && total > 0 {
+            self.cursor_index = total - 1;
+        }
+
+        self.active_view = self.previous_view;
+    }
+
+    /// Cancel pending confirmation
+    pub fn cancel_modal(&mut self) {
+        self.pending_action = None;
+        self.action_targets.clear();
+        self.active_view = self.previous_view;
+    }
+
+    /// Remove deleted item from internal directory tree and recalculate sizes
+    fn remove_path_from_tree(&mut self, path: &Path) {
+        fn remove_rec(entry: &mut FileEntry, target: &Path) -> bool {
+            let initial_len = entry.children.len();
+            entry.children.retain(|c| c.path != target);
+            if entry.children.len() != initial_len {
+                // Item removed directly from this directory; recalculate
+                recalc(entry);
+                return true;
+            }
+
+            let mut found = false;
+            for child in &mut entry.children {
+                if child.is_dir && target.starts_with(&child.path) {
+                    if remove_rec(child, target) {
+                        found = true;
+                        break;
+                    }
+                }
+            }
+            if found {
+                recalc(entry);
+            }
+            found
+        }
+
+        fn recalc(entry: &mut FileEntry) {
+            let mut total_size = 0u64;
+            let mut total_disk = 0u64;
+            let mut total_items = 0usize;
+            for child in &entry.children {
+                total_size = total_size.saturating_add(child.size);
+                total_disk = total_disk.saturating_add(child.disk_usage);
+                total_items = total_items.saturating_add(child.items_count);
+            }
+            entry.size = total_size;
+            entry.disk_usage = total_disk;
+            entry.items_count = total_items + 1;
+        }
+
+        remove_rec(&mut self.root_entry, path);
+    }
+}
