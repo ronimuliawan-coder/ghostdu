@@ -476,7 +476,7 @@ fn render_filesystem_view(f: &mut Frame, app: &App, area: Rect) {
 
             let name_span = Span::styled(display_name, name_style);
 
-            // Ghost/Docker Badge for wide/standard modes
+            // Ghost/Docker/Category Badge for wide/standard modes
             let badge_span = match entry.ghost_kind {
                 GhostKind::DockerOverlay
                 | GhostKind::DockerVolume
@@ -488,14 +488,47 @@ fn render_filesystem_view(f: &mut Frame, app: &App, area: Rect) {
                 GhostKind::PodmanUser => {
                     Span::styled("🦭 PODMAN", Style::default().fg(Color::Magenta))
                 }
-                GhostKind::BuildCache => {
-                    Span::styled("👻 CACHE", Style::default().fg(Color::LightMagenta))
+                GhostKind::DeletedOpen => {
+                    Span::styled("👻 GHOST", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD))
+                }
+                GhostKind::Trash => {
+                    Span::styled("🗑️ TRASH", Style::default().fg(Color::LightRed))
+                }
+                GhostKind::LogFiles => {
+                    Span::styled("📜 LOGS", Style::default().fg(Color::Yellow))
+                }
+                GhostKind::Flatpak => {
+                    Span::styled("📦 FLATPAK", Style::default().fg(Color::LightCyan))
+                }
+                GhostKind::SnapPackage => {
+                    Span::styled("📦 SNAP", Style::default().fg(Color::LightCyan))
+                }
+                GhostKind::DependencyTree => {
+                    Span::styled("📦 DEPS", Style::default().fg(Color::Cyan))
+                }
+                GhostKind::GamingCompat => {
+                    Span::styled("🎮 GAME", Style::default().fg(Color::LightGreen))
+                }
+                GhostKind::AiModel => {
+                    Span::styled("🤖 AI", Style::default().fg(Color::LightMagenta).add_modifier(Modifier::BOLD))
+                }
+                GhostKind::VmOrIso => {
+                    Span::styled("💿 VM/ISO", Style::default().fg(Color::LightBlue))
+                }
+                GhostKind::BrowserCache => {
+                    Span::styled("🌐 BROWSER", Style::default().fg(Color::LightYellow))
+                }
+                GhostKind::CoreDump => {
+                    Span::styled("💥 CRASH", Style::default().fg(Color::LightRed).add_modifier(Modifier::BOLD))
+                }
+                GhostKind::SystemSnapshot => {
+                    Span::styled("🔒 SNAP", Style::default().fg(Color::LightRed))
                 }
                 GhostKind::PackageCache => {
                     Span::styled("📦 PKG", Style::default().fg(Color::LightYellow))
                 }
-                GhostKind::DeletedOpen => {
-                    Span::styled("👻 GHOST", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD))
+                GhostKind::BuildCache => {
+                    Span::styled("👻 CACHE", Style::default().fg(Color::DarkGray))
                 }
                 GhostKind::None => {
                     if entry.has_err {
@@ -1258,6 +1291,16 @@ fn render_item_info_modal(f: &mut Frame, app: &App, screen: Rect) {
         Span::styled("Path: ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
         Span::styled(trunc_p, Style::default().fg(Color::White)),
     ]));
+
+    if info.ghost_kind.is_ghost() {
+        lines.push(Line::from(vec![
+            Span::styled("Category: ", Style::default().fg(Color::LightMagenta).add_modifier(Modifier::BOLD)),
+            Span::styled(info.ghost_kind.label(), Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+            Span::raw("  ["),
+            Span::styled(info.ghost_kind.badge(), Style::default().fg(Color::LightCyan)),
+            Span::raw("]"),
+        ]));
+    }
 
     if !is_compact {
         lines.push(Line::from(""));

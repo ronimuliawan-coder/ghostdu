@@ -13,6 +13,17 @@ pub enum GhostKind {
     BuildCache,
     PackageCache,
     DeletedOpen,
+    Trash,
+    LogFiles,
+    Flatpak,
+    SnapPackage,
+    DependencyTree,
+    GamingCompat,
+    AiModel,
+    VmOrIso,
+    BrowserCache,
+    CoreDump,
+    SystemSnapshot,
 }
 
 #[allow(dead_code)]
@@ -45,6 +56,17 @@ impl GhostKind {
             GhostKind::BuildCache => "👻 Build-Cache",
             GhostKind::PackageCache => "📦 Pkg-Cache",
             GhostKind::DeletedOpen => "👻 Deleted-Open",
+            GhostKind::Trash => "🗑️ Wastebin/Trash",
+            GhostKind::LogFiles => "📜 System/App Logs",
+            GhostKind::Flatpak => "📦 Flatpak",
+            GhostKind::SnapPackage => "📦 Snap Package",
+            GhostKind::DependencyTree => "📦 Dependencies",
+            GhostKind::GamingCompat => "🎮 Game/Shaders",
+            GhostKind::AiModel => "🤖 AI Model",
+            GhostKind::VmOrIso => "💿 VM Disk / ISO",
+            GhostKind::BrowserCache => "🌐 Browser Cache",
+            GhostKind::CoreDump => "💥 Crash Dump",
+            GhostKind::SystemSnapshot => "🔒 Snapshot",
         }
     }
 
@@ -60,6 +82,17 @@ impl GhostKind {
             GhostKind::BuildCache => "👻 CACHE",
             GhostKind::PackageCache => "📦 PKG",
             GhostKind::DeletedOpen => "👻 GHOST",
+            GhostKind::Trash => "🗑️ TRASH",
+            GhostKind::LogFiles => "📜 LOGS",
+            GhostKind::Flatpak => "📦 FLATPAK",
+            GhostKind::SnapPackage => "📦 SNAP",
+            GhostKind::DependencyTree => "📦 DEPS",
+            GhostKind::GamingCompat => "🎮 GAME",
+            GhostKind::AiModel => "🤖 AI",
+            GhostKind::VmOrIso => "💿 VM/ISO",
+            GhostKind::BrowserCache => "🌐 BROWSER",
+            GhostKind::CoreDump => "💥 CRASH",
+            GhostKind::SystemSnapshot => "🔒 SNAP",
         }
     }
 }

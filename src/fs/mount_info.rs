@@ -5,6 +5,9 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
+use crate::fs::entry::GhostKind;
+use crate::ghost::classify_path;
+
 #[derive(Debug, Clone, Default)]
 pub struct FsMountInfo {
     pub device: String,
@@ -105,6 +108,7 @@ pub struct DetailedItemInfo {
     pub gid: u32,
     pub modified_str: String,
     pub fs_info: Option<FsMountInfo>,
+    pub ghost_kind: GhostKind,
 }
 
 pub fn get_detailed_item_info(path: &Path, items_count: usize) -> Option<DetailedItemInfo> {
@@ -178,6 +182,7 @@ pub fn get_detailed_item_info(path: &Path, items_count: usize) -> Option<Detaile
         gid,
         modified_str,
         fs_info,
+        ghost_kind: classify_path(path),
     })
 }
 

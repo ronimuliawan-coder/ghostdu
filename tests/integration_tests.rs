@@ -54,10 +54,10 @@ fn test_scanner_and_inode_dedup() {
     // Without inode dedup it would have been 9000 bytes!
     assert_eq!(root_entry.size, 8000);
 
-    // Verify node_modules was classified as BuildCache
+    // Verify node_modules was classified as DependencyTree
     let subdir = root_entry.children.iter().find(|c| c.name == "subdir").unwrap();
     let node_modules = subdir.children.iter().find(|c| c.name == "node_modules").unwrap();
-    assert_eq!(node_modules.ghost_kind, ghostdu_scanner::GhostKind::BuildCache);
+    assert_eq!(node_modules.ghost_kind, ghostdu_scanner::GhostKind::DependencyTree);
     assert!(node_modules.ghost_kind.is_ghost());
 }
 
@@ -309,6 +309,63 @@ fn test_small_terminal_rendering() {
         app.active_view = ghostdu::ui::ActiveView::GhostInspector;
         terminal.draw(|f| ghostdu::ui::render_ui(f, &app)).unwrap();
     }
+}
+
+#[test]
+fn test_category_taxonomy_scanning() {
+    let temp_dir = tempfile::tempdir().expect("create temp dir");
+    let base = temp_dir.path();
+
+    // Create subdirs and files representing various categories
+    let trash_dir = base.join(".Trash-1000");
+    fs::create_dir_all(&trash_dir).unwrap();
+    fs::write(trash_dir.join("discarded.dat"), "trash content").unwrap();
+
+    let node_modules_dir = base.join("node_modules");
+    fs::create_dir_all(&node_modules_dir).unwrap();
+    fs::write(node_modules_dir.join("index.js"), "module.exports = {}").unwrap();
+
+    let target_dir = base.join("target");
+    fs::create_dir_all(&target_dir).unwrap();
+    fs::write(target_dir.join("build.rs"), "fn main() {}").unwrap();
+
+    let log_file = base.join("system.log");
+    fs::write(&log_file, "log line").unwrap();
+
+    let ai_file = base.join("weights.safetensors");
+    fs::write(&ai_file, "tensor weights").unwrap();
+
+    let iso_file = base.join("installer.iso");
+    fs::write(&iso_file, "iso header").unwrap();
+
+    let normal_file = base.join("notes.txt");
+    fs::write(&normal_file, "hello world").unwrap();
+
+    let stop_signal = Arc::new(AtomicBool::new(false));
+    let root = ghostdu_scanner::scan_directory(base, None, stop_signal).unwrap();
+
+    let find_child = |name: &str| root.children.iter().find(|c| c.name == name).unwrap();
+
+    assert_eq!(find_child(".Trash-1000").ghost_kind, ghostdu_scanner::GhostKind::Trash);
+    assert_eq!(find_child(".Trash-1000").ghost_kind.badge(), "🗑️ TRASH");
+
+    assert_eq!(find_child("node_modules").ghost_kind, ghostdu_scanner::GhostKind::DependencyTree);
+    assert_eq!(find_child("node_modules").ghost_kind.badge(), "📦 DEPS");
+
+    assert_eq!(find_child("target").ghost_kind, ghostdu_scanner::GhostKind::BuildCache);
+    assert_eq!(find_child("target").ghost_kind.badge(), "👻 CACHE");
+
+    assert_eq!(find_child("system.log").ghost_kind, ghostdu_scanner::GhostKind::LogFiles);
+    assert_eq!(find_child("system.log").ghost_kind.badge(), "📜 LOGS");
+
+    assert_eq!(find_child("weights.safetensors").ghost_kind, ghostdu_scanner::GhostKind::AiModel);
+    assert_eq!(find_child("weights.safetensors").ghost_kind.badge(), "🤖 AI");
+
+    assert_eq!(find_child("installer.iso").ghost_kind, ghostdu_scanner::GhostKind::VmOrIso);
+    assert_eq!(find_child("installer.iso").ghost_kind.badge(), "💿 VM/ISO");
+
+    assert_eq!(find_child("notes.txt").ghost_kind, ghostdu_scanner::GhostKind::None);
+    assert_eq!(find_child("notes.txt").ghost_kind.badge(), "");
 }
 
 // Minimal exposure for integration testing
