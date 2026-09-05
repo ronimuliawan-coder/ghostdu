@@ -217,6 +217,100 @@ fn test_app_state_and_navigation() {
     assert!(item_info.fs_info.is_some());
 }
 
+#[test]
+fn test_in_place_refresh() {
+    let temp_dir = tempfile::tempdir().expect("create temp dir");
+    let base = temp_dir.path();
+    let f1 = base.join("f1.txt");
+    fs::write(&f1, "12345").unwrap(); // 5 bytes
+
+    let stop_signal = Arc::new(AtomicBool::new(false));
+    let root = ghostdu_scanner::scan_directory(base, None, stop_signal).unwrap();
+    let mut app = ghostdu::ui::App::new(root);
+
+    assert_eq!(app.visible_children().len(), 1);
+    assert_eq!(app.root_entry.size, 5);
+
+    // Write a second file while app is running
+    let f2 = base.join("f2.txt");
+    fs::write(&f2, "6789012345").unwrap(); // 10 bytes
+
+    // Refresh in-place without restarting!
+    app.refresh_all();
+
+    assert_eq!(app.visible_children().len(), 2);
+    assert_eq!(app.root_entry.size, 15);
+    assert!(app.current_status().is_some());
+    assert!(app.current_status().unwrap().contains("Refreshed"));
+
+    // Test refresh while navigating inside a subdirectory
+    let sub = base.join("subfolder");
+    fs::create_dir_all(&sub).unwrap();
+    fs::write(sub.join("sub_a.txt"), "sub_a").unwrap();
+
+    app.refresh_all();
+    assert_eq!(app.visible_children().len(), 3);
+
+    // Enter subfolder
+    let sub_idx = app.visible_children().iter().position(|c| c.name == "subfolder").unwrap();
+    app.cursor_index = sub_idx;
+    app.enter_selected();
+    assert_eq!(app.path_stack.len(), 1);
+    assert_eq!(app.visible_children().len(), 1);
+
+    // Add another file in subfolder
+    fs::write(sub.join("sub_b.txt"), "sub_b").unwrap();
+    app.refresh_all();
+
+    // Still in subfolder, now seeing 2 files!
+    assert_eq!(app.path_stack.len(), 1);
+    assert_eq!(app.visible_children().len(), 2);
+}
+
+#[test]
+fn test_small_terminal_rendering() {
+    let temp_dir = tempfile::tempdir().expect("create temp dir");
+    let base = temp_dir.path();
+    fs::write(base.join("test.txt"), "content").unwrap();
+
+    let stop_signal = Arc::new(AtomicBool::new(false));
+    let root = ghostdu_scanner::scan_directory(base, None, stop_signal).unwrap();
+    let mut app = ghostdu::ui::App::new(root);
+
+    // Test a variety of terminal dimensions from wide to tiny
+    let sizes = [
+        (120, 30), // Widescreen
+        (80, 24),  // Standard
+        (70, 18),  // Medium
+        (60, 14),  // Small
+        (45, 10),  // Narrow & Short
+        (35, 6),   // Tiny
+        (20, 3),   // Extreme
+    ];
+
+    for &(w, h) in &sizes {
+        let backend = ratatui::backend::TestBackend::new(w, h);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+
+        // Filesystem View
+        app.active_view = ghostdu::ui::ActiveView::Filesystem;
+        terminal.draw(|f| ghostdu::ui::render_ui(f, &app)).unwrap();
+
+        // Help Modal
+        app.active_view = ghostdu::ui::ActiveView::HelpModal;
+        terminal.draw(|f| ghostdu::ui::render_ui(f, &app)).unwrap();
+
+        // Item Info Modal
+        app.active_view = ghostdu::ui::ActiveView::ItemInfoModal;
+        app.item_info = ghostdu::fs::get_detailed_item_info(&app.root_entry.path, 1);
+        terminal.draw(|f| ghostdu::ui::render_ui(f, &app)).unwrap();
+
+        // Ghost Inspector View
+        app.active_view = ghostdu::ui::ActiveView::GhostInspector;
+        terminal.draw(|f| ghostdu::ui::render_ui(f, &app)).unwrap();
+    }
+}
+
 // Minimal exposure for integration testing
 mod ghostdu_scanner {
     pub use ghostdu::fs::entry::GhostKind;

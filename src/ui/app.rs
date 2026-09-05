@@ -640,4 +640,129 @@ impl App {
 
         remove_rec(&mut self.root_entry, path);
     }
+
+    /// Replace a subtree at target path with a newly scanned node and recalculate ancestor sizes
+    pub fn replace_subtree(&mut self, target: &Path, new_node: FileEntry) {
+        fn replace_rec(entry: &mut FileEntry, target: &Path, new_node: &FileEntry) -> bool {
+            for child in &mut entry.children {
+                if child.path == target {
+                    *child = new_node.clone();
+                    recalc(entry);
+                    return true;
+                }
+                if child.is_dir && target.starts_with(&child.path) {
+                    if replace_rec(child, target, new_node) {
+                        recalc(entry);
+                        return true;
+                    }
+                }
+            }
+            false
+        }
+
+        fn recalc(entry: &mut FileEntry) {
+            let mut total_size = 0u64;
+            let mut total_disk = 0u64;
+            let mut total_items = 0usize;
+            for child in &entry.children {
+                total_size = total_size.saturating_add(child.size);
+                total_disk = total_disk.saturating_add(child.disk_usage);
+                total_items = total_items.saturating_add(child.items_count);
+            }
+            entry.size = total_size;
+            entry.disk_usage = total_disk;
+            entry.items_count = total_items + 1;
+        }
+
+        replace_rec(&mut self.root_entry, target, &new_node);
+
+        // Validate path_stack bounds
+        let mut curr = &self.root_entry;
+        let mut valid_depth = 0;
+        for &idx in &self.path_stack {
+            if idx < curr.children.len() {
+                curr = &curr.children[idx];
+                valid_depth += 1;
+            } else {
+                break;
+            }
+        }
+        self.path_stack.truncate(valid_depth);
+    }
+
+    /// Refresh filesystem stats, directory tree, Docker storage, and ghost files without restarting
+    pub fn refresh_all(&mut self) {
+        let current_path = self.current_dir_entry().path.clone();
+        let is_at_root = self.path_stack.is_empty();
+
+        let stop_signal = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        if is_at_root {
+            if let Ok(new_root) = crate::fs::scanner::scan_directory(&self.root_entry.path, None, stop_signal) {
+                self.root_entry = new_root;
+            }
+        } else {
+            if let Ok(new_subtree) = crate::fs::scanner::scan_directory(&current_path, None, stop_signal) {
+                self.replace_subtree(&current_path, new_subtree);
+            }
+        }
+
+        // 1. Refresh global fs statvfs
+        self.refresh_fs_info();
+
+        // 2. Refresh Docker & unlinked ghost files
+        self.docker_info = crate::ghost::fetch_docker_disk_info();
+        self.deleted_open_files = crate::ghost::scan_deleted_open_files();
+
+        // 3. Refresh detailed item info if modal is open
+        if self.active_view == ActiveView::ItemInfoModal {
+            let visible = self.visible_children();
+            if let Some(target) = visible.get(self.cursor_index) {
+                self.item_info = crate::fs::mount_info::get_detailed_item_info(&target.path, target.items_count);
+            }
+        }
+
+        // 4. Clamp cursor
+        let total = self.visible_children().len();
+        if self.cursor_index >= total && total > 0 {
+            self.cursor_index = total - 1;
+        }
+
+        self.set_status("⚡ Refreshed disk usage, free space & ghost details");
+    }
+
+    /// Navigate path_stack to reach target path if it exists within root_entry
+    pub fn navigate_to_path(&mut self, target: &Path) -> bool {
+        self.path_stack.clear();
+        self.cursor_index = 0;
+        self.scroll_offset.set(0);
+
+        if target == self.root_entry.path {
+            self.refresh_fs_info();
+            return true;
+        }
+
+        let mut curr = &self.root_entry;
+        loop {
+            let mut matched = false;
+            for (idx, child) in curr.children.iter().enumerate() {
+                if child.path == target {
+                    self.path_stack.push(idx);
+                    self.refresh_fs_info();
+                    return true;
+                }
+                if child.is_dir && target.starts_with(&child.path) {
+                    self.path_stack.push(idx);
+                    curr = child;
+                    matched = true;
+                    break;
+                }
+            }
+            if !matched {
+                break;
+            }
+        }
+
+        self.refresh_fs_info();
+        !self.path_stack.is_empty()
+    }
 }

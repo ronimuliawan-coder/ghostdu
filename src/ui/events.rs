@@ -93,8 +93,8 @@ fn handle_ghost_keys(app: &mut App, key: KeyEvent) -> EventResult {
                 app.prompt_docker_prune();
             }
         }
-        KeyCode::Char('r') | KeyCode::Char('R') => {
-            app.refresh_ghost_info();
+        KeyCode::Char('r') | KeyCode::F(5) => {
+            app.refresh_all();
         }
         KeyCode::Char('q') => {
             app.active_view = ActiveView::Filesystem;
@@ -254,7 +254,11 @@ fn handle_filesystem_keys(app: &mut App, key: KeyEvent) -> EventResult {
             app.open_item_info();
             EventResult::Continue
         }
-        KeyCode::Char('r') => EventResult::RescanRequested,
+        KeyCode::Char('r') => {
+            app.refresh_all();
+            EventResult::Continue
+        }
+        KeyCode::Char('R') | KeyCode::F(5) => EventResult::RescanRequested,
         KeyCode::Char('?') => {
             app.previous_view = app.active_view;
             app.active_view = ActiveView::HelpModal;

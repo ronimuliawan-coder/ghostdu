@@ -95,6 +95,8 @@ fn run_app<B: ratatui::backend::Backend>(
     terminal: &mut Terminal<B>,
     mut target_path: PathBuf,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let mut saved_current_path: Option<PathBuf> = None;
+
     loop {
         // Step 1: Progressive Scanning with Live Progress UI
         let (progress_tx, progress_rx) = unbounded::<ScanProgress>();
@@ -196,6 +198,10 @@ fn run_app<B: ratatui::backend::Backend>(
 
         // Step 2: Main interactive loop
         let mut app = App::new(root_entry);
+        if let Some(ref saved) = saved_current_path.take() {
+            app.navigate_to_path(saved);
+            app.set_status("⚡ Rescanned entire tree from root");
+        }
 
         let rescan_needed = loop {
             terminal.draw(|f| render_ui(f, &app))?;
@@ -206,7 +212,8 @@ fn run_app<B: ratatui::backend::Backend>(
                         EventResult::Exit => return Ok(()),
                         EventResult::Continue => {}
                         EventResult::RescanRequested => {
-                            target_path = app.current_dir_entry().path.clone();
+                            saved_current_path = Some(app.current_dir_entry().path.clone());
+                            target_path = app.root_entry.path.clone();
                             break true;
                         }
                         EventResult::RescanPath(new_path) => {
