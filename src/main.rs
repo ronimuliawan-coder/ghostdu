@@ -35,8 +35,8 @@ use std::io::IsTerminal;
 #[command(name = "ghostdu", author = "Ron", version = "0.1.0")]
 #[command(about = "Modern, ultra-fast native Linux disk usage & ghost file analyzer with wastebin support")]
 struct Cli {
-    /// Directory to scan (defaults to root /)
-    #[arg(default_value = "/")]
+    /// Directory to scan (defaults to current directory)
+    #[arg(default_value = ".")]
     path: PathBuf,
 
     /// Non-interactive summary report (auto-enabled if not running in an interactive terminal)

@@ -87,12 +87,16 @@ fn render_header(f: &mut Frame, app: &App, area: Rect) {
         Span::styled(" [📂 EXPLORER]", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))
     };
 
-    let title_line = Line::from(vec![
+    let mut title_spans = vec![
         Span::styled("👻 ghostdu ", Style::default().fg(Color::LightCyan).add_modifier(Modifier::BOLD)),
         view_tab_span,
         Span::raw(" │ "),
         Span::styled(format!("📁 {}", current_path), Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
-    ]);
+    ];
+    if current_path != "/" {
+        title_spans.push(Span::styled(" (Bksp: up, \\: root /)", Style::default().fg(Color::DarkGray)));
+    }
+    let title_line = Line::from(title_spans);
 
     let subtitle_line = Line::from(vec![
         Span::styled(format!("Size: {}", size_str), Style::default().fg(Color::Green)),
@@ -867,6 +871,10 @@ fn render_footer(f: &mut Frame, app: &App, area: Rect) {
     let footer_spans = match app.active_view {
         ActiveView::Filesystem => vec![
             Span::styled(" [?] Help ", Style::default().fg(Color::White).bg(Color::DarkGray)),
+            Span::raw(" "),
+            Span::styled(" [Bksp] Up ", Style::default().fg(Color::White).bg(Color::Rgb(60, 60, 75))),
+            Span::raw(" "),
+            Span::styled(" [\\] Root ", Style::default().fg(Color::White).bg(Color::Rgb(75, 60, 60))),
             Span::raw(" "),
             Span::styled(" [Tab] Ghost/Docker ", Style::default().fg(Color::Black).bg(Color::Magenta)),
             Span::raw(" "),
