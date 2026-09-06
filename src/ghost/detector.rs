@@ -1,4 +1,4 @@
-use crate::fs::entry::GhostKind;
+use crate::fs::entry::{DeleteSafety, GhostKind};
 use std::path::Path;
 
 pub fn classify_path(path: &Path) -> GhostKind {
@@ -190,6 +190,96 @@ pub fn classify_path(path: &Path) -> GhostKind {
     GhostKind::None
 }
 
+/// Classifies a path and its ghost kind into a Deletion Safety Tier:
+/// - Safe: Caches, trash, crash dumps, rotated logs, build artifacts (can be recreated safely)
+/// - Recheck: Dependencies, models, ISOs, VM disks, snapshots (reproducible with cost/bandwidth)
+/// - UserData: Documents, source code, personal files, configuration (permanent loss)
+/// - System: Critical OS roots and directories (/usr, /etc, /boot, /bin, etc. — deletion blocked)
+pub fn classify_safety(path: &Path, ghost: GhostKind) -> DeleteSafety {
+    let path_str = path.to_string_lossy();
+    let p = path_str.as_ref();
+
+    // 1. Critical System Directories (Deleting these will brick or severely impair Linux)
+    if p == "/"
+        || p == "/bin" || p == "/sbin" || p == "/boot" || p == "/etc" || p == "/lib" || p == "/lib64"
+        || p == "/usr" || p == "/usr/bin" || p == "/usr/sbin" || p == "/usr/lib" || p == "/usr/lib64" || p == "/usr/include"
+        || p == "/sys" || p == "/proc" || p == "/dev" || p == "/run" || p == "/root"
+        || p == "/var" || p == "/var/lib" || p == "/var/lib/systemd"
+    {
+        return DeleteSafety::System;
+    }
+
+    // Direct children under root like /etc/* or /usr/* without cache context
+    if p.starts_with("/etc/")
+        || p.starts_with("/boot/")
+        || p.starts_with("/lib/")
+        || p.starts_with("/lib64/")
+        || (p.starts_with("/usr/") && !p.contains("cache") && !p.contains("flatpak") && !p.contains("snap"))
+    {
+        return DeleteSafety::System;
+    }
+
+    // 2. Safe to remove (Caches, Trashes, Crash Dumps, Rotated Logs, Ephemeral Caches)
+    match ghost {
+        GhostKind::Trash
+        | GhostKind::BuildCache
+        | GhostKind::PackageCache
+        | GhostKind::BrowserCache
+        | GhostKind::CoreDump
+        | GhostKind::DeletedOpen
+        | GhostKind::DockerOverlay
+        | GhostKind::DockerBuildkit => {
+            return DeleteSafety::Safe;
+        }
+        // Steam shadercache is 100% safe to remove; compatdata / wine prefixes contain prefixes/saves so recheck
+        GhostKind::GamingCompat => {
+            if p.contains("/shadercache") {
+                return DeleteSafety::Safe;
+            } else {
+                return DeleteSafety::Recheck;
+            }
+        }
+        // Rotated or old logs or journal logs are safe to clean
+        GhostKind::LogFiles => {
+            return DeleteSafety::Safe;
+        }
+        // Dependencies, AI weights, ISOs, Snapshots, Flatpak/Snap app data, Docker volumes require recheck
+        GhostKind::DependencyTree
+        | GhostKind::AiModel
+        | GhostKind::VmOrIso
+        | GhostKind::SystemSnapshot
+        | GhostKind::Flatpak
+        | GhostKind::SnapPackage
+        | GhostKind::DockerVolume
+        | GhostKind::DockerContainer
+        | GhostKind::DockerUser
+        | GhostKind::PodmanUser => {
+            return DeleteSafety::Recheck;
+        }
+        GhostKind::None => {}
+    }
+
+    // Root temp mount points are protected system directories
+    if p == "/tmp" || p == "/var/tmp" {
+        return DeleteSafety::System;
+    }
+
+    // Ephemeral temporary files, editor backup/swap files
+    let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+    if file_name.ends_with(".tmp")
+        || file_name.ends_with(".temp")
+        || file_name.ends_with(".bak")
+        || file_name.ends_with(".swp")
+        || file_name.ends_with("~")
+        || file_name.starts_with(".#")
+    {
+        return DeleteSafety::Safe;
+    }
+
+    // Default to UserData
+    DeleteSafety::UserData
+}
+
 /// Returns true if a given path is an inherently virtual/pseudo Linux filesystem
 /// that should never be traversed when analyzing disk usage.
 pub fn is_virtual_fs_path(path: &Path) -> bool {
@@ -367,5 +457,37 @@ mod tests {
             classify_path(&PathBuf::from("/home/ron/documents/photo.jpg")),
             GhostKind::None
         );
+    }
+
+    #[test]
+    fn test_safety_classification() {
+        // System protected paths
+        assert_eq!(classify_safety(&PathBuf::from("/"), GhostKind::None), DeleteSafety::System);
+        assert_eq!(classify_safety(&PathBuf::from("/usr"), GhostKind::None), DeleteSafety::System);
+        assert_eq!(classify_safety(&PathBuf::from("/usr/bin/python"), GhostKind::None), DeleteSafety::System);
+        assert_eq!(classify_safety(&PathBuf::from("/etc/fstab"), GhostKind::None), DeleteSafety::System);
+        assert_eq!(classify_safety(&PathBuf::from("/boot"), GhostKind::None), DeleteSafety::System);
+        assert_eq!(classify_safety(&PathBuf::from("/tmp"), GhostKind::None), DeleteSafety::System);
+
+        // Safe to remove (caches, trash, logs, coredumps)
+        assert_eq!(classify_safety(&PathBuf::from("/home/ron/.local/share/Trash"), GhostKind::Trash), DeleteSafety::Safe);
+        assert_eq!(classify_safety(&PathBuf::from("/home/ron/project/target"), GhostKind::BuildCache), DeleteSafety::Safe);
+        assert_eq!(classify_safety(&PathBuf::from("/home/ron/.cache/google-chrome"), GhostKind::BrowserCache), DeleteSafety::Safe);
+        assert_eq!(classify_safety(&PathBuf::from("/var/lib/systemd/coredump"), GhostKind::CoreDump), DeleteSafety::Safe);
+        assert_eq!(classify_safety(&PathBuf::from("/var/log/pacman.log"), GhostKind::LogFiles), DeleteSafety::Safe);
+        assert_eq!(classify_safety(&PathBuf::from("/tmp/scratch.tmp"), GhostKind::None), DeleteSafety::Safe);
+        assert_eq!(classify_safety(&PathBuf::from("/tmp/scratch.txt"), GhostKind::None), DeleteSafety::UserData);
+        assert_eq!(classify_safety(&PathBuf::from("/home/ron/.local/share/Steam/steamapps/shadercache"), GhostKind::GamingCompat), DeleteSafety::Safe);
+
+        // Recheck items (deps, models, ISOs, snapshots)
+        assert_eq!(classify_safety(&PathBuf::from("/home/ron/project/node_modules"), GhostKind::DependencyTree), DeleteSafety::Recheck);
+        assert_eq!(classify_safety(&PathBuf::from("/home/ron/ai/llama.safetensors"), GhostKind::AiModel), DeleteSafety::Recheck);
+        assert_eq!(classify_safety(&PathBuf::from("/home/ron/Downloads/arch.iso"), GhostKind::VmOrIso), DeleteSafety::Recheck);
+        assert_eq!(classify_safety(&PathBuf::from("/.snapshots/1/snapshot"), GhostKind::SystemSnapshot), DeleteSafety::Recheck);
+        assert_eq!(classify_safety(&PathBuf::from("/home/ron/.wine"), GhostKind::GamingCompat), DeleteSafety::Recheck);
+
+        // User data
+        assert_eq!(classify_safety(&PathBuf::from("/home/ron/Documents/notes.txt"), GhostKind::None), DeleteSafety::UserData);
+        assert_eq!(classify_safety(&PathBuf::from("/home/ron/Projects/src/main.rs"), GhostKind::None), DeleteSafety::UserData);
     }
 }

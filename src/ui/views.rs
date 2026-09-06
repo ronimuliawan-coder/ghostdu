@@ -1,4 +1,4 @@
-use crate::fs::entry::{format_count, format_size, GhostKind};
+use crate::fs::entry::{format_count, format_size, DeleteSafety, GhostKind};
 use crate::ui::app::{ActiveView, App, ConfirmAction, GhostFilterMode};
 use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
@@ -131,6 +131,19 @@ fn render_header(f: &mut Frame, app: &App, area: Rect, header_len: u16) {
         Span::styled(" [📂 EXPLORER]", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))
     };
 
+    let safe_reclaimable = current_dir.safe_reclaimable_bytes();
+    let safe_stat_span = if safe_reclaimable > 0 {
+        Span::styled(format!(" │ 🟢 Safe: {}", format_size(safe_reclaimable)), Style::default().fg(Color::LightGreen).add_modifier(Modifier::BOLD))
+    } else {
+        Span::raw("")
+    };
+
+    let safe_filter_span = if app.safe_only_filter {
+        Span::styled(" [🟢 SAFE ONLY]", Style::default().fg(Color::LightGreen).add_modifier(Modifier::BOLD))
+    } else {
+        Span::raw("")
+    };
+
     let content_width = if header_len >= 3 {
         (area.width as usize).saturating_sub(2)
     } else {
@@ -149,9 +162,11 @@ fn render_header(f: &mut Frame, app: &App, area: Rect, header_len: u16) {
         let line = Line::from(vec![
             Span::styled("📁 ", Style::default().fg(Color::Cyan)),
             Span::styled(trunc_p, Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+            safe_stat_span,
             Span::raw(" │ "),
             Span::styled(format_size(current_dir.disk_usage), Style::default().fg(Color::Green)),
             Span::styled(free_str, Style::default().fg(Color::LightGreen)),
+            safe_filter_span,
             selection_span,
         ]);
         f.render_widget(Paragraph::new(line), area);
@@ -170,9 +185,11 @@ fn render_header(f: &mut Frame, app: &App, area: Rect, header_len: u16) {
         let line = Line::from(vec![
             Span::styled("📁 ", Style::default().fg(Color::Cyan)),
             Span::styled(trunc_p, Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+            safe_stat_span,
             Span::raw(" │ "),
             Span::styled(format!("📊 {}", format_size(current_dir.disk_usage)), Style::default().fg(Color::Green)),
             Span::styled(free_str, Style::default().fg(Color::LightGreen)),
+            safe_filter_span,
             selection_span,
         ]);
         let widget = Paragraph::new(line).block(
@@ -192,6 +209,7 @@ fn render_header(f: &mut Frame, app: &App, area: Rect, header_len: u16) {
         let line1 = Line::from(vec![
             Span::styled("👻 ghostdu ", Style::default().fg(Color::LightCyan).add_modifier(Modifier::BOLD)),
             Span::styled(format!("📁 {}", trunc_p), Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+            safe_filter_span,
             selection_span,
         ]);
 
@@ -203,6 +221,7 @@ fn render_header(f: &mut Frame, app: &App, area: Rect, header_len: u16) {
 
         let line2 = Line::from(vec![
             Span::styled(format!("📊 Folder: {} ({} itm)", format_size(current_dir.disk_usage), count_str), Style::default().fg(Color::Green)),
+            safe_stat_span,
             Span::styled(free_str, Style::default().fg(Color::LightGreen)),
             Span::raw(" │ "),
             Span::styled(format!("Sort: {}", app.sort_mode.label()), Style::default().fg(Color::LightYellow)),
@@ -224,6 +243,7 @@ fn render_header(f: &mut Frame, app: &App, area: Rect, header_len: u16) {
     let mut title_spans = vec![
         Span::styled("👻 ghostdu ", Style::default().fg(Color::LightCyan).add_modifier(Modifier::BOLD)),
         view_tab_span,
+        safe_filter_span,
         Span::raw(" │ "),
         Span::styled(format!("📁 {}", trunc_p), Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
     ];
@@ -237,6 +257,7 @@ fn render_header(f: &mut Frame, app: &App, area: Rect, header_len: u16) {
         Line::from(vec![
             Span::styled("📊 Folder Usage: ", Style::default().fg(Color::DarkGray)),
             Span::styled(format!("{} (disk)", format_size(current_dir.disk_usage)), Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+            safe_stat_span,
             Span::raw(" │ "),
             Span::styled(format!("{} (apparent)", format_size(current_dir.size)), Style::default().fg(Color::Cyan)),
             Span::raw(" │ "),
@@ -251,6 +272,7 @@ fn render_header(f: &mut Frame, app: &App, area: Rect, header_len: u16) {
         Line::from(vec![
             Span::styled("📊 Folder: ", Style::default().fg(Color::DarkGray)),
             Span::styled(format_size(current_dir.disk_usage), Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+            safe_stat_span,
             Span::raw(" │ "),
             Span::styled(format!("{} itm", count_str), Style::default().fg(Color::White)),
             Span::raw(" │ "),
@@ -262,6 +284,7 @@ fn render_header(f: &mut Frame, app: &App, area: Rect, header_len: u16) {
         Line::from(vec![
             Span::styled("📊 ", Style::default().fg(Color::DarkGray)),
             Span::styled(format_size(current_dir.disk_usage), Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+            safe_stat_span,
             Span::raw(" │ "),
             Span::styled(format!("{} itm", count_str), Style::default().fg(Color::White)),
             selection_span,
@@ -467,72 +490,80 @@ fn render_filesystem_view(f: &mut Frame, app: &App, area: Rect) {
                 Style::default().fg(Color::Gray)
             };
 
-            // In narrow modes (2 & 3), embed ghost badge directly into name column
-            let display_name = if col_mode >= 2 && entry.ghost_kind.is_ghost() {
-                format!("{}{} {}", icon, entry.ghost_kind.badge(), entry.name)
+            // In narrow modes (2 & 3), embed ghost badge & safety directly into name column
+            let display_name = if col_mode >= 2 {
+                if entry.ghost_kind.is_ghost() {
+                    format!("{}{} {} {}", icon, entry.delete_safety.glyph(), entry.ghost_kind.badge(), entry.name)
+                } else if entry.delete_safety == DeleteSafety::System {
+                    format!("{}{} SYSTEM {}", icon, entry.delete_safety.glyph(), entry.name)
+                } else {
+                    format!("{}{}", icon, entry.name)
+                }
             } else {
                 format!("{}{}", icon, entry.name)
             };
 
             let name_span = Span::styled(display_name, name_style);
 
-            // Ghost/Docker/Category Badge for wide/standard modes
+            // Ghost/Docker/Category/Safety Badge for wide/standard modes
             let badge_span = match entry.ghost_kind {
                 GhostKind::DockerOverlay
                 | GhostKind::DockerVolume
                 | GhostKind::DockerContainer
                 | GhostKind::DockerBuildkit
                 | GhostKind::DockerUser => {
-                    Span::styled(entry.ghost_kind.badge(), Style::default().fg(Color::LightBlue).add_modifier(Modifier::BOLD))
+                    Span::styled(format!("{} {}", entry.delete_safety.glyph(), entry.ghost_kind.badge()), Style::default().fg(Color::LightBlue).add_modifier(Modifier::BOLD))
                 }
                 GhostKind::PodmanUser => {
-                    Span::styled("🦭 PODMAN", Style::default().fg(Color::Magenta))
+                    Span::styled(format!("{} 🦭 PODMAN", entry.delete_safety.glyph()), Style::default().fg(Color::Magenta))
                 }
                 GhostKind::DeletedOpen => {
-                    Span::styled("👻 GHOST", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD))
+                    Span::styled(format!("{} 👻 GHOST", entry.delete_safety.glyph()), Style::default().fg(Color::Red).add_modifier(Modifier::BOLD))
                 }
                 GhostKind::Trash => {
-                    Span::styled("🗑️ TRASH", Style::default().fg(Color::LightRed))
+                    Span::styled(format!("{} 🗑️ TRASH", entry.delete_safety.glyph()), Style::default().fg(Color::LightRed))
                 }
                 GhostKind::LogFiles => {
-                    Span::styled("📜 LOGS", Style::default().fg(Color::Yellow))
+                    Span::styled(format!("{} 📜 LOGS", entry.delete_safety.glyph()), Style::default().fg(Color::Yellow))
                 }
                 GhostKind::Flatpak => {
-                    Span::styled("📦 FLATPAK", Style::default().fg(Color::LightCyan))
+                    Span::styled(format!("{} 📦 FLATPAK", entry.delete_safety.glyph()), Style::default().fg(Color::LightCyan))
                 }
                 GhostKind::SnapPackage => {
-                    Span::styled("📦 SNAP", Style::default().fg(Color::LightCyan))
+                    Span::styled(format!("{} 📦 SNAP", entry.delete_safety.glyph()), Style::default().fg(Color::LightCyan))
                 }
                 GhostKind::DependencyTree => {
-                    Span::styled("📦 DEPS", Style::default().fg(Color::Cyan))
+                    Span::styled(format!("{} 📦 DEPS", entry.delete_safety.glyph()), Style::default().fg(Color::Cyan))
                 }
                 GhostKind::GamingCompat => {
-                    Span::styled("🎮 GAME", Style::default().fg(Color::LightGreen))
+                    Span::styled(format!("{} 🎮 GAME", entry.delete_safety.glyph()), Style::default().fg(Color::LightGreen))
                 }
                 GhostKind::AiModel => {
-                    Span::styled("🤖 AI", Style::default().fg(Color::LightMagenta).add_modifier(Modifier::BOLD))
+                    Span::styled(format!("{} 🤖 AI", entry.delete_safety.glyph()), Style::default().fg(Color::LightMagenta).add_modifier(Modifier::BOLD))
                 }
                 GhostKind::VmOrIso => {
-                    Span::styled("💿 VM/ISO", Style::default().fg(Color::LightBlue))
+                    Span::styled(format!("{} 💿 VM/ISO", entry.delete_safety.glyph()), Style::default().fg(Color::LightBlue))
                 }
                 GhostKind::BrowserCache => {
-                    Span::styled("🌐 BROWSER", Style::default().fg(Color::LightYellow))
+                    Span::styled(format!("{} 🌐 BROWSER", entry.delete_safety.glyph()), Style::default().fg(Color::LightYellow))
                 }
                 GhostKind::CoreDump => {
-                    Span::styled("💥 CRASH", Style::default().fg(Color::LightRed).add_modifier(Modifier::BOLD))
+                    Span::styled(format!("{} 💥 CRASH", entry.delete_safety.glyph()), Style::default().fg(Color::LightRed).add_modifier(Modifier::BOLD))
                 }
                 GhostKind::SystemSnapshot => {
-                    Span::styled("🔒 SNAP", Style::default().fg(Color::LightRed))
+                    Span::styled(format!("{} 🔒 SNAP", entry.delete_safety.glyph()), Style::default().fg(Color::LightRed))
                 }
                 GhostKind::PackageCache => {
-                    Span::styled("📦 PKG", Style::default().fg(Color::LightYellow))
+                    Span::styled(format!("{} 📦 PKG", entry.delete_safety.glyph()), Style::default().fg(Color::LightYellow))
                 }
                 GhostKind::BuildCache => {
-                    Span::styled("👻 CACHE", Style::default().fg(Color::DarkGray))
+                    Span::styled(format!("{} 👻 CACHE", entry.delete_safety.glyph()), Style::default().fg(Color::DarkGray))
                 }
                 GhostKind::None => {
                     if entry.has_err {
                         Span::styled("[!] LOCKED", Style::default().fg(Color::Red))
+                    } else if entry.delete_safety == DeleteSafety::System {
+                        Span::styled("🔴 SYSTEM", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD))
                     } else {
                         Span::raw("")
                     }
@@ -628,8 +659,8 @@ fn render_filesystem_view(f: &mut Frame, app: &App, area: Rect) {
         0 => (
             vec![
                 Constraint::Length(6),      // Marker & Sel
-                Constraint::Percentage(38), // Name
-                Constraint::Length(12),     // Category
+                Constraint::Percentage(36), // Name
+                Constraint::Length(14),     // Category & Safety
                 Constraint::Length(11),     // Size
                 Constraint::Length(18),     // Usage Bar
                 Constraint::Length(9),      // Items
@@ -639,8 +670,8 @@ fn render_filesystem_view(f: &mut Frame, app: &App, area: Rect) {
         1 => (
             vec![
                 Constraint::Length(5),      // Marker
-                Constraint::Percentage(36), // Name
-                Constraint::Length(10),     // Category
+                Constraint::Percentage(33), // Name
+                Constraint::Length(13),     // Category & Safety
                 Constraint::Length(10),     // Size
                 Constraint::Length(14),     // Bar
                 Constraint::Length(8),      // Items
@@ -1057,86 +1088,122 @@ fn render_confirm_modal(f: &mut Frame, app: &App, screen: Rect) {
 
     f.render_widget(Clear, area);
 
-    let (title, border_color, prompt_line, info_lines) = match action {
-        ConfirmAction::MoveToTrash => {
-            let count = app.action_targets.len();
-            let sz = format_size(app.action_total_size);
-            let title = " 🗑️  MOVE TO WASTEBIN (TRASH) ";
-            let border_color = Color::Green;
+    let (title, border_color, prompt_line, info_lines) = if app.action_safety_blocked {
+        let title = " ⛔  DELETION BLOCKED — SYSTEM PROTECTION ";
+        let border_color = Color::Red;
 
-            let prompt = Line::from(vec![
-                Span::styled(" [y] Move to Wastebin ", Style::default().bg(Color::Green).fg(Color::Black).add_modifier(Modifier::BOLD)),
-                Span::raw("    "),
-                Span::styled(" [n / Esc] Cancel ", Style::default().bg(Color::DarkGray).fg(Color::White)),
-            ]);
+        let prompt = Line::from(vec![
+            Span::styled(" [Esc / n] Dismiss & Cancel ", Style::default().bg(Color::Red).fg(Color::White).add_modifier(Modifier::BOLD)),
+        ]);
 
-            let mut infos = vec![
-                Line::from(vec![
-                    Span::styled(format!("Move {} item(s) (total {}) to Wastebin?", count, sz), Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
-                ]),
-                Line::from(""),
-                Line::from(Span::styled("✔ Safe & Recoverable: Items are moved to ~/.local/share/Trash", Style::default().fg(Color::LightGreen))),
-                Line::from(Span::styled("✔ Restore anytime using Dolphin, Nautilus, or trash-restore", Style::default().fg(Color::DarkGray))),
-                Line::from(""),
-            ];
+        let mut infos = vec![
+            Line::from(vec![
+                Span::styled("CRITICAL SYSTEM SAFETY GUARD ACTIVATED", Style::default().fg(Color::LightRed).add_modifier(Modifier::BOLD)),
+            ]),
+            Line::from(""),
+            Line::from(Span::styled("⛔ Selected target is a critical system directory or file.", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD))),
+            Line::from(Span::styled("   Deleting core system paths (/usr, /etc, /boot, /bin, etc.)", Style::default().fg(Color::Yellow))),
+            Line::from(Span::styled("   will severely damage or brick your operating system.", Style::default().fg(Color::Yellow))),
+            Line::from(Span::styled("⛔ ghostdu actively blocks deletion of protected system files.", Style::default().fg(Color::White))),
+            Line::from(""),
+        ];
 
-            if let Some(first) = app.action_targets.first() {
-                infos.push(Line::from(Span::styled(format!("Target: {}", first.to_string_lossy()), Style::default().fg(Color::Yellow))));
-            }
-
-            (title, border_color, prompt, infos)
+        if let Some(first) = app.action_targets.first() {
+            infos.push(Line::from(Span::styled(format!("Protected Path: {}", first.to_string_lossy()), Style::default().fg(Color::LightYellow))));
         }
-        ConfirmAction::PermanentDelete => {
-            let count = app.action_targets.len();
-            let sz = format_size(app.action_total_size);
-            let title = " ⚠️  PERMANENT DESTRUCTION (CANNOT BE UNDONE) ";
-            let border_color = Color::Red;
 
-            let prompt = Line::from(vec![
-                Span::styled(" [y] PERMANENTLY REMOVE ", Style::default().bg(Color::Red).fg(Color::White).add_modifier(Modifier::BOLD)),
-                Span::raw("    "),
-                Span::styled(" [n / Esc] Cancel ", Style::default().bg(Color::DarkGray).fg(Color::White)),
-            ]);
+        (title, border_color, prompt, infos)
+    } else {
+        match action {
+            ConfirmAction::MoveToTrash => {
+                let count = app.action_targets.len();
+                let sz = format_size(app.action_total_size);
+                let title = " 🗑️  MOVE TO WASTEBIN (TRASH) ";
+                let border_color = Color::Green;
 
-            let mut infos = vec![
-                Line::from(vec![
-                    Span::styled(format!("PERMANENTLY ERASE {} item(s) (total {})?", count, sz), Style::default().fg(Color::LightRed).add_modifier(Modifier::BOLD)),
-                ]),
-                Line::from(""),
-                Line::from(Span::styled("❌ WARNING: This bypasses Wastebin and deletes data FOREVER!", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD))),
-                Line::from(Span::styled("❌ Files cannot be recovered after this action.", Style::default().fg(Color::LightYellow))),
-                Line::from(""),
-            ];
+                let prompt = Line::from(vec![
+                    Span::styled(" [y] Move to Wastebin ", Style::default().bg(Color::Green).fg(Color::Black).add_modifier(Modifier::BOLD)),
+                    Span::raw("    "),
+                    Span::styled(" [n / Esc] Cancel ", Style::default().bg(Color::DarkGray).fg(Color::White)),
+                ]);
 
-            if let Some(first) = app.action_targets.first() {
-                infos.push(Line::from(Span::styled(format!("Target: {}", first.to_string_lossy()), Style::default().fg(Color::Yellow))));
+                let mut infos = vec![
+                    Line::from(vec![
+                        Span::styled(format!("Move {} item(s) (total {}) to Wastebin?", count, sz), Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+                    ]),
+                    Line::from(""),
+                ];
+
+                if app.action_has_recheck {
+                    infos.push(Line::from(Span::styled("🟡 CAUTION: Targets include dependencies, models, or VM images.", Style::default().fg(Color::LightYellow).add_modifier(Modifier::BOLD))));
+                    infos.push(Line::from(Span::styled("   These can be regenerated, but will take bandwidth or time to restore.", Style::default().fg(Color::DarkGray))));
+                } else {
+                    infos.push(Line::from(Span::styled("🟢 SAFE: Selected items are temporary caches or trash.", Style::default().fg(Color::LightGreen))));
+                    infos.push(Line::from(Span::styled("✔ Restore anytime using Dolphin, Nautilus, or trash-restore", Style::default().fg(Color::DarkGray))));
+                }
+                infos.push(Line::from(""));
+
+                if let Some(first) = app.action_targets.first() {
+                    infos.push(Line::from(Span::styled(format!("Target: {}", first.to_string_lossy()), Style::default().fg(Color::Yellow))));
+                }
+
+                (title, border_color, prompt, infos)
             }
+            ConfirmAction::PermanentDelete => {
+                let count = app.action_targets.len();
+                let sz = format_size(app.action_total_size);
+                let title = " ⚠️  PERMANENT DESTRUCTION (CANNOT BE UNDONE) ";
+                let border_color = Color::Red;
 
-            (title, border_color, prompt, infos)
-        }
-        ConfirmAction::DockerPrune => {
-            let sz = format_size(app.action_total_size);
-            let title = " 🐳  DOCKER SYSTEM PRUNE ";
-            let border_color = Color::Yellow;
+                let prompt = Line::from(vec![
+                    Span::styled(" [y] PERMANENTLY REMOVE ", Style::default().bg(Color::Red).fg(Color::White).add_modifier(Modifier::BOLD)),
+                    Span::raw("    "),
+                    Span::styled(" [n / Esc] Cancel ", Style::default().bg(Color::DarkGray).fg(Color::White)),
+                ]);
 
-            let prompt = Line::from(vec![
-                Span::styled(" [y] Prune Dangling Resources ", Style::default().bg(Color::Yellow).fg(Color::Black).add_modifier(Modifier::BOLD)),
-                Span::raw("    "),
-                Span::styled(" [n / Esc] Cancel ", Style::default().bg(Color::DarkGray).fg(Color::White)),
-            ]);
+                let mut infos = vec![
+                    Line::from(vec![
+                        Span::styled(format!("PERMANENTLY ERASE {} item(s) (total {})?", count, sz), Style::default().fg(Color::LightRed).add_modifier(Modifier::BOLD)),
+                    ]),
+                    Line::from(""),
+                    Line::from(Span::styled("❌ WARNING: This bypasses Wastebin and deletes data FOREVER!", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD))),
+                ];
 
-            let infos = vec![
-                Line::from(Span::styled(format!("Reclaim up to {} of Docker ghost data?", sz), Style::default().fg(Color::White).add_modifier(Modifier::BOLD))),
-                Line::from(""),
-                Line::from(Span::styled("This will safely remove:", Style::default().fg(Color::LightCyan))),
-                Line::from(Span::styled(" • All stopped containers", Style::default().fg(Color::White))),
-                Line::from(Span::styled(" • All dangling / untagged images", Style::default().fg(Color::White))),
-                Line::from(Span::styled(" • Unused build cache layers", Style::default().fg(Color::White))),
-                Line::from(Span::styled(" • Unattached local volumes", Style::default().fg(Color::White))),
-                Line::from(""),
-            ];
+                if app.action_has_recheck {
+                    infos.push(Line::from(Span::styled("🟡 CAUTION: Targets include dependencies, models, or VM images.", Style::default().fg(Color::LightYellow).add_modifier(Modifier::BOLD))));
+                    infos.push(Line::from(Span::styled("   These will require redownload or rebuilding if deleted.", Style::default().fg(Color::DarkGray))));
+                } else {
+                    infos.push(Line::from(Span::styled("🟢 SAFE: Selected items are temporary caches or crash files.", Style::default().fg(Color::LightGreen))));
+                }
+                infos.push(Line::from(""));
 
-            (title, border_color, prompt, infos)
+                if let Some(first) = app.action_targets.first() {
+                    infos.push(Line::from(Span::styled(format!("Target: {}", first.to_string_lossy()), Style::default().fg(Color::Yellow))));
+                }
+
+                (title, border_color, prompt, infos)
+            }
+            ConfirmAction::DockerPrune => {
+                let sz = format_size(app.action_total_size);
+                let title = " 🐳  DOCKER SYSTEM PRUNE ";
+                let border_color = Color::Yellow;
+
+                let prompt = Line::from(vec![
+                    Span::styled(" [y] Prune Dangling Resources ", Style::default().bg(Color::Yellow).fg(Color::Black).add_modifier(Modifier::BOLD)),
+                    Span::raw("    "),
+                    Span::styled(" [n / Esc] Cancel ", Style::default().bg(Color::DarkGray).fg(Color::White)),
+                ]);
+
+                let infos = vec![
+                    Line::from(Span::styled(format!("Reclaim up to {} of Docker ghost data?", sz), Style::default().fg(Color::White).add_modifier(Modifier::BOLD))),
+                    Line::from(""),
+                    Line::from(Span::styled("🟢 SAFE: Only removes stopped containers, dangling images & build cache.", Style::default().fg(Color::LightGreen))),
+                    Line::from(Span::styled("Running containers and named volumes will NOT be affected.", Style::default().fg(Color::DarkGray))),
+                    Line::from(""),
+                ];
+
+                (title, border_color, prompt, infos)
+            }
         }
     };
 
@@ -1202,10 +1269,10 @@ fn render_help_modal(f: &mut Frame, screen: Rect) {
             Line::from("  \\  /  ~      Root (/) / Home (~)"),
             Line::from("  Home / End   Top / Bottom"),
             Line::from(""),
-            Line::from(Span::styled("DISPLAY & MODES", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD))),
             Line::from("  i            Item & Disk info"),
             Line::from("  s            Cycle sort order"),
             Line::from("  A            Toggle Apparent size"),
+            Line::from("  c            Toggle Safe-only filter (🟢)"),
             Line::from("  /            Live search / filter"),
             Line::from("  q / Ctrl+C   Quit ghostdu"),
         ];
@@ -1217,12 +1284,12 @@ fn render_help_modal(f: &mut Frame, screen: Rect) {
             Line::from("  t / w        Move to Wastebin"),
             Line::from("  d / D        Permanent delete"),
             Line::from(""),
-            Line::from(Span::styled("REFRESH & GHOST FILES", Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD))),
-            Line::from("  r            Refresh current details"),
-            Line::from("  R / F5       Rescan entire root tree"),
+            Line::from(Span::styled("SAFETY TIERS & GHOST", Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD))),
+            Line::from("  🟢 Safe      Caches, Trash, Coredumps"),
+            Line::from("  🟡 Recheck   Deps, AI models, ISOs"),
+            Line::from("  ⚪ User      Code & personal files"),
+            Line::from("  🔴 System    Protected (locked delete)"),
             Line::from("  Tab / g      Ghost / Docker view"),
-            Line::from("  G            Cycle ghost filter"),
-            Line::from("  p            Prune Docker dangling"),
             Line::from("  ?            Toggle this help"),
         ];
 
@@ -1238,9 +1305,9 @@ fn render_help_modal(f: &mut Frame, screen: Rect) {
             Line::from(Span::styled("ACTIONS: ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))),
             Line::from("  Space: Sel │ t/w: Trash │ d/D: Delete │ i: Info"),
             Line::from(""),
-            Line::from(Span::styled("GHOST & VIEW: ", Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD))),
-            Line::from("  Tab/g: Ghost View │ G: Filter │ p: Prune"),
-            Line::from("  s: Sort │ A: Apparent │ /: Find │ q: Quit"),
+            Line::from(Span::styled("SAFETY & MODES: ", Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD))),
+            Line::from("  🟢 Safe │ 🟡 Recheck │ ⚪ User │ 🔴 System"),
+            Line::from("  c: Safe-Only │ s: Sort │ A: Apparent │ q: Quit"),
         ];
         let widget = Paragraph::new(help_text).block(block).wrap(Wrap { trim: false });
         f.render_widget(widget, area);
@@ -1301,6 +1368,19 @@ fn render_item_info_modal(f: &mut Frame, app: &App, screen: Rect) {
             Span::raw("]"),
         ]));
     }
+
+    let safety_color = match info.delete_safety {
+        DeleteSafety::Safe => Color::LightGreen,
+        DeleteSafety::Recheck => Color::LightYellow,
+        DeleteSafety::System => Color::LightRed,
+        DeleteSafety::UserData => Color::White,
+    };
+
+    lines.push(Line::from(vec![
+        Span::styled("Safety:   ", Style::default().fg(safety_color).add_modifier(Modifier::BOLD)),
+        Span::styled(format!("{} {}", info.delete_safety.glyph(), info.delete_safety.label()), Style::default().fg(safety_color).add_modifier(Modifier::BOLD)),
+        Span::styled(format!(" — {}", info.delete_safety.description()), Style::default().fg(Color::DarkGray)),
+    ]));
 
     if !is_compact {
         lines.push(Line::from(""));

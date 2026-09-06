@@ -27,7 +27,11 @@ pub fn handle_key_event(app: &mut App, key: KeyEvent) -> EventResult {
 fn handle_confirm_keys(app: &mut App, key: KeyEvent) -> EventResult {
     match key.code {
         KeyCode::Char('y') | KeyCode::Char('Y') => {
-            app.execute_pending_action();
+            if app.action_safety_blocked {
+                app.set_status("⛔ Deletion blocked: Cannot delete critical system files!");
+            } else {
+                app.execute_pending_action();
+            }
         }
         KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
             app.cancel_modal();
@@ -228,6 +232,10 @@ fn handle_filesystem_keys(app: &mut App, key: KeyEvent) -> EventResult {
         KeyCode::Char('G') => {
             app.ghost_filter = app.ghost_filter.next();
             app.set_status(format!("Filter: {}", app.ghost_filter.label()));
+            EventResult::Continue
+        }
+        KeyCode::Char('c') | KeyCode::Char('C') => {
+            app.toggle_safe_filter();
             EventResult::Continue
         }
 

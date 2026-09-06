@@ -97,6 +97,63 @@ impl GhostKind {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[allow(dead_code)]
+pub enum DeleteSafety {
+    Safe,      // 🟢 Safe to remove, transient/ephemeral/cache
+    Recheck,   // 🟡 Recheck/reproducible with cost (deps, models, isos)
+    #[default]
+    UserData,  // ⚪ User personal files or source code
+    System,    // 🔴 Critical system directory/file - deletion blocked or dangerous
+}
+
+#[allow(dead_code)]
+impl DeleteSafety {
+    pub fn glyph(&self) -> &'static str {
+        match self {
+            DeleteSafety::Safe => "🟢",
+            DeleteSafety::Recheck => "🟡",
+            DeleteSafety::UserData => "⚪",
+            DeleteSafety::System => "🔴",
+        }
+    }
+
+    pub fn label(&self) -> &'static str {
+        match self {
+            DeleteSafety::Safe => "Safe to Remove",
+            DeleteSafety::Recheck => "Caution / Reproducible",
+            DeleteSafety::UserData => "User Data",
+            DeleteSafety::System => "System Protected",
+        }
+    }
+
+    pub fn badge(&self) -> &'static str {
+        match self {
+            DeleteSafety::Safe => "SAFE",
+            DeleteSafety::Recheck => "RECHECK",
+            DeleteSafety::UserData => "USER",
+            DeleteSafety::System => "SYSTEM",
+        }
+    }
+
+    pub fn description(&self) -> &'static str {
+        match self {
+            DeleteSafety::Safe => "Temporary cache, trash, or build artifact — safe to delete; automatically recreated if needed.",
+            DeleteSafety::Recheck => "Dependency tree, downloaded model, or VM disk — safe to purge, but requires network or time to restore.",
+            DeleteSafety::UserData => "Personal file, source code, or configuration — permanent loss if deleted.",
+            DeleteSafety::System => "Critical operating system directory or binary — deletion is blocked to prevent breaking your OS.",
+        }
+    }
+
+    pub fn is_safe(&self) -> bool {
+        matches!(self, DeleteSafety::Safe)
+    }
+
+    pub fn is_system(&self) -> bool {
+        matches!(self, DeleteSafety::System)
+    }
+}
+
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub struct FileEntry {
@@ -110,6 +167,7 @@ pub struct FileEntry {
     pub dev: u64,
     pub ino: u64,
     pub ghost_kind: GhostKind,
+    pub delete_safety: DeleteSafety,
     pub has_err: bool,       // e.g. permission denied
     pub children: Vec<FileEntry>,
 }
@@ -124,6 +182,7 @@ impl FileEntry {
         dev: u64,
         ino: u64,
         ghost_kind: GhostKind,
+        delete_safety: DeleteSafety,
     ) -> Self {
         Self {
             name,
@@ -136,6 +195,7 @@ impl FileEntry {
             dev,
             ino,
             ghost_kind,
+            delete_safety,
             has_err: false,
             children: Vec::new(),
         }
@@ -147,6 +207,7 @@ impl FileEntry {
         dev: u64,
         ino: u64,
         ghost_kind: GhostKind,
+        delete_safety: DeleteSafety,
     ) -> Self {
         Self {
             name,
@@ -159,6 +220,7 @@ impl FileEntry {
             dev,
             ino,
             ghost_kind,
+            delete_safety,
             has_err: false,
             children: Vec::new(),
         }
@@ -170,6 +232,21 @@ impl FileEntry {
         } else {
             self.disk_usage
         }
+    }
+
+    pub fn safe_reclaimable_bytes(&self) -> u64 {
+        self.children
+            .iter()
+            .filter(|c| c.delete_safety == DeleteSafety::Safe)
+            .map(|c| c.disk_usage)
+            .sum()
+    }
+
+    pub fn safe_items_count(&self) -> usize {
+        self.children
+            .iter()
+            .filter(|c| c.delete_safety == DeleteSafety::Safe)
+            .count()
     }
 }
 

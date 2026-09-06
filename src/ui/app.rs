@@ -1,8 +1,8 @@
-use crate::fs::entry::FileEntry;
+use crate::fs::entry::{DeleteSafety, FileEntry};
 use crate::fs::mount_info::{get_detailed_item_info, query_fs_info, DetailedItemInfo, FsMountInfo};
 use crate::ghost::{
-    fetch_docker_disk_info, prune_docker_dangling, scan_deleted_open_files, DeletedOpenFile,
-    DockerDiskInfo,
+    classify_path, classify_safety, fetch_docker_disk_info, prune_docker_dangling,
+    scan_deleted_open_files, DeletedOpenFile, DockerDiskInfo,
 };
 use crate::ops::{move_to_trash, permanently_delete};
 use std::cell::Cell;
@@ -95,6 +95,10 @@ pub struct App {
     pub pending_action: Option<ConfirmAction>,
     pub action_targets: Vec<PathBuf>,
     pub action_total_size: u64,
+    pub action_safety_blocked: bool,
+    pub action_has_recheck: bool,
+    pub action_has_system: bool,
+    pub safe_only_filter: bool,
 
     // Ghost Inspector data
     pub docker_info: DockerDiskInfo,
@@ -132,6 +136,10 @@ impl App {
             pending_action: None,
             action_targets: Vec::new(),
             action_total_size: 0,
+            action_safety_blocked: false,
+            action_has_recheck: false,
+            action_has_system: false,
+            safe_only_filter: false,
             docker_info,
             deleted_open_files,
             ghost_tab_index: 0,
@@ -213,6 +221,14 @@ impl App {
                         .name
                         .to_lowercase()
                         .contains(&self.search_query.to_lowercase())
+                }
+            })
+            .filter(|entry| {
+                // 3. Safe-to-clean filter (c key)
+                if self.safe_only_filter {
+                    entry.delete_safety.is_safe()
+                } else {
+                    true
                 }
             })
             .collect();
@@ -444,6 +460,18 @@ impl App {
         (count, total_size)
     }
 
+    /// Toggle filter showing only safe-to-clean items
+    pub fn toggle_safe_filter(&mut self) {
+        self.safe_only_filter = !self.safe_only_filter;
+        self.cursor_index = 0;
+        self.scroll_offset.set(0);
+        if self.safe_only_filter {
+            self.set_status("Safe-to-Clean filter: ON (showing only 🟢 safe items)");
+        } else {
+            self.set_status("Safe-to-Clean filter: OFF (showing all items)");
+        }
+    }
+
     /// Prepare Move to Wastebin confirmation
     pub fn prompt_move_to_trash(&mut self) {
         let mut targets = Vec::new();
@@ -466,8 +494,23 @@ impl App {
             return;
         }
 
+        let mut has_system = false;
+        let mut has_recheck = false;
+        for path in &targets {
+            let ghost = classify_path(path);
+            let safety = classify_safety(path, ghost);
+            if safety == DeleteSafety::System {
+                has_system = true;
+            } else if safety == DeleteSafety::Recheck {
+                has_recheck = true;
+            }
+        }
+
         self.action_targets = targets;
         self.action_total_size = total_size;
+        self.action_has_system = has_system;
+        self.action_has_recheck = has_recheck;
+        self.action_safety_blocked = has_system;
         self.pending_action = Some(ConfirmAction::MoveToTrash);
         self.previous_view = self.active_view;
         self.active_view = ActiveView::ConfirmModal;
@@ -495,8 +538,23 @@ impl App {
             return;
         }
 
+        let mut has_system = false;
+        let mut has_recheck = false;
+        for path in &targets {
+            let ghost = classify_path(path);
+            let safety = classify_safety(path, ghost);
+            if safety == DeleteSafety::System {
+                has_system = true;
+            } else if safety == DeleteSafety::Recheck {
+                has_recheck = true;
+            }
+        }
+
         self.action_targets = targets;
         self.action_total_size = total_size;
+        self.action_has_system = has_system;
+        self.action_has_recheck = has_recheck;
+        self.action_safety_blocked = has_system;
         self.pending_action = Some(ConfirmAction::PermanentDelete);
         self.previous_view = self.active_view;
         self.active_view = ActiveView::ConfirmModal;
@@ -511,6 +569,9 @@ impl App {
 
         self.action_targets.clear();
         self.action_total_size = total_reclaimable;
+        self.action_has_system = false;
+        self.action_has_recheck = false;
+        self.action_safety_blocked = false;
         self.pending_action = Some(ConfirmAction::DockerPrune);
         self.previous_view = self.active_view;
         self.active_view = ActiveView::ConfirmModal;
@@ -518,6 +579,12 @@ impl App {
 
     /// Execute pending action after user confirms
     pub fn execute_pending_action(&mut self) {
+        if self.action_safety_blocked {
+            self.set_status("⛔ BLOCKED: Cannot delete protected system file/directory!");
+            self.cancel_modal();
+            return;
+        }
+
         let action = match self.pending_action.take() {
             Some(a) => a,
             None => {
@@ -588,6 +655,9 @@ impl App {
             self.cursor_index = total - 1;
         }
 
+        self.action_safety_blocked = false;
+        self.action_has_recheck = false;
+        self.action_has_system = false;
         self.active_view = self.previous_view;
     }
 
@@ -595,6 +665,10 @@ impl App {
     pub fn cancel_modal(&mut self) {
         self.pending_action = None;
         self.action_targets.clear();
+        self.action_total_size = 0;
+        self.action_safety_blocked = false;
+        self.action_has_recheck = false;
+        self.action_has_system = false;
         self.active_view = self.previous_view;
     }
 

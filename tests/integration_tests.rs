@@ -1,5 +1,6 @@
 use std::fs::{self, File};
 use std::io::Write;
+use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
@@ -366,12 +367,68 @@ fn test_category_taxonomy_scanning() {
 
     assert_eq!(find_child("notes.txt").ghost_kind, ghostdu_scanner::GhostKind::None);
     assert_eq!(find_child("notes.txt").ghost_kind.badge(), "");
+
+    // Check Deletion Safety Tiers
+    assert_eq!(find_child(".Trash-1000").delete_safety, ghostdu_scanner::DeleteSafety::Safe);
+    assert_eq!(find_child("target").delete_safety, ghostdu_scanner::DeleteSafety::Safe);
+    assert_eq!(find_child("system.log").delete_safety, ghostdu_scanner::DeleteSafety::Safe);
+    assert_eq!(find_child("node_modules").delete_safety, ghostdu_scanner::DeleteSafety::Recheck);
+    assert_eq!(find_child("weights.safetensors").delete_safety, ghostdu_scanner::DeleteSafety::Recheck);
+    assert_eq!(find_child("installer.iso").delete_safety, ghostdu_scanner::DeleteSafety::Recheck);
+    assert_eq!(find_child("notes.txt").delete_safety, ghostdu_scanner::DeleteSafety::UserData);
+
+    // Verify safe reclaimable calculation
+    assert!(root.safe_reclaimable_bytes() > 0);
+    assert_eq!(root.safe_items_count(), 3); // .Trash-1000, target, system.log
+
+    // Verify Safe-Only filter in App
+    let mut app = ghostdu::ui::App::new(root);
+    assert_eq!(app.visible_children().len(), 7);
+
+    app.toggle_safe_filter();
+    assert!(app.safe_only_filter);
+    let safe_children = app.visible_children();
+    assert_eq!(safe_children.len(), 3);
+    for child in safe_children {
+        assert_eq!(child.delete_safety, ghostdu_scanner::DeleteSafety::Safe);
+    }
+}
+
+#[test]
+fn test_system_deletion_guardrail() {
+    let temp_dir = tempfile::tempdir().expect("create temp dir");
+    let safe_file = temp_dir.path().join("cache.tmp");
+    fs::write(&safe_file, "cleanable").unwrap();
+
+    let stop_signal = Arc::new(AtomicBool::new(false));
+    let root = ghostdu_scanner::scan_directory(temp_dir.path(), None, stop_signal).unwrap();
+    let mut app = ghostdu::ui::App::new(root);
+
+    // 1. Trying to delete a critical system path (e.g. /etc or /usr) must be actively blocked!
+    app.action_targets = vec![PathBuf::from("/etc")];
+    app.action_total_size = 1024;
+    let ghost = ghostdu_scanner::classify_path(&PathBuf::from("/etc"));
+    let safety = ghostdu_scanner::classify_safety(&PathBuf::from("/etc"), ghost);
+    assert_eq!(safety, ghostdu_scanner::DeleteSafety::System);
+
+    app.action_has_system = true;
+    app.action_safety_blocked = true;
+    app.pending_action = Some(ghostdu::ui::ConfirmAction::PermanentDelete);
+
+    // Attempting execution must NOT delete anything and must disarm
+    app.execute_pending_action();
+    assert_eq!(app.pending_action, None);
+    assert!(app.status_message.as_ref().unwrap().0.contains("BLOCKED"));
+
+    // Verify /etc is obviously still there
+    assert!(PathBuf::from("/etc").exists());
 }
 
 // Minimal exposure for integration testing
 mod ghostdu_scanner {
-    pub use ghostdu::fs::entry::GhostKind;
+    pub use ghostdu::fs::entry::{DeleteSafety, GhostKind};
     pub use ghostdu::fs::scanner::scan_directory;
+    pub use ghostdu::ghost::{classify_path, classify_safety};
     pub use ghostdu::ops::delete::permanently_delete;
     pub use ghostdu::ops::trash::move_to_trash;
 }

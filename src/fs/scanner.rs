@@ -1,5 +1,5 @@
 use crate::fs::entry::FileEntry;
-use crate::ghost::{classify_path, is_virtual_fs_path};
+use crate::ghost::{classify_path, classify_safety, is_virtual_fs_path};
 use crossbeam_channel::Sender;
 use std::collections::HashSet;
 use std::fs;
@@ -47,6 +47,7 @@ pub fn scan_directory(
     let root_ino = root_meta.ino();
 
     let ghost = classify_path(&canonical);
+    let safety = classify_safety(&canonical, ghost);
     let mut root_entry = FileEntry::new_dir(
         canonical
             .file_name()
@@ -56,6 +57,7 @@ pub fn scan_directory(
         root_dev,
         root_ino,
         ghost,
+        safety,
     );
 
     let mut seen_inodes: HashSet<(u64, u64)> = HashSet::new();
@@ -146,6 +148,7 @@ fn scan_dir_recursive(
             Ok(m) => m,
             Err(_) => {
                 let ghost = classify_path(&path);
+                let safety = classify_safety(&path, ghost);
                 let mut err_entry = FileEntry::new_file(
                     file_name,
                     path,
@@ -155,6 +158,7 @@ fn scan_dir_recursive(
                     0,
                     0,
                     ghost,
+                    safety,
                 );
                 err_entry.has_err = true;
                 sub_entries.push(err_entry);
@@ -170,6 +174,7 @@ fn scan_dir_recursive(
         let disk_usage = meta.blocks() * 512;
 
         let ghost_kind = classify_path(&path);
+        let delete_safety = classify_safety(&path, ghost_kind);
 
         // Progress counter update
         let total_files = files_counter.fetch_add(1, Ordering::Relaxed) + 1;
@@ -193,7 +198,7 @@ fn scan_dir_recursive(
         }
 
         if is_dir {
-            let mut dir_node = FileEntry::new_dir(file_name, path.clone(), dev, ino, ghost_kind);
+            let mut dir_node = FileEntry::new_dir(file_name, path.clone(), dev, ino, ghost_kind, delete_safety);
 
             // Recurse into subdirectory
             scan_dir_recursive(
@@ -234,6 +239,7 @@ fn scan_dir_recursive(
                 dev,
                 ino,
                 ghost_kind,
+                delete_safety,
             );
 
             // Store counted size for aggregation
