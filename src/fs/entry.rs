@@ -270,12 +270,23 @@ pub fn format_size(bytes: u64) -> String {
     }
 }
 
-pub fn format_count(count: usize) -> String {
-    if count >= 1_000_000 {
-        format!("{:.1}M items", count as f64 / 1_000_000.0)
+pub fn format_count_short(count: usize) -> String {
+    if count >= 1_000_000_000 {
+        format!("{:.1}B", count as f64 / 1_000_000_000.0)
+    } else if count >= 1_000_000 {
+        format!("{:.1}M", count as f64 / 1_000_000.0)
     } else if count >= 1_000 {
-        format!("{:.1}k items", count as f64 / 1_000.0)
+        format!("{:.1}k", count as f64 / 1_000.0)
     } else {
-        format!("{} items", count)
+        format!("{}", count)
+    }
+}
+
+pub fn format_count(count: usize) -> String {
+    let s = format_count_short(count);
+    if count == 1 {
+        format!("{} item", s)
+    } else {
+        format!("{} items", s)
     }
 }

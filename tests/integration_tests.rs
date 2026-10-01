@@ -302,9 +302,12 @@ fn test_small_terminal_rendering() {
     let root = ghostdu_scanner::scan_directory(base, None, stop_signal).unwrap();
     let mut app = ghostdu::ui::App::new(root);
 
-    // Test a variety of terminal dimensions from wide to tiny
+    // Test a variety of terminal dimensions from wide to tiny, including 112 (the user's terminal size)
     let sizes = [
         (120, 30), // Widescreen
+        (112, 30), // User reported cutoff width
+        (105, 25), // Transition zone
+        (95, 25),  // Pre-100 threshold
         (80, 24),  // Standard
         (70, 18),  // Medium
         (60, 14),  // Small
@@ -319,7 +322,18 @@ fn test_small_terminal_rendering() {
 
         // Filesystem View
         app.active_view = ghostdu::ui::ActiveView::Filesystem;
-        terminal.draw(|f| ghostdu::ui::render_ui(f, &app)).unwrap();
+        let frame = terminal.draw(|f| ghostdu::ui::render_ui(f, &app)).unwrap();
+        // Verify buffer has no "items items" anywhere
+        for y in 0..h {
+            let mut row = String::new();
+            for x in 0..w {
+                row.push_str(frame.buffer[(x, y)].symbol());
+            }
+            assert!(
+                !row.contains("items items"),
+                "Width {w} Row {y} contained duplicate 'items items': {row}"
+            );
+        }
 
         // Help Modal
         app.active_view = ghostdu::ui::ActiveView::HelpModal;
@@ -328,7 +342,17 @@ fn test_small_terminal_rendering() {
         // Item Info Modal
         app.active_view = ghostdu::ui::ActiveView::ItemInfoModal;
         app.item_info = ghostdu::fs::get_detailed_item_info(&app.root_entry.path, 1);
-        terminal.draw(|f| ghostdu::ui::render_ui(f, &app)).unwrap();
+        let frame_modal = terminal.draw(|f| ghostdu::ui::render_ui(f, &app)).unwrap();
+        for y in 0..h {
+            let mut row = String::new();
+            for x in 0..w {
+                row.push_str(frame_modal.buffer[(x, y)].symbol());
+            }
+            assert!(
+                !row.contains("items items"),
+                "Modal Width {w} Row {y} contained duplicate 'items items': {row}"
+            );
+        }
 
         // Ghost Inspector View
         app.active_view = ghostdu::ui::ActiveView::GhostInspector;

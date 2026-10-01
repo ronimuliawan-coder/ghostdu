@@ -1,4 +1,4 @@
-use crate::fs::entry::{format_count, format_size, DeleteSafety, GhostKind};
+use crate::fs::entry::{format_count, format_count_short, format_size, DeleteSafety, GhostKind};
 use crate::ui::app::{ActiveView, App, ConfirmAction, GhostFilterMode};
 use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
@@ -26,6 +26,21 @@ fn truncate_path(path: &str, max_len: usize) -> String {
         .nth(keep_end)
         .unwrap_or(path.len().saturating_sub(keep_end));
     format!("…{}", &path[start_idx..])
+}
+
+fn append_if_fits<'a>(
+    line_spans: &mut Vec<Span<'a>>,
+    new_spans: Vec<Span<'a>>,
+    max_width: usize,
+) -> bool {
+    let mut candidate = line_spans.clone();
+    candidate.extend(new_spans.clone());
+    if Line::from(candidate).width() <= max_width {
+        line_spans.extend(new_spans);
+        true
+    } else {
+        false
+    }
 }
 
 pub fn render_ui(f: &mut Frame, app: &App) {
@@ -177,39 +192,66 @@ fn render_header(f: &mut Frame, app: &App, area: Rect, header_len: u16) {
 
     // Mode 1: Minimal single-line header (header_len == 1, no border)
     if header_len == 1 {
-        let max_path = content_width.saturating_sub(35).max(8);
-        let trunc_p = truncate_path(&current_path, max_path);
+        let mut line_spans = vec![Span::styled("📁 ", Style::default().fg(Color::Cyan))];
         let free_str = if let Some(ref fs) = app.fs_info {
             format!(" │ Free: {}", format_size(fs.avail_bytes))
         } else {
             String::new()
         };
-        let line = Line::from(vec![
-            Span::styled("📁 ", Style::default().fg(Color::Cyan)),
-            Span::styled(
-                trunc_p,
-                Style::default()
-                    .fg(Color::White)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            safe_stat_span,
-            Span::raw(" │ "),
-            Span::styled(
-                format_size(current_dir.disk_usage),
-                Style::default().fg(Color::Green),
-            ),
-            Span::styled(free_str, Style::default().fg(Color::LightGreen)),
-            safe_filter_span,
-            selection_span,
-        ]);
-        f.render_widget(Paragraph::new(line), area);
+
+        let fixed_right_len = 3
+            + format_size(current_dir.disk_usage).len()
+            + free_str.len()
+            + (if safe_reclaimable > 0 { 16 } else { 0 })
+            + (if app.safe_only_filter { 16 } else { 0 })
+            + (if sel_count > 0 { 18 } else { 0 });
+        let max_path = content_width.saturating_sub(fixed_right_len).max(8);
+        let trunc_p = truncate_path(&current_path, max_path);
+
+        line_spans.push(Span::styled(
+            trunc_p,
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        ));
+        if safe_reclaimable > 0 {
+            append_if_fits(&mut line_spans, vec![safe_stat_span], content_width);
+        }
+        append_if_fits(
+            &mut line_spans,
+            vec![
+                Span::raw(" │ "),
+                Span::styled(
+                    format_size(current_dir.disk_usage),
+                    Style::default().fg(Color::Green),
+                ),
+            ],
+            content_width,
+        );
+        if !free_str.is_empty() {
+            append_if_fits(
+                &mut line_spans,
+                vec![Span::styled(
+                    free_str,
+                    Style::default().fg(Color::LightGreen),
+                )],
+                content_width,
+            );
+        }
+        if app.safe_only_filter {
+            append_if_fits(&mut line_spans, vec![safe_filter_span], content_width);
+        }
+        if sel_count > 0 {
+            append_if_fits(&mut line_spans, vec![selection_span], content_width);
+        }
+
+        f.render_widget(Paragraph::new(Line::from(line_spans)), area);
         return;
     }
 
     // Mode 2: Compact 1 content line inside border (header_len == 3)
     if header_len == 3 {
-        let max_path = content_width.saturating_sub(40).max(8);
-        let trunc_p = truncate_path(&current_path, max_path);
+        let mut line_spans = vec![Span::styled("📁 ", Style::default().fg(Color::Cyan))];
         let free_str = if let Some(ref fs) = app.fs_info {
             format!(
                 " │ 💾 Free: {} ({:.0}%)",
@@ -219,25 +261,54 @@ fn render_header(f: &mut Frame, app: &App, area: Rect, header_len: u16) {
         } else {
             String::new()
         };
-        let line = Line::from(vec![
-            Span::styled("📁 ", Style::default().fg(Color::Cyan)),
-            Span::styled(
-                trunc_p,
-                Style::default()
-                    .fg(Color::White)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            safe_stat_span,
-            Span::raw(" │ "),
-            Span::styled(
-                format!("📊 {}", format_size(current_dir.disk_usage)),
-                Style::default().fg(Color::Green),
-            ),
-            Span::styled(free_str, Style::default().fg(Color::LightGreen)),
-            safe_filter_span,
-            selection_span,
-        ]);
-        let widget = Paragraph::new(line).block(
+
+        let fixed_right_len = 5
+            + format_size(current_dir.disk_usage).len()
+            + free_str.len()
+            + (if safe_reclaimable > 0 { 16 } else { 0 })
+            + (if app.safe_only_filter { 16 } else { 0 })
+            + (if sel_count > 0 { 18 } else { 0 });
+        let max_path = content_width.saturating_sub(fixed_right_len).max(8);
+        let trunc_p = truncate_path(&current_path, max_path);
+
+        line_spans.push(Span::styled(
+            trunc_p,
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        ));
+        if safe_reclaimable > 0 {
+            append_if_fits(&mut line_spans, vec![safe_stat_span], content_width);
+        }
+        append_if_fits(
+            &mut line_spans,
+            vec![
+                Span::raw(" │ "),
+                Span::styled(
+                    format!("📊 {}", format_size(current_dir.disk_usage)),
+                    Style::default().fg(Color::Green),
+                ),
+            ],
+            content_width,
+        );
+        if !free_str.is_empty() {
+            append_if_fits(
+                &mut line_spans,
+                vec![Span::styled(
+                    free_str,
+                    Style::default().fg(Color::LightGreen),
+                )],
+                content_width,
+            );
+        }
+        if app.safe_only_filter {
+            append_if_fits(&mut line_spans, vec![safe_filter_span], content_width);
+        }
+        if sel_count > 0 {
+            append_if_fits(&mut line_spans, vec![selection_span], content_width);
+        }
+
+        let widget = Paragraph::new(Line::from(line_spans)).block(
             Block::default()
                 .borders(Borders::ALL)
                 .border_type(BorderType::Rounded)
@@ -251,7 +322,7 @@ fn render_header(f: &mut Frame, app: &App, area: Rect, header_len: u16) {
     if header_len == 4 {
         let max_path = content_width.saturating_sub(25).max(10);
         let trunc_p = truncate_path(&current_path, max_path);
-        let line1 = Line::from(vec![
+        let mut line1_spans = vec![
             Span::styled(
                 "👻 ghostdu ",
                 Style::default()
@@ -264,13 +335,21 @@ fn render_header(f: &mut Frame, app: &App, area: Rect, header_len: u16) {
                     .fg(Color::White)
                     .add_modifier(Modifier::BOLD),
             ),
-            safe_filter_span,
-            selection_span,
-        ]);
+        ];
+        if app.safe_only_filter {
+            append_if_fits(&mut line1_spans, vec![safe_filter_span], content_width);
+        }
+        if sel_count > 0 {
+            append_if_fits(
+                &mut line1_spans,
+                vec![selection_span.clone()],
+                content_width,
+            );
+        }
 
         let free_str = if let Some(ref fs) = app.fs_info {
             format!(
-                " │ 💾 Free: {} / {} ({:.1}%)",
+                " │ 💾 Free: {} / {} ({:.0}%)",
                 format_size(fs.avail_bytes),
                 format_size(fs.total_bytes),
                 fs.use_percent
@@ -279,25 +358,46 @@ fn render_header(f: &mut Frame, app: &App, area: Rect, header_len: u16) {
             String::new()
         };
 
-        let line2 = Line::from(vec![
+        let mut line2_spans = vec![
             Span::styled(
-                format!(
-                    "📊 Folder: {} ({} itm)",
-                    format_size(current_dir.disk_usage),
-                    count_str
-                ),
+                format!("📊 {}", format_size(current_dir.disk_usage)),
                 Style::default().fg(Color::Green),
             ),
-            safe_stat_span,
-            Span::styled(free_str, Style::default().fg(Color::LightGreen)),
-            Span::raw(" │ "),
             Span::styled(
-                format!("Sort: {}", app.sort_mode.label()),
-                Style::default().fg(Color::LightYellow),
+                format!(" ({})", count_str),
+                Style::default().fg(Color::White),
             ),
-        ]);
+        ];
+        if safe_reclaimable > 0 {
+            append_if_fits(
+                &mut line2_spans,
+                vec![safe_stat_span.clone()],
+                content_width,
+            );
+        }
+        if !free_str.is_empty() {
+            append_if_fits(
+                &mut line2_spans,
+                vec![Span::styled(
+                    free_str,
+                    Style::default().fg(Color::LightGreen),
+                )],
+                content_width,
+            );
+        }
+        append_if_fits(
+            &mut line2_spans,
+            vec![
+                Span::raw(" │ "),
+                Span::styled(
+                    format!("Sort: {}", app.sort_mode.label()),
+                    Style::default().fg(Color::LightYellow),
+                ),
+            ],
+            content_width,
+        );
 
-        let widget = Paragraph::new(vec![line1, line2]).block(
+        let widget = Paragraph::new(vec![Line::from(line1_spans), Line::from(line2_spans)]).block(
             Block::default()
                 .borders(Borders::ALL)
                 .border_type(BorderType::Rounded)
@@ -308,8 +408,32 @@ fn render_header(f: &mut Frame, app: &App, area: Rect, header_len: u16) {
     }
 
     // Mode 4: Full 3 content lines inside border (header_len >= 5)
-    let max_path = content_width.saturating_sub(35).max(12);
+    // Line 1: Title & Current Path
+    let show_hints = current_path != "/" && content_width >= 85;
+    let hints_span = Span::styled(
+        " (Bksp: up, \\: root)",
+        Style::default().fg(Color::DarkGray),
+    );
+    let fixed_title_line = Line::from(vec![
+        Span::styled(
+            "👻 ghostdu ",
+            Style::default()
+                .fg(Color::LightCyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        view_tab_span.clone(),
+        safe_filter_span.clone(),
+        Span::raw(" │ 📁 "),
+        if show_hints {
+            hints_span.clone()
+        } else {
+            Span::raw("")
+        },
+    ]);
+    let fixed_title_w = fixed_title_line.width();
+    let max_path = content_width.saturating_sub(fixed_title_w).max(8);
     let trunc_p = truncate_path(&current_path, max_path);
+
     let mut title_spans = vec![
         Span::styled(
             "👻 ghostdu ",
@@ -327,85 +451,99 @@ fn render_header(f: &mut Frame, app: &App, area: Rect, header_len: u16) {
                 .add_modifier(Modifier::BOLD),
         ),
     ];
-    if current_path != "/" && content_width >= 85 {
-        title_spans.push(Span::styled(
-            " (Bksp: up, \\: root)",
-            Style::default().fg(Color::DarkGray),
-        ));
+    if show_hints {
+        title_spans.push(hints_span);
     }
     let title_line = Line::from(title_spans);
 
     // Line 2: Folder statistics
-    let folder_stat_line = if content_width >= 95 {
-        Line::from(vec![
-            Span::styled("📊 Folder Usage: ", Style::default().fg(Color::DarkGray)),
-            Span::styled(
-                format!("{} (disk)", format_size(current_dir.disk_usage)),
-                Style::default()
-                    .fg(Color::Green)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            safe_stat_span,
+    let mut folder_spans = vec![
+        Span::styled(
+            if content_width >= 40 {
+                "📊 Folder: "
+            } else {
+                "📊 "
+            },
+            Style::default().fg(Color::DarkGray),
+        ),
+        Span::styled(
+            if content_width >= 90 {
+                format!("{} (disk)", format_size(current_dir.disk_usage))
+            } else {
+                format_size(current_dir.disk_usage)
+            },
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD),
+        ),
+    ];
+
+    if safe_reclaimable > 0 {
+        append_if_fits(
+            &mut folder_spans,
+            vec![
+                Span::raw(" │ "),
+                Span::styled(
+                    format!("🟢 Safe: {}", format_size(safe_reclaimable)),
+                    Style::default()
+                        .fg(Color::LightGreen)
+                        .add_modifier(Modifier::BOLD),
+                ),
+            ],
+            content_width,
+        );
+    }
+
+    if content_width >= 115 {
+        append_if_fits(
+            &mut folder_spans,
+            vec![
+                Span::raw(" │ "),
+                Span::styled(
+                    format!("{} (apparent)", format_size(current_dir.size)),
+                    Style::default().fg(Color::Cyan),
+                ),
+            ],
+            content_width,
+        );
+    }
+
+    append_if_fits(
+        &mut folder_spans,
+        vec![
             Span::raw(" │ "),
-            Span::styled(
-                format!("{} (apparent)", format_size(current_dir.size)),
-                Style::default().fg(Color::Cyan),
-            ),
-            Span::raw(" │ "),
-            Span::styled(
-                format!("{} items", count_str),
-                Style::default().fg(Color::White),
-            ),
+            Span::styled(count_str.clone(), Style::default().fg(Color::White)),
+        ],
+        content_width,
+    );
+
+    append_if_fits(
+        &mut folder_spans,
+        vec![
             Span::raw(" │ "),
             Span::styled(
                 format!("Sort: {}", app.sort_mode.label()),
                 Style::default().fg(Color::LightYellow),
             ),
-            filter_span,
-            size_mode_span,
-            selection_span,
-        ])
-    } else if content_width >= 70 {
-        Line::from(vec![
-            Span::styled("📊 Folder: ", Style::default().fg(Color::DarkGray)),
-            Span::styled(
-                format_size(current_dir.disk_usage),
-                Style::default()
-                    .fg(Color::Green)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            safe_stat_span,
-            Span::raw(" │ "),
-            Span::styled(
-                format!("{} itm", count_str),
-                Style::default().fg(Color::White),
-            ),
-            Span::raw(" │ "),
-            Span::styled(
-                app.sort_mode.label(),
-                Style::default().fg(Color::LightYellow),
-            ),
-            size_mode_span,
-            selection_span,
-        ])
-    } else {
-        Line::from(vec![
-            Span::styled("📊 ", Style::default().fg(Color::DarkGray)),
-            Span::styled(
-                format_size(current_dir.disk_usage),
-                Style::default()
-                    .fg(Color::Green)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            safe_stat_span,
-            Span::raw(" │ "),
-            Span::styled(
-                format!("{} itm", count_str),
-                Style::default().fg(Color::White),
-            ),
-            selection_span,
-        ])
-    };
+        ],
+        content_width,
+    );
+
+    if app.ghost_filter != GhostFilterMode::ShowAll {
+        append_if_fits(&mut folder_spans, vec![filter_span], content_width);
+    }
+    if content_width >= 120 {
+        append_if_fits(&mut folder_spans, vec![size_mode_span], content_width);
+    }
+    if sel_count > 0 {
+        append_if_fits(
+            &mut folder_spans,
+            vec![selection_span.clone()],
+            content_width,
+        );
+    }
+
+    let folder_stat_line = Line::from(folder_spans);
 
     // Line 3: Global filesystem statistics
     let fs_line = if let Some(ref fs) = app.fs_info {
@@ -421,108 +559,157 @@ fn render_header(f: &mut Frame, app: &App, area: Rect, header_len: u16) {
             Color::Green
         };
 
-        if content_width >= 110 {
-            Line::from(vec![
-                Span::styled("💾 Global Disk: ", Style::default().fg(Color::DarkGray)),
-                Span::styled(
-                    format!("{} ({})", fs.device, fs.fs_type),
-                    Style::default().fg(Color::White),
+        // Option A: Full detail
+        let opt_a = Line::from(vec![
+            Span::styled("💾 Global Disk: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                format!("{} ({})", fs.device, fs.fs_type),
+                Style::default().fg(Color::White),
+            ),
+            Span::styled(
+                format!(" on {}", fs.mount_point.display()),
+                Style::default().fg(Color::DarkGray),
+            ),
+            Span::raw(" │ "),
+            Span::styled(
+                format!("Total: {}", format_size(fs.total_bytes)),
+                Style::default().fg(Color::White),
+            ),
+            Span::raw(" │ "),
+            Span::styled(
+                format!("Used: {}", format_size(fs.used_bytes)),
+                Style::default().fg(Color::LightRed),
+            ),
+            Span::raw(" "),
+            Span::styled(
+                format!("[{}{}] {:.1}%", bar_filled, bar_empty, fs.use_percent),
+                Style::default().fg(bar_color).add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" │ "),
+            Span::styled(
+                format!("Free: {}", format_size(fs.avail_bytes)),
+                Style::default()
+                    .fg(Color::LightGreen)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]);
+
+        // Option B: Medium detail (device omitted, mount + fs type shown)
+        let compact_len = 8;
+        let c_fill = ((fs.use_percent / 100.0) * compact_len as f64).round() as usize;
+        let c_bar = format!(
+            "{}{}",
+            "█".repeat(c_fill.min(compact_len)),
+            "░".repeat(compact_len.saturating_sub(c_fill))
+        );
+        let opt_b = Line::from(vec![
+            Span::styled("💾 Disk: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                format!("{} on {}", fs.fs_type, fs.mount_point.display()),
+                Style::default().fg(Color::White),
+            ),
+            Span::raw(" │ "),
+            Span::styled(
+                format!("Total: {}", format_size(fs.total_bytes)),
+                Style::default().fg(Color::White),
+            ),
+            Span::raw(" │ "),
+            Span::styled(
+                format!("Used: {}", format_size(fs.used_bytes)),
+                Style::default().fg(Color::LightRed),
+            ),
+            Span::raw(" "),
+            Span::styled(
+                format!("[{}] {:.1}%", c_bar, fs.use_percent),
+                Style::default().fg(bar_color).add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" │ "),
+            Span::styled(
+                format!("Free: {}", format_size(fs.avail_bytes)),
+                Style::default()
+                    .fg(Color::LightGreen)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]);
+
+        // Option C: Compact
+        let opt_c = Line::from(vec![
+            Span::styled("💾 Disk: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                format!("{} ({})", fs.mount_point.display(), fs.fs_type),
+                Style::default().fg(Color::White),
+            ),
+            Span::raw(" │ "),
+            Span::styled(
+                format!(
+                    "{}/{}",
+                    format_size(fs.used_bytes),
+                    format_size(fs.total_bytes)
                 ),
-                Span::styled(
-                    format!(" on {}", fs.mount_point.display()),
-                    Style::default().fg(Color::DarkGray),
+                Style::default().fg(Color::LightRed),
+            ),
+            Span::styled(
+                format!(" ({:.0}%)", fs.use_percent),
+                Style::default().fg(bar_color),
+            ),
+            Span::raw(" │ "),
+            Span::styled(
+                format!("Free: {}", format_size(fs.avail_bytes)),
+                Style::default()
+                    .fg(Color::LightGreen)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]);
+
+        // Option D: Mini
+        let opt_d = Line::from(vec![
+            Span::styled(
+                format!("💾 {}: ", fs.mount_point.display()),
+                Style::default().fg(Color::DarkGray),
+            ),
+            Span::styled(
+                format!(
+                    "{}/{} ({:.0}%)",
+                    format_size(fs.used_bytes),
+                    format_size(fs.total_bytes),
+                    fs.use_percent
                 ),
-                Span::raw(" │ "),
-                Span::styled(
-                    format!("Total: {}", format_size(fs.total_bytes)),
-                    Style::default().fg(Color::White),
-                ),
-                Span::raw(" │ "),
-                Span::styled(
-                    format!("Used: {}", format_size(fs.used_bytes)),
-                    Style::default().fg(Color::LightRed),
-                ),
-                Span::raw(" "),
-                Span::styled(
-                    format!("[{}{}] {:.1}%", bar_filled, bar_empty, fs.use_percent),
-                    Style::default().fg(bar_color).add_modifier(Modifier::BOLD),
-                ),
-                Span::raw(" │ "),
-                Span::styled(
-                    format!("Free Left: {}", format_size(fs.avail_bytes)),
-                    Style::default()
-                        .fg(Color::LightGreen)
-                        .add_modifier(Modifier::BOLD),
-                ),
-            ])
-        } else if content_width >= 80 {
-            let compact_len = 6;
-            let c_fill = ((fs.use_percent / 100.0) * compact_len as f64).round() as usize;
-            let c_bar = format!(
-                "{}{}",
-                "█".repeat(c_fill.min(compact_len)),
-                "░".repeat(compact_len.saturating_sub(c_fill))
-            );
-            Line::from(vec![
-                Span::styled("💾 Disk: ", Style::default().fg(Color::DarkGray)),
-                Span::styled(
-                    format!("{} on {}", fs.fs_type, fs.mount_point.display()),
-                    Style::default().fg(Color::White),
-                ),
-                Span::raw(" │ "),
-                Span::styled(
-                    format!(
-                        "{}/{}",
-                        format_size(fs.used_bytes),
-                        format_size(fs.total_bytes)
-                    ),
-                    Style::default().fg(Color::LightRed),
-                ),
-                Span::raw(" "),
-                Span::styled(
-                    format!("[{}] {:.0}%", c_bar, fs.use_percent),
-                    Style::default().fg(bar_color).add_modifier(Modifier::BOLD),
-                ),
-                Span::raw(" │ "),
-                Span::styled(
-                    format!("Free: {}", format_size(fs.avail_bytes)),
-                    Style::default()
-                        .fg(Color::LightGreen)
-                        .add_modifier(Modifier::BOLD),
-                ),
-            ])
-        } else if content_width >= 55 {
-            Line::from(vec![
-                Span::styled("💾 Free Space: ", Style::default().fg(Color::DarkGray)),
-                Span::styled(
-                    format_size(fs.avail_bytes),
-                    Style::default()
-                        .fg(Color::LightGreen)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(
-                    format!(
-                        " / {} ({:.0}% used)",
-                        format_size(fs.total_bytes),
-                        fs.use_percent
-                    ),
-                    Style::default().fg(Color::DarkGray),
-                ),
-            ])
+                Style::default().fg(Color::LightRed),
+            ),
+            Span::raw(" │ "),
+            Span::styled(
+                format!("Free: {}", format_size(fs.avail_bytes)),
+                Style::default()
+                    .fg(Color::LightGreen)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]);
+
+        // Option E: Minimal fallback
+        let opt_e = Line::from(vec![
+            Span::styled("💾 Free: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                format_size(fs.avail_bytes),
+                Style::default()
+                    .fg(Color::LightGreen)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!(" ({:.0}% used)", fs.use_percent),
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]);
+
+        if opt_a.width() <= content_width {
+            opt_a
+        } else if opt_b.width() <= content_width {
+            opt_b
+        } else if opt_c.width() <= content_width {
+            opt_c
+        } else if opt_d.width() <= content_width {
+            opt_d
         } else {
-            Line::from(vec![
-                Span::styled("💾 Free: ", Style::default().fg(Color::DarkGray)),
-                Span::styled(
-                    format_size(fs.avail_bytes),
-                    Style::default()
-                        .fg(Color::LightGreen)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(
-                    format!(" ({:.0}%)", fs.use_percent),
-                    Style::default().fg(Color::DarkGray),
-                ),
-            ])
+            opt_e
         }
     } else {
         Line::from(vec![
@@ -805,7 +992,7 @@ fn render_filesystem_view(f: &mut Frame, app: &App, area: Rect) {
             // Proportional Bar Graph
             let percent = ((entry_size as f64 / parent_size as f64) * 100.0).clamp(0.0, 100.0);
             let bar_text = if col_mode == 0 {
-                let bl = 10;
+                let bl = 8;
                 let fl = ((percent / 100.0) * bl as f64).round() as usize;
                 format!(
                     "[{}{}] {:>5.1}%",
@@ -843,14 +1030,12 @@ fn render_filesystem_view(f: &mut Frame, app: &App, area: Rect) {
             let bar_span = Span::styled(bar_text, bar_style);
 
             // Item count
-            let items_span = if entry.is_dir {
-                Span::styled(
-                    format_count(entry.items_count),
-                    Style::default().fg(Color::DarkGray),
-                )
+            let items_str = if entry.is_dir {
+                format_count_short(entry.items_count)
             } else {
-                Span::raw("")
+                String::new()
             };
+            let items_span = Span::styled(items_str, Style::default().fg(Color::DarkGray));
 
             let row_style = if is_cursor {
                 Style::default().bg(Color::Rgb(30, 35, 45))
@@ -897,12 +1082,12 @@ fn render_filesystem_view(f: &mut Frame, app: &App, area: Rect) {
     let (widths, header_row) = match col_mode {
         0 => (
             vec![
-                Constraint::Length(6),      // Marker & Sel
-                Constraint::Percentage(36), // Name
-                Constraint::Length(14),     // Category & Safety
-                Constraint::Length(11),     // Size
-                Constraint::Length(18),     // Usage Bar
-                Constraint::Length(9),      // Items
+                Constraint::Length(5),  // Marker & Sel
+                Constraint::Min(20),    // Name (absorbs remaining space)
+                Constraint::Length(14), // Category & Safety
+                Constraint::Length(11), // Size
+                Constraint::Length(18), // Usage Bar
+                Constraint::Length(8),  // Items
             ],
             Row::new(vec![
                 "Sel",
@@ -915,18 +1100,18 @@ fn render_filesystem_view(f: &mut Frame, app: &App, area: Rect) {
         ),
         1 => (
             vec![
-                Constraint::Length(5),      // Marker
-                Constraint::Percentage(33), // Name
-                Constraint::Length(13),     // Category & Safety
-                Constraint::Length(10),     // Size
-                Constraint::Length(14),     // Bar
-                Constraint::Length(8),      // Items
+                Constraint::Length(5),  // Marker & Sel
+                Constraint::Min(16),    // Name
+                Constraint::Length(13), // Category & Safety
+                Constraint::Length(10), // Size
+                Constraint::Length(14), // Bar
+                Constraint::Length(7),  // Items
             ],
             Row::new(vec!["Sel", "Name", "Category", "Size", "Bar", "Items"]),
         ),
         2 => (
             vec![
-                Constraint::Length(5),  // Marker
+                Constraint::Length(5),  // Marker & Sel
                 Constraint::Min(14),    // Name
                 Constraint::Length(10), // Size
                 Constraint::Length(13), // Bar
@@ -1975,7 +2160,7 @@ fn render_item_info_modal(f: &mut Frame, app: &App, screen: Rect) {
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled(
-                format!("{} items", format_count(info.items_count)),
+                format_count(info.items_count),
                 Style::default().fg(Color::White),
             ),
         ]));
