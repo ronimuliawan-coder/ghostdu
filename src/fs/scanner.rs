@@ -19,16 +19,9 @@ pub struct ScanProgress {
 }
 
 #[allow(dead_code)]
+#[derive(Default)]
 pub struct ScannerOptions {
     pub cross_mounts: bool,
-}
-
-impl Default for ScannerOptions {
-    fn default() -> Self {
-        Self {
-            cross_mounts: false,
-        }
-    }
 }
 
 pub fn scan_directory(
@@ -82,7 +75,7 @@ pub fn scan_directory(
     // Sort root children descending by disk usage
     root_entry
         .children
-        .sort_by(|a, b| b.disk_usage.cmp(&a.disk_usage));
+        .sort_by_key(|a| std::cmp::Reverse(a.disk_usage));
 
     if let Some(ref tx) = progress_tx {
         let _ = tx.send(ScanProgress {
@@ -96,6 +89,7 @@ pub fn scan_directory(
     Ok(root_entry)
 }
 
+#[allow(clippy::too_many_arguments, clippy::only_used_in_recursion)]
 fn scan_dir_recursive(
     dir_path: &Path,
     parent_entry: &mut FileEntry,
@@ -149,17 +143,8 @@ fn scan_dir_recursive(
             Err(_) => {
                 let ghost = classify_path(&path);
                 let safety = classify_safety(&path, ghost);
-                let mut err_entry = FileEntry::new_file(
-                    file_name,
-                    path,
-                    0,
-                    0,
-                    false,
-                    0,
-                    0,
-                    ghost,
-                    safety,
-                );
+                let mut err_entry =
+                    FileEntry::new_file(file_name, path, 0, 0, false, 0, 0, ghost, safety);
                 err_entry.has_err = true;
                 sub_entries.push(err_entry);
                 continue;
@@ -181,7 +166,7 @@ fn scan_dir_recursive(
         bytes_counter.fetch_add(disk_usage, Ordering::Relaxed);
 
         // Send throttled progress update every ~50ms or every 200 items
-        if total_files % 200 == 0 {
+        if total_files.is_multiple_of(200) {
             if let Some(ref tx) = progress_tx {
                 if let Ok(mut last) = last_progress.lock() {
                     if last.elapsed().as_millis() >= 50 {
@@ -198,7 +183,8 @@ fn scan_dir_recursive(
         }
 
         if is_dir {
-            let mut dir_node = FileEntry::new_dir(file_name, path.clone(), dev, ino, ghost_kind, delete_safety);
+            let mut dir_node =
+                FileEntry::new_dir(file_name, path.clone(), dev, ino, ghost_kind, delete_safety);
 
             // Recurse into subdirectory
             scan_dir_recursive(
@@ -216,7 +202,7 @@ fn scan_dir_recursive(
             // Sort child entries descending by disk usage
             dir_node
                 .children
-                .sort_by(|a, b| b.disk_usage.cmp(&a.disk_usage));
+                .sort_by_key(|a| std::cmp::Reverse(a.disk_usage));
 
             sub_entries.push(dir_node);
         } else {

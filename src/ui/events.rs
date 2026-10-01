@@ -53,7 +53,11 @@ fn handle_help_keys(app: &mut App, key: KeyEvent) -> EventResult {
 
 fn handle_item_info_keys(app: &mut App, key: KeyEvent) -> EventResult {
     match key.code {
-        KeyCode::Char('i') | KeyCode::Char('I') | KeyCode::Char('q') | KeyCode::Esc | KeyCode::Enter => {
+        KeyCode::Char('i')
+        | KeyCode::Char('I')
+        | KeyCode::Char('q')
+        | KeyCode::Esc
+        | KeyCode::Enter => {
             app.active_view = app.previous_view;
         }
         _ => {}
@@ -189,9 +193,7 @@ fn handle_filesystem_keys(app: &mut App, key: KeyEvent) -> EventResult {
             app.cursor_to_end();
             EventResult::Continue
         }
-        KeyCode::Char('\\') => {
-            EventResult::RescanPath(PathBuf::from("/"))
-        }
+        KeyCode::Char('\\') => EventResult::RescanPath(PathBuf::from("/")),
         KeyCode::Char('~') => {
             if let Ok(home) = std::env::var("HOME") {
                 EventResult::RescanPath(PathBuf::from(home))

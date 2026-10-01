@@ -56,9 +56,20 @@ fn test_scanner_and_inode_dedup() {
     assert_eq!(root_entry.size, 8000);
 
     // Verify node_modules was classified as DependencyTree
-    let subdir = root_entry.children.iter().find(|c| c.name == "subdir").unwrap();
-    let node_modules = subdir.children.iter().find(|c| c.name == "node_modules").unwrap();
-    assert_eq!(node_modules.ghost_kind, ghostdu_scanner::GhostKind::DependencyTree);
+    let subdir = root_entry
+        .children
+        .iter()
+        .find(|c| c.name == "subdir")
+        .unwrap();
+    let node_modules = subdir
+        .children
+        .iter()
+        .find(|c| c.name == "node_modules")
+        .unwrap();
+    assert_eq!(
+        node_modules.ghost_kind,
+        ghostdu_scanner::GhostKind::DependencyTree
+    );
     assert!(node_modules.ghost_kind.is_ghost());
 }
 
@@ -90,7 +101,7 @@ fn test_move_to_trash() {
     fs::write(&file_path, "move to wastebin test").unwrap();
     assert!(file_path.exists());
 
-    let res = ghostdu_scanner::move_to_trash(&[file_path.clone()]);
+    let res = ghostdu_scanner::move_to_trash(std::slice::from_ref(&file_path));
     // FreeDesktop trash on /tmp or $HOME:
     if res.succeeded.len() == 1 {
         assert!(!file_path.exists());
@@ -181,14 +192,20 @@ fn test_app_state_and_navigation() {
     // Test confirm modals
     app.prompt_move_to_trash();
     assert_eq!(app.active_view, ghostdu::ui::ActiveView::ConfirmModal);
-    assert_eq!(app.pending_action, Some(ghostdu::ui::ConfirmAction::MoveToTrash));
+    assert_eq!(
+        app.pending_action,
+        Some(ghostdu::ui::ConfirmAction::MoveToTrash)
+    );
     app.cancel_modal();
     assert_eq!(app.active_view, ghostdu::ui::ActiveView::Filesystem);
     assert_eq!(app.pending_action, None);
 
     app.prompt_permanent_delete();
     assert_eq!(app.active_view, ghostdu::ui::ActiveView::ConfirmModal);
-    assert_eq!(app.pending_action, Some(ghostdu::ui::ConfirmAction::PermanentDelete));
+    assert_eq!(
+        app.pending_action,
+        Some(ghostdu::ui::ConfirmAction::PermanentDelete)
+    );
     app.cancel_modal();
     assert_eq!(app.active_view, ghostdu::ui::ActiveView::Filesystem);
 
@@ -208,7 +225,10 @@ fn test_app_state_and_navigation() {
     assert_eq!(parent.unwrap(), base.parent().unwrap());
 
     // Test item info modal ('i' key)
-    assert!(app.fs_info.is_some(), "app.fs_info should be loaded on init");
+    assert!(
+        app.fs_info.is_some(),
+        "app.fs_info should be loaded on init"
+    );
     app.open_item_info();
     assert_eq!(app.active_view, ghostdu::ui::ActiveView::ItemInfoModal);
     assert!(app.item_info.is_some());
@@ -253,7 +273,11 @@ fn test_in_place_refresh() {
     assert_eq!(app.visible_children().len(), 3);
 
     // Enter subfolder
-    let sub_idx = app.visible_children().iter().position(|c| c.name == "subfolder").unwrap();
+    let sub_idx = app
+        .visible_children()
+        .iter()
+        .position(|c| c.name == "subfolder")
+        .unwrap();
     app.cursor_index = sub_idx;
     app.enter_selected();
     assert_eq!(app.path_stack.len(), 1);
@@ -347,35 +371,80 @@ fn test_category_taxonomy_scanning() {
 
     let find_child = |name: &str| root.children.iter().find(|c| c.name == name).unwrap();
 
-    assert_eq!(find_child(".Trash-1000").ghost_kind, ghostdu_scanner::GhostKind::Trash);
+    assert_eq!(
+        find_child(".Trash-1000").ghost_kind,
+        ghostdu_scanner::GhostKind::Trash
+    );
     assert_eq!(find_child(".Trash-1000").ghost_kind.badge(), "🗑️ TRASH");
 
-    assert_eq!(find_child("node_modules").ghost_kind, ghostdu_scanner::GhostKind::DependencyTree);
+    assert_eq!(
+        find_child("node_modules").ghost_kind,
+        ghostdu_scanner::GhostKind::DependencyTree
+    );
     assert_eq!(find_child("node_modules").ghost_kind.badge(), "📦 DEPS");
 
-    assert_eq!(find_child("target").ghost_kind, ghostdu_scanner::GhostKind::BuildCache);
+    assert_eq!(
+        find_child("target").ghost_kind,
+        ghostdu_scanner::GhostKind::BuildCache
+    );
     assert_eq!(find_child("target").ghost_kind.badge(), "👻 CACHE");
 
-    assert_eq!(find_child("system.log").ghost_kind, ghostdu_scanner::GhostKind::LogFiles);
+    assert_eq!(
+        find_child("system.log").ghost_kind,
+        ghostdu_scanner::GhostKind::LogFiles
+    );
     assert_eq!(find_child("system.log").ghost_kind.badge(), "📜 LOGS");
 
-    assert_eq!(find_child("weights.safetensors").ghost_kind, ghostdu_scanner::GhostKind::AiModel);
-    assert_eq!(find_child("weights.safetensors").ghost_kind.badge(), "🤖 AI");
+    assert_eq!(
+        find_child("weights.safetensors").ghost_kind,
+        ghostdu_scanner::GhostKind::AiModel
+    );
+    assert_eq!(
+        find_child("weights.safetensors").ghost_kind.badge(),
+        "🤖 AI"
+    );
 
-    assert_eq!(find_child("installer.iso").ghost_kind, ghostdu_scanner::GhostKind::VmOrIso);
+    assert_eq!(
+        find_child("installer.iso").ghost_kind,
+        ghostdu_scanner::GhostKind::VmOrIso
+    );
     assert_eq!(find_child("installer.iso").ghost_kind.badge(), "💿 VM/ISO");
 
-    assert_eq!(find_child("notes.txt").ghost_kind, ghostdu_scanner::GhostKind::None);
+    assert_eq!(
+        find_child("notes.txt").ghost_kind,
+        ghostdu_scanner::GhostKind::None
+    );
     assert_eq!(find_child("notes.txt").ghost_kind.badge(), "");
 
     // Check Deletion Safety Tiers
-    assert_eq!(find_child(".Trash-1000").delete_safety, ghostdu_scanner::DeleteSafety::Safe);
-    assert_eq!(find_child("target").delete_safety, ghostdu_scanner::DeleteSafety::Safe);
-    assert_eq!(find_child("system.log").delete_safety, ghostdu_scanner::DeleteSafety::Safe);
-    assert_eq!(find_child("node_modules").delete_safety, ghostdu_scanner::DeleteSafety::Recheck);
-    assert_eq!(find_child("weights.safetensors").delete_safety, ghostdu_scanner::DeleteSafety::Recheck);
-    assert_eq!(find_child("installer.iso").delete_safety, ghostdu_scanner::DeleteSafety::Recheck);
-    assert_eq!(find_child("notes.txt").delete_safety, ghostdu_scanner::DeleteSafety::UserData);
+    assert_eq!(
+        find_child(".Trash-1000").delete_safety,
+        ghostdu_scanner::DeleteSafety::Safe
+    );
+    assert_eq!(
+        find_child("target").delete_safety,
+        ghostdu_scanner::DeleteSafety::Safe
+    );
+    assert_eq!(
+        find_child("system.log").delete_safety,
+        ghostdu_scanner::DeleteSafety::Safe
+    );
+    assert_eq!(
+        find_child("node_modules").delete_safety,
+        ghostdu_scanner::DeleteSafety::Recheck
+    );
+    assert_eq!(
+        find_child("weights.safetensors").delete_safety,
+        ghostdu_scanner::DeleteSafety::Recheck
+    );
+    assert_eq!(
+        find_child("installer.iso").delete_safety,
+        ghostdu_scanner::DeleteSafety::Recheck
+    );
+    assert_eq!(
+        find_child("notes.txt").delete_safety,
+        ghostdu_scanner::DeleteSafety::UserData
+    );
 
     // Verify safe reclaimable calculation
     assert!(root.safe_reclaimable_bytes() > 0);

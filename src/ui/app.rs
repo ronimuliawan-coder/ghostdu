@@ -250,10 +250,10 @@ impl App {
                 });
             }
             SortMode::ByName => {
-                list.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+                list.sort_by_key(|a| a.name.to_lowercase());
             }
             SortMode::ByItems => {
-                list.sort_by(|a, b| b.items_count.cmp(&a.items_count));
+                list.sort_by_key(|a| std::cmp::Reverse(a.items_count));
             }
         }
 
@@ -361,7 +361,8 @@ impl App {
                 let target_path = target.path.clone();
                 // Locate original child index in parent
                 let current = self.current_dir_entry();
-                if let Some(orig_idx) = current.children.iter().position(|c| c.path == target_path) {
+                if let Some(orig_idx) = current.children.iter().position(|c| c.path == target_path)
+                {
                     self.path_stack.push(orig_idx);
                     self.cursor_index = 0;
                     self.scroll_offset.set(0);
@@ -446,7 +447,12 @@ impl App {
         let mut total_size = 0u64;
 
         // Traverse tree to calculate sizes
-        fn sum_selected(entry: &FileEntry, selected: &HashSet<PathBuf>, apparent: bool, sum: &mut u64) {
+        fn sum_selected(
+            entry: &FileEntry,
+            selected: &HashSet<PathBuf>,
+            apparent: bool,
+            sum: &mut u64,
+        ) {
             if selected.contains(&entry.path) {
                 *sum = sum.saturating_add(entry.display_size(apparent));
             } else if entry.is_dir {
@@ -456,7 +462,12 @@ impl App {
             }
         }
 
-        sum_selected(&self.root_entry, &self.selected_paths, self.apparent_size, &mut total_size);
+        sum_selected(
+            &self.root_entry,
+            &self.selected_paths,
+            self.apparent_size,
+            &mut total_size,
+        );
         (count, total_size)
     }
 
@@ -636,17 +647,15 @@ impl App {
                     ));
                 }
             }
-            ConfirmAction::DockerPrune => {
-                match prune_docker_dangling() {
-                    Ok(msg) => {
-                        self.set_status(format!("✔ Docker Prune: {}", msg));
-                        self.refresh_ghost_info();
-                    }
-                    Err(err) => {
-                        self.set_status(format!("❌ Docker Prune failed: {}", err));
-                    }
+            ConfirmAction::DockerPrune => match prune_docker_dangling() {
+                Ok(msg) => {
+                    self.set_status(format!("✔ Docker Prune: {}", msg));
+                    self.refresh_ghost_info();
                 }
-            }
+                Err(err) => {
+                    self.set_status(format!("❌ Docker Prune failed: {}", err));
+                }
+            },
         }
 
         // Adjust cursor
@@ -685,11 +694,9 @@ impl App {
 
             let mut found = false;
             for child in &mut entry.children {
-                if child.is_dir && target.starts_with(&child.path) {
-                    if remove_rec(child, target) {
-                        found = true;
-                        break;
-                    }
+                if child.is_dir && target.starts_with(&child.path) && remove_rec(child, target) {
+                    found = true;
+                    break;
                 }
             }
             if found {
@@ -724,11 +731,12 @@ impl App {
                     recalc(entry);
                     return true;
                 }
-                if child.is_dir && target.starts_with(&child.path) {
-                    if replace_rec(child, target, new_node) {
-                        recalc(entry);
-                        return true;
-                    }
+                if child.is_dir
+                    && target.starts_with(&child.path)
+                    && replace_rec(child, target, new_node)
+                {
+                    recalc(entry);
+                    return true;
                 }
             }
             false
@@ -771,11 +779,15 @@ impl App {
 
         let stop_signal = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         if is_at_root {
-            if let Ok(new_root) = crate::fs::scanner::scan_directory(&self.root_entry.path, None, stop_signal) {
+            if let Ok(new_root) =
+                crate::fs::scanner::scan_directory(&self.root_entry.path, None, stop_signal)
+            {
                 self.root_entry = new_root;
             }
         } else {
-            if let Ok(new_subtree) = crate::fs::scanner::scan_directory(&current_path, None, stop_signal) {
+            if let Ok(new_subtree) =
+                crate::fs::scanner::scan_directory(&current_path, None, stop_signal)
+            {
                 self.replace_subtree(&current_path, new_subtree);
             }
         }
@@ -791,7 +803,8 @@ impl App {
         if self.active_view == ActiveView::ItemInfoModal {
             let visible = self.visible_children();
             if let Some(target) = visible.get(self.cursor_index) {
-                self.item_info = crate::fs::mount_info::get_detailed_item_info(&target.path, target.items_count);
+                self.item_info =
+                    crate::fs::mount_info::get_detailed_item_info(&target.path, target.items_count);
             }
         }
 

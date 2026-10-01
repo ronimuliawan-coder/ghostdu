@@ -1,1 +1,16 @@
+# Build artifacts
 /target
+
+# Rust / Cargo backups
+**/*.rs.bk
+
+# Editor swap & temp files
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
+
+# OS metadata
+.DS_Store
+Thumbs.db

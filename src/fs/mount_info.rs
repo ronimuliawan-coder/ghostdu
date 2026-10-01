@@ -34,10 +34,10 @@ pub fn query_fs_info(path: &Path) -> Option<FsMountInfo> {
 
     let stat = unsafe { stat.assume_init() };
 
-    let frsize = stat.f_frsize as u64;
-    let total_bytes = stat.f_blocks as u64 * frsize;
-    let free_bytes = stat.f_bfree as u64 * frsize;
-    let avail_bytes = stat.f_bavail as u64 * frsize;
+    let frsize = stat.f_frsize;
+    let total_bytes = stat.f_blocks * frsize;
+    let free_bytes = stat.f_bfree * frsize;
+    let avail_bytes = stat.f_bavail * frsize;
     let used_bytes = total_bytes.saturating_sub(free_bytes);
     let use_percent = if total_bytes > 0 {
         ((used_bytes as f64 / total_bytes as f64) * 100.0).clamp(0.0, 100.0)
@@ -199,9 +199,15 @@ fn format_mode(mode: u32, is_dir: bool, is_symlink: bool) -> String {
     };
 
     let rwx = [
-        (0o400, 'r'), (0o200, 'w'), (0o100, 'x'),
-        (0o040, 'r'), (0o020, 'w'), (0o010, 'x'),
-        (0o004, 'r'), (0o002, 'w'), (0o001, 'x'),
+        (0o400, 'r'),
+        (0o200, 'w'),
+        (0o100, 'x'),
+        (0o040, 'r'),
+        (0o020, 'w'),
+        (0o010, 'x'),
+        (0o004, 'r'),
+        (0o002, 'w'),
+        (0o001, 'x'),
     ];
 
     let mut s = String::with_capacity(10);
@@ -234,8 +240,14 @@ mod tests {
         let info = query_fs_info(root);
         assert!(info.is_some(), "query_fs_info(/) should succeed");
         let info = info.unwrap();
-        assert!(info.total_bytes > 0, "Root filesystem total_bytes should be > 0");
-        assert!(info.avail_bytes > 0, "Root filesystem avail_bytes should be > 0");
+        assert!(
+            info.total_bytes > 0,
+            "Root filesystem total_bytes should be > 0"
+        );
+        assert!(
+            info.avail_bytes > 0,
+            "Root filesystem avail_bytes should be > 0"
+        );
         assert!(info.use_percent >= 0.0 && info.use_percent <= 100.0);
     }
 

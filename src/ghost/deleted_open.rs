@@ -89,6 +89,6 @@ pub fn scan_deleted_open_files() -> Vec<DeletedOpenFile> {
     }
 
     // Sort descending by size
-    deleted_files.sort_by(|a, b| b.size.cmp(&a.size));
+    deleted_files.sort_by_key(|a| std::cmp::Reverse(a.size));
     deleted_files
 }

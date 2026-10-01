@@ -33,7 +33,9 @@ use std::io::IsTerminal;
 /// ghostdu: Modern, ultra-fast native Linux disk usage & ghost file analyzer
 #[derive(Parser, Debug)]
 #[command(name = "ghostdu", author = "Ron", version = "0.1.0")]
-#[command(about = "Modern, ultra-fast native Linux disk usage & ghost file analyzer with wastebin support")]
+#[command(
+    about = "Modern, ultra-fast native Linux disk usage & ghost file analyzer with wastebin support"
+)]
 struct Cli {
     /// Directory to scan (defaults to current directory)
     #[arg(default_value = ".")]
@@ -104,9 +106,8 @@ fn run_app<B: ratatui::backend::Backend>(
         let stop_clone = stop_signal.clone();
 
         let scan_path = target_path.clone();
-        let scan_handle = thread::spawn(move || {
-            scan_directory(&scan_path, Some(progress_tx), stop_clone)
-        });
+        let scan_handle =
+            thread::spawn(move || scan_directory(&scan_path, Some(progress_tx), stop_clone));
 
         let mut last_progress = ScanProgress {
             files_scanned: 0,
@@ -146,18 +147,41 @@ fn run_app<B: ratatui::backend::Backend>(
 
                 let lines = vec![
                     Line::from(vec![
-                        Span::styled(format!("{} ", spinner), Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-                        Span::styled("Analyzing disk usage & ghost files...", Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+                        Span::styled(
+                            format!("{} ", spinner),
+                            Style::default()
+                                .fg(Color::Cyan)
+                                .add_modifier(Modifier::BOLD),
+                        ),
+                        Span::styled(
+                            "Analyzing disk usage & ghost files...",
+                            Style::default()
+                                .fg(Color::White)
+                                .add_modifier(Modifier::BOLD),
+                        ),
                     ]),
                     Line::from(""),
                     Line::from(vec![
                         Span::styled("Files Scanned: ", Style::default().fg(Color::DarkGray)),
-                        Span::styled(files_str, Style::default().fg(Color::LightGreen).add_modifier(Modifier::BOLD)),
+                        Span::styled(
+                            files_str,
+                            Style::default()
+                                .fg(Color::LightGreen)
+                                .add_modifier(Modifier::BOLD),
+                        ),
                         Span::raw("   "),
                         Span::styled("Total Size: ", Style::default().fg(Color::DarkGray)),
-                        Span::styled(bytes_str, Style::default().fg(Color::LightCyan).add_modifier(Modifier::BOLD)),
+                        Span::styled(
+                            bytes_str,
+                            Style::default()
+                                .fg(Color::LightCyan)
+                                .add_modifier(Modifier::BOLD),
+                        ),
                         Span::raw("   "),
-                        Span::styled(format!("({:.1}s)", elapsed), Style::default().fg(Color::DarkGray)),
+                        Span::styled(
+                            format!("({:.1}s)", elapsed),
+                            Style::default().fg(Color::DarkGray),
+                        ),
                     ]),
                     Line::from(""),
                     Line::from(vec![
@@ -172,7 +196,10 @@ fn run_app<B: ratatui::backend::Backend>(
                         ),
                     ]),
                     Line::from(""),
-                    Line::from(Span::styled("Press 'q' or Ctrl+C to cancel", Style::default().fg(Color::DarkGray))),
+                    Line::from(Span::styled(
+                        "Press 'q' or Ctrl+C to cancel",
+                        Style::default().fg(Color::DarkGray),
+                    )),
                 ];
 
                 let block = Block::default()
@@ -181,13 +208,19 @@ fn run_app<B: ratatui::backend::Backend>(
                     .border_style(Style::default().fg(Color::LightCyan))
                     .title(" 👻 ghostdu Scanner ");
 
-                f.render_widget(Paragraph::new(lines).block(block).alignment(Alignment::Left), area);
+                f.render_widget(
+                    Paragraph::new(lines)
+                        .block(block)
+                        .alignment(Alignment::Left),
+                    area,
+                );
             })?;
 
             if event::poll(Duration::from_millis(60))? {
                 if let Event::Key(key) = event::read()? {
                     if key.code == KeyCode::Char('q')
-                        || (key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c'))
+                        || (key.modifiers.contains(KeyModifiers::CONTROL)
+                            && key.code == KeyCode::Char('c'))
                     {
                         stop_signal.store(true, Ordering::Relaxed);
                         return Ok(());
@@ -246,7 +279,10 @@ fn centered_rect(width: u16, height: u16, r: Rect) -> Rect {
 }
 
 fn run_headless_summary(target_path: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
-    println!("👻 ghostdu: Analyzing disk usage & ghost files for {:?}...", target_path);
+    println!(
+        "👻 ghostdu: Analyzing disk usage & ghost files for {:?}...",
+        target_path
+    );
 
     let stop_signal = Arc::new(AtomicBool::new(false));
     let root_entry = scan_directory(&target_path, None, stop_signal)?;
@@ -264,8 +300,14 @@ fn run_headless_summary(target_path: PathBuf) -> Result<(), Box<dyn std::error::
         let filled_len = ((percent / 100.0) * bar_len as f64).round() as usize;
         let bar_filled = "█".repeat(filled_len.min(bar_len));
         let bar_empty = "░".repeat(bar_len.saturating_sub(filled_len));
-        println!("  💾 FILESYSTEM: {} ({} on {})", fs.device, fs.fs_type, fs.mount_point.display());
-        println!("     Capacity: {} | Used: {} [{}{}] {:.1}% | Free Space: {}",
+        println!(
+            "  💾 FILESYSTEM: {} ({} on {})",
+            fs.device,
+            fs.fs_type,
+            fs.mount_point.display()
+        );
+        println!(
+            "     Capacity: {} | Used: {} [{}{}] {:.1}% | Free Space: {}",
             format_size(fs.total_bytes),
             format_size(fs.used_bytes),
             bar_filled,
@@ -274,10 +316,17 @@ fn run_headless_summary(target_path: PathBuf) -> Result<(), Box<dyn std::error::
             format_size(fs.avail_bytes),
         );
     }
-    println!("  📊 TOTAL DISK USAGE: {} (Apparent: {})", format_size(root_entry.disk_usage), format_size(root_entry.size));
+    println!(
+        "  📊 TOTAL DISK USAGE: {} (Apparent: {})",
+        format_size(root_entry.disk_usage),
+        format_size(root_entry.size)
+    );
     println!("  📦 TOTAL ITEMS: {}", format_count(root_entry.items_count));
     println!("════════════════════════════════════════════════════════════════════════════════");
-    println!("{:<4} {:<40} {:<12} {:<18} {:<12}", "SEL", "NAME", "SIZE", "USAGE BAR", "CATEGORY");
+    println!(
+        "{:<4} {:<40} {:<12} {:<18} {:<12}",
+        "SEL", "NAME", "SIZE", "USAGE BAR", "CATEGORY"
+    );
     println!("────────────────────────────────────────────────────────────────────────────────");
 
     let parent_size = root_entry.disk_usage.max(1);
@@ -334,10 +383,18 @@ fn run_headless_summary(target_path: PathBuf) -> Result<(), Box<dyn std::error::
             format_size(docker_info.volumes_reclaimable_size),
             format_size(docker_info.build_cache_reclaimable_size),
         );
-        println!("  Images: {} | Containers: {} | Local Volumes: {}",
-            docker_info.images_count, docker_info.containers_count, docker_info.volumes_count);
+        println!(
+            "  Images: {} | Containers: {} | Local Volumes: {}",
+            docker_info.images_count, docker_info.containers_count, docker_info.volumes_count
+        );
     } else {
-        println!("  Docker daemon: {}", docker_info.error_message.as_deref().unwrap_or("Not running"));
+        println!(
+            "  Docker daemon: {}",
+            docker_info
+                .error_message
+                .as_deref()
+                .unwrap_or("Not running")
+        );
     }
 
     println!();
@@ -348,9 +405,19 @@ fn run_headless_summary(target_path: PathBuf) -> Result<(), Box<dyn std::error::
         println!("  No open unlinked files currently holding significant disk space.");
     } else {
         let total_held: u64 = deleted_open.iter().map(|f| f.size).sum();
-        println!("  Total Ghost Space Held: {} ({} files)", format_size(total_held), deleted_open.len());
+        println!(
+            "  Total Ghost Space Held: {} ({} files)",
+            format_size(total_held),
+            deleted_open.len()
+        );
         for item in deleted_open.iter().take(5) {
-            println!("  PID {:<7} | {:<16} | {:<10} | {}", item.pid, item.process_name, format_size(item.size), item.original_path);
+            println!(
+                "  PID {:<7} | {:<16} | {:<10} | {}",
+                item.pid,
+                item.process_name,
+                format_size(item.size),
+                item.original_path
+            );
         }
     }
 

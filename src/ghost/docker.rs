@@ -239,7 +239,7 @@ pub fn fetch_docker_disk_info() -> DockerDiskInfo {
                 let rw_size = c.size_rw.unwrap_or(0).max(0) as u64;
                 info.containers_total_size += rw_size;
                 let is_stopped = c.state.as_deref() == Some("exited")
-                    || c.status.as_deref().map_or(false, |s| s.starts_with("Exited"));
+                    || c.status.as_deref().is_some_and(|s| s.starts_with("Exited"));
                 if is_stopped {
                     info.containers_reclaimable_size += rw_size;
                 }
@@ -294,7 +294,9 @@ pub fn fetch_docker_disk_info() -> DockerDiskInfo {
                     id_or_name: bc.id.chars().take(12).collect(),
                     size,
                     is_reclaimable: bc.reclaimable,
-                    details: bc.description.unwrap_or_else(|| "Build cache entry".to_string()),
+                    details: bc
+                        .description
+                        .unwrap_or_else(|| "Build cache entry".to_string()),
                 });
             }
         }
@@ -312,7 +314,10 @@ pub fn prune_docker_dangling() -> Result<String, String> {
     let mut messages = Vec::new();
 
     // 1. Prune dangling images
-    if let Ok(_res) = send_docker_http_request("POST", "/images/prune?filters=%7B%22dangling%22%3A%7B%22true%22%3Atrue%7D%7D") {
+    if let Ok(_res) = send_docker_http_request(
+        "POST",
+        "/images/prune?filters=%7B%22dangling%22%3A%7B%22true%22%3Atrue%7D%7D",
+    ) {
         messages.push("Pruned unused images".to_string());
     }
     // 2. Prune stopped containers

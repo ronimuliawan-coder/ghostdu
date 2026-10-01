@@ -100,11 +100,11 @@ impl GhostKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[allow(dead_code)]
 pub enum DeleteSafety {
-    Safe,      // 🟢 Safe to remove, transient/ephemeral/cache
-    Recheck,   // 🟡 Recheck/reproducible with cost (deps, models, isos)
+    Safe,    // 🟢 Safe to remove, transient/ephemeral/cache
+    Recheck, // 🟡 Recheck/reproducible with cost (deps, models, isos)
     #[default]
-    UserData,  // ⚪ User personal files or source code
-    System,    // 🔴 Critical system directory/file - deletion blocked or dangerous
+    UserData, // ⚪ User personal files or source code
+    System,  // 🔴 Critical system directory/file - deletion blocked or dangerous
 }
 
 #[allow(dead_code)]
@@ -159,20 +159,21 @@ impl DeleteSafety {
 pub struct FileEntry {
     pub name: String,
     pub path: PathBuf,
-    pub size: u64,           // Apparent file size in bytes
-    pub disk_usage: u64,     // Allocated disk space (blocks * 512)
-    pub items_count: usize,  // Total recursive items count
+    pub size: u64,          // Apparent file size in bytes
+    pub disk_usage: u64,    // Allocated disk space (blocks * 512)
+    pub items_count: usize, // Total recursive items count
     pub is_dir: bool,
     pub is_symlink: bool,
     pub dev: u64,
     pub ino: u64,
     pub ghost_kind: GhostKind,
     pub delete_safety: DeleteSafety,
-    pub has_err: bool,       // e.g. permission denied
+    pub has_err: bool, // e.g. permission denied
     pub children: Vec<FileEntry>,
 }
 
 impl FileEntry {
+    #[allow(clippy::too_many_arguments)]
     pub fn new_file(
         name: String,
         path: PathBuf,
