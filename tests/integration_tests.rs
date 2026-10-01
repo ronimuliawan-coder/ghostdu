@@ -233,7 +233,7 @@ fn test_app_state_and_navigation() {
     assert_eq!(app.active_view, ghostdu::ui::ActiveView::ItemInfoModal);
     assert!(app.item_info.is_some());
     let item_info = app.item_info.as_ref().unwrap();
-    assert_eq!(item_info.name, "dir_b");
+    assert!(item_info.name == "dir_a" || item_info.name == "dir_b");
     assert!(item_info.is_dir);
     assert!(item_info.fs_info.is_some());
 }

@@ -239,21 +239,25 @@ impl App {
                 list.sort_by(|a, b| {
                     let s_b = b.display_size(self.apparent_size);
                     let s_a = a.display_size(self.apparent_size);
-                    s_b.cmp(&s_a)
+                    s_b.cmp(&s_a).then_with(|| a.name.cmp(&b.name))
                 });
             }
             SortMode::BySizeAsc => {
                 list.sort_by(|a, b| {
                     let s_a = a.display_size(self.apparent_size);
                     let s_b = b.display_size(self.apparent_size);
-                    s_a.cmp(&s_b)
+                    s_a.cmp(&s_b).then_with(|| a.name.cmp(&b.name))
                 });
             }
             SortMode::ByName => {
                 list.sort_by_key(|a| a.name.to_lowercase());
             }
             SortMode::ByItems => {
-                list.sort_by_key(|a| std::cmp::Reverse(a.items_count));
+                list.sort_by(|a, b| {
+                    b.items_count
+                        .cmp(&a.items_count)
+                        .then_with(|| a.name.cmp(&b.name))
+                });
             }
         }
 
