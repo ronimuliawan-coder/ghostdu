@@ -108,7 +108,7 @@ Ensure you have Rust and Cargo installed:
 
 ```bash
 # Clone the repository
-git clone https://github.com/ronimuliawan/ghostdu.git
+git clone https://github.com/ronimuliawan-coder/ghostdu.git
 cd ghostdu
 
 # Install directly to ~/.cargo/bin (or ~/.local/bin)
