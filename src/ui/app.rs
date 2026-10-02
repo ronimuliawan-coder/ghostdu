@@ -651,7 +651,9 @@ impl App {
                     self.remove_path_from_tree(path);
                 }
 
-                if count > 0 {
+                // A failed recursive deletion may already have removed children.
+                let reconciled = failed_count == 0 || self.reconcile_after_delete_failure();
+                if count > 0 || failed_count > 0 {
                     self.refresh_fs_info();
                 }
 
@@ -659,8 +661,15 @@ impl App {
                     self.set_status(format!("✔ Permanently removed {} items", count));
                 } else {
                     self.set_status(format!(
-                        "Removed {} items, {} failed (permissions)",
-                        count, failed_count
+                        "Removed {} items, {} failed: {}{}",
+                        count,
+                        failed_count,
+                        result.failed[0].1,
+                        if reconciled {
+                            ""
+                        } else {
+                            "; rescan failed, displayed tree may be stale"
+                        }
                     ));
                 }
             }
@@ -687,6 +696,24 @@ impl App {
         self.action_has_recheck = false;
         self.action_has_system = false;
         self.active_view = self.previous_view;
+    }
+
+    fn reconcile_after_delete_failure(&mut self) -> bool {
+        let current_path = self.current_dir_entry().path.clone();
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        match crate::fs::scanner::scan_directory(&self.root_entry.path, None, stop) {
+            Ok(root) => {
+                self.root_entry = root;
+                self.navigate_to_path(&current_path);
+                self.selected_paths
+                    .retain(|path| std::fs::symlink_metadata(path).is_ok());
+                true
+            }
+            Err(_) => {
+                self.root_entry.has_err = true;
+                false
+            }
+        }
     }
 
     /// Cancel pending confirmation
@@ -727,12 +754,14 @@ impl App {
         fn recalc(entry: &mut FileEntry) {
             let mut total_size = 0u64;
             let mut total_disk = 0u64;
+            let mut total_reclaimable = 0u64;
             let mut total_items = 0usize;
             let mut total_safe_reclaimable = 0u64;
             let mut total_safe_items = 0usize;
             for child in &entry.children {
                 total_size = total_size.saturating_add(child.size);
                 total_disk = total_disk.saturating_add(child.disk_usage);
+                total_reclaimable = total_reclaimable.saturating_add(child.reclaimable);
                 total_items = total_items.saturating_add(child.items_count);
                 total_safe_reclaimable =
                     total_safe_reclaimable.saturating_add(child.safe_reclaimable_bytes());
@@ -740,9 +769,10 @@ impl App {
             }
             entry.size = total_size;
             entry.disk_usage = total_disk;
+            entry.reclaimable = total_reclaimable;
             entry.items_count = total_items + 1;
             if entry.delete_safety == DeleteSafety::Safe {
-                entry.safe_reclaimable = total_disk;
+                entry.safe_reclaimable = total_reclaimable;
                 entry.safe_items = 1;
             } else {
                 entry.safe_reclaimable = total_safe_reclaimable;
@@ -776,12 +806,14 @@ impl App {
         fn recalc(entry: &mut FileEntry) {
             let mut total_size = 0u64;
             let mut total_disk = 0u64;
+            let mut total_reclaimable = 0u64;
             let mut total_items = 0usize;
             let mut total_safe_reclaimable = 0u64;
             let mut total_safe_items = 0usize;
             for child in &entry.children {
                 total_size = total_size.saturating_add(child.size);
                 total_disk = total_disk.saturating_add(child.disk_usage);
+                total_reclaimable = total_reclaimable.saturating_add(child.reclaimable);
                 total_items = total_items.saturating_add(child.items_count);
                 total_safe_reclaimable =
                     total_safe_reclaimable.saturating_add(child.safe_reclaimable_bytes());
@@ -789,9 +821,10 @@ impl App {
             }
             entry.size = total_size;
             entry.disk_usage = total_disk;
+            entry.reclaimable = total_reclaimable;
             entry.items_count = total_items + 1;
             if entry.delete_safety == DeleteSafety::Safe {
-                entry.safe_reclaimable = total_disk;
+                entry.safe_reclaimable = total_reclaimable;
                 entry.safe_items = 1;
             } else {
                 entry.safe_reclaimable = total_safe_reclaimable;

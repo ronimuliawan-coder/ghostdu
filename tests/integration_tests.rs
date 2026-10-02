@@ -960,9 +960,10 @@ fn test_duplicate_safe_hardlink_stored_totals() {
         .unwrap();
     assert_eq!((duplicate.safe_reclaimable, duplicate.safe_items), (0, 0));
     assert_eq!(duplicate.safe_items_count(), 0);
-    assert_eq!(counted.safe_reclaimable, counted.disk_usage);
+    assert_eq!(counted.safe_reclaimable, 0);
+    assert_eq!(counted.safe_reclaimable_bytes(), 0);
     assert_eq!(counted.safe_items, 1);
-    assert_eq!(root.safe_reclaimable, counted.disk_usage);
+    assert_eq!(root.safe_reclaimable, 0);
     assert_eq!(root.safe_items, 1);
 }
 
@@ -976,4 +977,51 @@ fn test_snap_archives_are_not_virtual_filesystems() {
         "/var/lib/snapd/mnt/core"
     )));
     assert!(is_virtual_fs_path(std::path::Path::new("/proc/1/stat")));
+}
+
+#[test]
+fn test_external_hardlinks_do_not_inflate_safe_directory_savings() {
+    let fixture = tempfile::tempdir().unwrap();
+    let safe = fixture.path().join(".cache");
+    fs::create_dir(&safe).unwrap();
+    fs::write(safe.join("linked"), vec![b'x'; 8192]).unwrap();
+    fs::hard_link(safe.join("linked"), fixture.path().join("outside")).unwrap();
+    fs::write(safe.join("single"), vec![b'x'; 4096]).unwrap();
+    let root =
+        ghostdu_scanner::scan_directory(&safe, None, Arc::new(AtomicBool::new(false))).unwrap();
+    let linked = root.children.iter().find(|e| e.name == "linked").unwrap();
+    let single = root
+        .children
+        .iter()
+        .find(|e| e.name == "single")
+        .unwrap()
+        .clone();
+    assert!(linked.disk_usage > 0);
+    assert_eq!(linked.reclaimable, 0);
+    assert_eq!(root.safe_reclaimable_bytes(), single.disk_usage);
+    assert_eq!(root.safe_reclaimable, single.disk_usage);
+    // UI recomputation must preserve conservative estimates as subtrees change.
+    let mut app = ghostdu::ui::App::new(root);
+    app.replace_subtree(&safe.join("single"), single.clone());
+    assert_eq!(app.root_entry.safe_reclaimable_bytes(), single.disk_usage);
+}
+
+#[test]
+fn test_failed_deletion_reconciles_stale_tree() {
+    let dir = tempfile::tempdir().unwrap();
+    let removed = dir.path().join("removed");
+    fs::write(&removed, "already gone").unwrap();
+    fs::write(dir.path().join("remaining"), "keep").unwrap();
+    let root = ghostdu_scanner::scan_directory(dir.path(), None, Arc::new(AtomicBool::new(false)))
+        .unwrap();
+    let mut app = ghostdu::ui::App::new(root);
+    fs::remove_file(&removed).unwrap();
+    app.selected_paths.insert(removed.clone());
+    app.action_targets = vec![removed];
+    app.pending_action = Some(ghostdu::ui::ConfirmAction::PermanentDelete);
+    app.execute_pending_action();
+    assert_eq!(app.root_entry.children.len(), 1);
+    assert_eq!(app.root_entry.children[0].name, "remaining");
+    assert!(app.selected_paths.is_empty());
+    assert!(app.current_status().unwrap().contains("1 failed"));
 }

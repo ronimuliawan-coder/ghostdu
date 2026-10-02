@@ -101,6 +101,18 @@ fn bind_mount_boundaries_and_ancestor_cycles() {
             .unwrap();
         assert!(cycle.children.is_empty());
     }
+    // Removal must reject both mount points and ancestors containing mounted data.
+    for target in [&root, &bind, &ancestor, &other_device] {
+        let result = ghostdu::ops::permanently_delete(&[target]);
+        assert!(result.succeeded.is_empty());
+        assert_eq!(result.failed.len(), 1);
+        assert_eq!(fs::read(root.join("local")).unwrap(), b"1234567");
+        assert_eq!(fs::read(external.join("bound")).unwrap(), b"12345");
+        assert_eq!(
+            fs::read(other_device.join("separate")).unwrap(),
+            b"123456789"
+        );
+    }
     // TempDir cleanup must happen after unmounting the synthetic filesystems.
     for mount in [&ancestor, &bind, &other_device] {
         assert!(Command::new("umount")
