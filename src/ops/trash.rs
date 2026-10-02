@@ -19,11 +19,28 @@ pub struct TrashResult {
 }
 
 pub fn move_to_trash<P: AsRef<Path>>(paths: &[P]) -> TrashResult {
+    trash_with_verification(paths, |_, _| Ok(()))
+}
+
+pub(crate) fn move_to_trash_confirmed(
+    paths: &[PathBuf],
+    identities: &super::TargetIdentities,
+) -> TrashResult {
+    trash_with_verification(paths, |path, target| {
+        super::verify_confirmed(identities, path, target)
+    })
+}
+
+fn trash_with_verification<P: AsRef<Path>>(
+    paths: &[P],
+    verify: impl Fn(&Path, &File) -> io::Result<()>,
+) -> TrashResult {
     let mut result = TrashResult::default();
     for path in paths {
         let path = path.as_ref();
         let moved: io::Result<()> = (|| {
             let (parent, name, target) = prepare_target(path)?;
+            verify(path, &target)?;
             inspect_tree(&target)?;
             let original = fd_path(&parent)?.join(OsStr::from_bytes(name.to_bytes()));
             let (trash, topdir) = trash_directory(&parent)?;
@@ -82,7 +99,7 @@ fn private_directory(parent: &File, name: &Path) -> io::Result<File> {
     Ok(directory)
 }
 
-fn home_trash() -> io::Result<File> {
+fn data_home_path() -> io::Result<PathBuf> {
     let data_home = std::env::var_os("XDG_DATA_HOME")
         .filter(|s| !s.is_empty())
         .map(PathBuf::from)
@@ -91,6 +108,10 @@ fn home_trash() -> io::Result<File> {
     if !data_home.is_absolute() {
         return Err(io::Error::other("Trash data directory must be absolute"));
     }
+    Ok(data_home)
+}
+
+fn home_trash(data_home: &Path) -> io::Result<File> {
     let mut directory = File::from(openat2(
         CWD,
         "/",
@@ -128,10 +149,46 @@ fn same_mount(left: &File, right: &File) -> io::Result<bool> {
     }
 }
 
+fn data_home_mount(data_home: &Path) -> io::Result<File> {
+    for path in data_home.ancestors() {
+        match openat2(
+            CWD,
+            path,
+            OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC,
+            Mode::empty(),
+            ResolveFlags::NO_SYMLINKS,
+        ) {
+            Ok(fd) => return Ok(File::from(fd)),
+            Err(rustix::io::Errno::NOENT | rustix::io::Errno::NOTDIR) => continue,
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Err(io::Error::other("Cannot identify the home trash mount"))
+}
+
 fn trash_directory(parent: &File) -> io::Result<(File, Option<PathBuf>)> {
-    if let Ok(home) = home_trash() {
-        if same_mount(&home, parent)? {
-            return Ok((home, None));
+    trash_directory_for_data_home(parent, &data_home_path()?)
+}
+
+fn trash_directory_for_data_home(
+    parent: &File,
+    data_home: &Path,
+) -> io::Result<(File, Option<PathBuf>)> {
+    match home_trash(data_home) {
+        Ok(home) => {
+            if same_mount(&home, parent)? {
+                return Ok((home, None));
+            }
+        }
+        Err(error) => {
+            // Use the selected XDG location, not $HOME. Missing components inherit
+            // their nearest existing directory's mount; unknown mounts fail closed.
+            let on_other_mount = data_home_mount(data_home)
+                .and_then(|home| same_mount(&home, parent))
+                .is_ok_and(|same| !same);
+            if !on_other_mount {
+                return Err(error);
+            }
         }
     }
     // Locate this filesystem's top directory without crossing even same-device bind mounts.
@@ -183,6 +240,25 @@ fn move_verified(
     trash: &File,
     original: &Path,
 ) -> io::Result<()> {
+    move_verified_with_hook(parent, name, target, trash, original, |_, _, _| {})
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MovePhase {
+    Reserved,
+    MetadataSynced,
+    Renamed,
+}
+
+// The hook permits subprocess interruption tests at actual transaction boundaries.
+fn move_verified_with_hook(
+    parent: &File,
+    name: &CStr,
+    target: &File,
+    trash: &File,
+    original: &Path,
+    hook: impl Fn(MovePhase, &File, &str),
+) -> io::Result<()> {
     let files = private_directory(trash, Path::new("files"))?;
     let info = private_directory(trash, Path::new("info"))?;
     static NEXT_NAME: AtomicU64 = AtomicU64::new(0);
@@ -201,6 +277,7 @@ fn move_verified(
             Err(rustix::io::Errno::EXIST) => continue,
             Err(error) => return Err(error.into()),
         };
+        hook(MovePhase::Reserved, &info, &info_name);
         let moved: io::Result<()> = (|| {
             let mut metadata = File::from(metadata_fd);
             writeln!(
@@ -210,13 +287,23 @@ fn move_verified(
                 chrono::Local::now().format("%Y-%m-%dT%H:%M:%S")
             )?;
             metadata.sync_all()?;
+            hook(MovePhase::MetadataSynced, &info, &info_name);
             verify_identity(parent, name, target)?;
             // Both directories stay pinned. Never re-resolve the user's source path or copy/delete.
             renameat_with(parent, name, &files, &stored_name, RenameFlags::NOREPLACE)?;
+            hook(MovePhase::Renamed, &info, &info_name);
             Ok(())
         })();
-        if moved.is_err() {
-            let _ = unlinkat(&info, &info_name, AtFlags::empty());
+        if let Err(error) = &moved {
+            if let Err(cleanup) = unlinkat(&info, &info_name, AtFlags::empty()) {
+                let location = fd_path(&info)
+                    .map(|path| path.join(&info_name))
+                    .unwrap_or_else(|_| PathBuf::from(&info_name));
+                return Err(io::Error::other(format!(
+                    "{error}; metadata cleanup failed at {}: {cleanup}; inspect this orphaned entry",
+                    location.display()
+                )));
+            }
         }
         match moved {
             Err(error) if error.raw_os_error() == Some(libc::EEXIST) => continue,
@@ -341,5 +428,210 @@ mod tests {
         assert!(move_verified(&parent, &name, &target, &trash, &source).is_err());
         assert_eq!(fs::read_to_string(&source).unwrap(), "keep");
         assert_eq!(fs::read_dir(victim).unwrap().count(), 0);
+    }
+    #[test]
+    fn home_trash_error_is_preserved_on_the_selected_mount() {
+        let fixture = tempfile::tempdir().unwrap();
+        let data_home = fixture.path().join("xdg-data");
+        fs::create_dir(&data_home).unwrap();
+        fs::write(data_home.join("Trash"), "not a directory").unwrap();
+        let expected = home_trash(&data_home).unwrap_err();
+        let parent = File::open(fixture.path()).unwrap();
+        let actual = trash_directory_for_data_home(&parent, &data_home).unwrap_err();
+        assert_eq!(actual.raw_os_error(), expected.raw_os_error());
+        assert_eq!(actual.to_string(), expected.to_string());
+    }
+
+    #[test]
+    fn invalid_data_home_component_retains_its_setup_error() {
+        let fixture = tempfile::tempdir().unwrap();
+        let not_directory = fixture.path().join("file");
+        fs::write(&not_directory, "keep").unwrap();
+        let data_home = not_directory.join("missing");
+        let parent = File::open(fixture.path()).unwrap();
+        let expected = home_trash(&data_home).unwrap_err();
+        let actual = trash_directory_for_data_home(&parent, &data_home).unwrap_err();
+        assert_eq!(actual.raw_os_error(), expected.raw_os_error());
+        assert_eq!(actual.to_string(), expected.to_string());
+        assert_eq!(fs::read_to_string(not_directory).unwrap(), "keep");
+    }
+}
+
+#[cfg(test)]
+mod recovery_tests {
+    use super::*;
+    use std::process::{Command, Stdio};
+
+    #[test]
+    fn process_interruption_leaves_recoverable_states() {
+        const CHILD_ROOT: &str = "GHOSTDU_INTERRUPTION_FIXTURE";
+        const CHILD_PHASE: &str = "GHOSTDU_INTERRUPTION_PHASE";
+        if let Some(root) = std::env::var_os(CHILD_ROOT) {
+            let root = PathBuf::from(root);
+            let phase = std::env::var(CHILD_PHASE).unwrap();
+            let source = root.join("source");
+            let trash = private_directory(&File::open(&root).unwrap(), Path::new("Trash")).unwrap();
+            let (parent, name, target) = prepare_target(&source).unwrap();
+            move_verified_with_hook(&parent, &name, &target, &trash, &source, |at, _, _| {
+                if matches!(
+                    (phase.as_str(), at),
+                    ("reserved", MovePhase::Reserved)
+                        | ("synced", MovePhase::MetadataSynced)
+                        | ("renamed", MovePhase::Renamed)
+                ) {
+                    // No Rust destructors/cleanup run, as with abrupt process termination.
+                    std::process::exit(73);
+                }
+            })
+            .unwrap();
+            panic!("interruption boundary was not reached");
+        }
+        for phase in ["reserved", "synced", "renamed"] {
+            let fixture = tempfile::tempdir().unwrap();
+            let source = fixture.path().join("source");
+            fs::write(&source, "recoverable payload").unwrap();
+            let status = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "ops::trash::recovery_tests::process_interruption_leaves_recoverable_states",
+                ])
+                .env(CHILD_ROOT, fixture.path())
+                .env(CHILD_PHASE, phase)
+                .status()
+                .unwrap();
+            assert_eq!(status.code(), Some(73));
+            let info: Vec<_> = fs::read_dir(fixture.path().join("Trash/info"))
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .collect();
+            assert_eq!(info.len(), 1);
+            let metadata = fs::read_to_string(&info[0]).unwrap();
+            if phase == "reserved" {
+                assert!(metadata.is_empty());
+            } else {
+                assert!(metadata.contains(&format!("Path={}\n", encode_path(&source))));
+            }
+            let files: Vec<_> = fs::read_dir(fixture.path().join("Trash/files"))
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .collect();
+            if phase == "renamed" {
+                assert!(!source.exists());
+                assert_eq!(files.len(), 1);
+                assert_eq!(
+                    fs::read_to_string(&files[0]).unwrap(),
+                    "recoverable payload"
+                );
+                assert_eq!(info[0].file_stem(), files[0].file_name());
+            } else {
+                assert!(files.is_empty());
+                assert_eq!(fs::read_to_string(&source).unwrap(), "recoverable payload");
+            }
+        }
+    }
+
+    #[test]
+    fn metadata_cleanup_failure_reports_original_error_and_orphan_location() {
+        let fixture = tempfile::tempdir().unwrap();
+        let source = fixture.path().join("source");
+        fs::write(&source, "original").unwrap();
+        let trash =
+            private_directory(&File::open(fixture.path()).unwrap(), Path::new("Trash")).unwrap();
+        let (parent, name, target) = prepare_target(&source).unwrap();
+        let error = move_verified_with_hook(
+            &parent,
+            &name,
+            &target,
+            &trash,
+            &source,
+            |phase, info, info_name| {
+                if phase == MovePhase::MetadataSynced {
+                    fs::rename(&source, fixture.path().join("original")).unwrap();
+                    fs::write(&source, "replacement").unwrap();
+                    // Deterministic unlink failure even when tests run as root.
+                    let info_path = fd_path(info).unwrap().join(info_name);
+                    let metadata = fs::read(&info_path).unwrap();
+                    fs::remove_file(&info_path).unwrap();
+                    fs::create_dir(&info_path).unwrap();
+                    fs::write(info_path.join("saved-metadata"), metadata).unwrap();
+                }
+            },
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("Target changed"));
+        assert!(error.contains("metadata cleanup failed"));
+        assert!(error.contains(fixture.path().join("Trash/info").to_str().unwrap()));
+        assert!(error.contains(".trashinfo"));
+        assert_eq!(fs::read_to_string(&source).unwrap(), "replacement");
+        assert_eq!(
+            fs::read_to_string(fixture.path().join("original")).unwrap(),
+            "original"
+        );
+        assert_eq!(
+            fs::read_dir(fixture.path().join("Trash/files"))
+                .unwrap()
+                .count(),
+            0
+        );
+    }
+
+    #[test]
+    #[ignore = "requires external trash-cli; set GHOSTDU_TRASH_RESTORE to its trash-restore executable"]
+    fn external_consumer_restores_files_directories_and_symlinks() {
+        let restore =
+            std::env::var_os("GHOSTDU_TRASH_RESTORE").unwrap_or_else(|| "trash-restore".into());
+        for kind in ["file", "directory", "symlink"] {
+            let fixture = tempfile::tempdir().unwrap();
+            let data_home = fixture.path().join("data");
+            fs::create_dir(&data_home).unwrap();
+            let source = fixture.path().join("restore #é%\nitem");
+            match kind {
+                "directory" => {
+                    fs::create_dir(&source).unwrap();
+                    fs::write(source.join("child"), "payload").unwrap();
+                }
+                "symlink" => std::os::unix::fs::symlink("missing-target", &source).unwrap(),
+                _ => fs::write(&source, "payload").unwrap(),
+            }
+            let trash = home_trash(&data_home).unwrap();
+            let (parent, name, target) = prepare_target(&source).unwrap();
+            move_verified(&parent, &name, &target, &trash, &source).unwrap();
+            assert!(fs::symlink_metadata(&source).is_err());
+            let mut child = Command::new(&restore)
+                .arg(&source)
+                .env("HOME", fixture.path())
+                .env("XDG_DATA_HOME", &data_home)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("install trash-cli or set GHOSTDU_TRASH_RESTORE");
+            child.stdin.take().unwrap().write_all(b"0\n").unwrap();
+            let output = child.wait_with_output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            match kind {
+                "directory" => {
+                    assert_eq!(fs::read_to_string(source.join("child")).unwrap(), "payload")
+                }
+                "symlink" => {
+                    assert_eq!(fs::read_link(&source).unwrap(), Path::new("missing-target"))
+                }
+                _ => assert_eq!(fs::read_to_string(&source).unwrap(), "payload"),
+            }
+            for child in ["info", "files"] {
+                assert_eq!(
+                    fs::read_dir(data_home.join("Trash").join(child))
+                        .unwrap()
+                        .count(),
+                    0
+                );
+            }
+        }
     }
 }

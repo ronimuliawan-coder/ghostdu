@@ -16,10 +16,27 @@ pub struct DeleteResult {
 }
 
 pub fn permanently_delete<P: AsRef<Path>>(paths: &[P]) -> DeleteResult {
+    delete_with_verification(paths, |_, _| Ok(()))
+}
+
+pub(crate) fn permanently_delete_confirmed(
+    paths: &[PathBuf],
+    identities: &super::TargetIdentities,
+) -> DeleteResult {
+    delete_with_verification(paths, |path, target| {
+        super::verify_confirmed(identities, path, target)
+    })
+}
+
+fn delete_with_verification<P: AsRef<Path>>(
+    paths: &[P],
+    verify: impl Fn(&Path, &File) -> io::Result<()>,
+) -> DeleteResult {
     let mut result = DeleteResult::default();
     for path in paths {
         let path = path.as_ref();
         let removal = prepare_target(path).and_then(|(parent, name, target)| {
+            verify(path, &target)?;
             // Reject existing mounts/unreadable subtrees before mutating anything.
             inspect_tree(&target)?;
             remove_at(&parent, &name, &target)

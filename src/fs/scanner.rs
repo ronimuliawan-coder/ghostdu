@@ -163,15 +163,22 @@ fn scan_dir_recursive(
             continue;
         }
 
-        let file_name = entry.file_name().to_string_lossy().to_string();
-
         let meta = match fs::symlink_metadata(&path) {
             Ok(m) => m,
             Err(_) => {
                 let ghost = classify_path(&path);
                 let safety = classify_safety(&path, ghost);
-                let mut err_entry =
-                    FileEntry::new_file(file_name, path, 0, 0, false, 0, 0, ghost, safety);
+                let mut err_entry = FileEntry::new_file(
+                    entry.file_name().to_string_lossy().into_owned(),
+                    path,
+                    0,
+                    0,
+                    false,
+                    0,
+                    0,
+                    ghost,
+                    safety,
+                );
                 err_entry.has_err = true;
                 sub_entries.push(err_entry);
                 continue;
@@ -182,11 +189,7 @@ fn scan_dir_recursive(
         let ino = meta.ino();
         let is_symlink = meta.is_symlink();
         let is_dir = meta.is_dir() && !is_symlink;
-        let apparent_size = meta.len();
         let disk_usage = meta.blocks() * 512;
-
-        let ghost_kind = classify_path(&path);
-        let delete_safety = classify_safety(&path, ghost_kind);
 
         // Progress counter update
         let total_files = files_counter.fetch_add(1, Ordering::Relaxed) + 1;
@@ -210,6 +213,9 @@ fn scan_dir_recursive(
         }
 
         if is_dir {
+            let file_name = entry.file_name().to_string_lossy().into_owned();
+            let ghost_kind = classify_path(&path);
+            let delete_safety = classify_safety(&path, ghost_kind);
             let mut dir_node =
                 FileEntry::new_dir(file_name, path.clone(), dev, ino, ghost_kind, delete_safety);
 
@@ -239,42 +245,7 @@ fn scan_dir_recursive(
 
             sub_entries.push(dir_node);
         } else {
-            // Regular file or symlink
-            let is_duplicate_hardlink = meta.nlink() > 1 && !seen_inodes.insert((dev, ino));
-
-            // If duplicate hardlink, don't double count for parent aggregates
-            let (counted_size, counted_disk) = if is_duplicate_hardlink {
-                (0, 0)
-            } else {
-                (apparent_size, disk_usage)
-            };
-
-            let mut file_node = FileEntry::new_file(
-                file_name,
-                path,
-                apparent_size,
-                disk_usage,
-                is_symlink,
-                dev,
-                ino,
-                ghost_kind,
-                delete_safety,
-            );
-
-            // Store counted size for aggregation
-            file_node.size = counted_size;
-            file_node.disk_usage = counted_disk;
-            // Any unselected or unseen link can retain the inode blocks.
-            if meta.nlink() > 1 {
-                file_node.reclaimable = 0;
-                file_node.safe_reclaimable = 0;
-            }
-            if is_duplicate_hardlink {
-                file_node.safe_reclaimable = 0;
-                file_node.safe_items = 0;
-            }
-
-            sub_entries.push(file_node);
+            sub_entries.push(file_entry(path, &meta, seen_inodes));
         }
     }
 
@@ -308,6 +279,107 @@ fn scan_dir_recursive(
         parent_entry.safe_items = total_safe_items;
     }
     parent_entry.children = sub_entries;
+}
+
+fn file_entry(
+    path: PathBuf,
+    meta: &fs::Metadata,
+    seen_inodes: &mut HashSet<(u64, u64)>,
+) -> FileEntry {
+    let dev = meta.dev();
+    let ino = meta.ino();
+    let is_symlink = meta.is_symlink();
+    let apparent_size = meta.len();
+    let disk_usage = meta.blocks() * 512;
+    let ghost_kind = classify_path(&path);
+    let delete_safety = classify_safety(&path, ghost_kind);
+    // Regular file or symlink
+    let is_duplicate_hardlink = meta.nlink() > 1 && !seen_inodes.insert((dev, ino));
+
+    // If duplicate hardlink, don't double count for parent aggregates
+    let (counted_size, counted_disk) = if is_duplicate_hardlink {
+        (0, 0)
+    } else {
+        (apparent_size, disk_usage)
+    };
+
+    let mut file_node = FileEntry::new_file(
+        path.file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned(),
+        path,
+        apparent_size,
+        disk_usage,
+        is_symlink,
+        dev,
+        ino,
+        ghost_kind,
+        delete_safety,
+    );
+
+    // Store counted size for aggregation
+    file_node.size = counted_size;
+    file_node.disk_usage = counted_disk;
+    // Any unselected or unseen link can retain the inode blocks.
+    if meta.nlink() > 1 {
+        file_node.reclaimable = 0;
+        file_node.safe_reclaimable = 0;
+    }
+    if is_duplicate_hardlink {
+        file_node.safe_reclaimable = 0;
+        file_node.safe_items = 0;
+    }
+
+    file_node
+}
+
+/// Refresh one failed target without reading sibling subtrees. Preserve the original
+/// scan's mount boundary and seed hard-link accounting from the retained tree.
+pub(crate) fn rescan_entry(
+    path: &Path,
+    root_dev: u64,
+    seen_inodes: &mut HashSet<(u64, u64)>,
+) -> std::io::Result<FileEntry> {
+    let meta = fs::symlink_metadata(path)?;
+    if !meta.is_dir() {
+        return Ok(file_entry(path.to_path_buf(), &meta, seen_inodes));
+    }
+    let ghost = classify_path(path);
+    let mut entry = FileEntry::new_dir(
+        path.file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned(),
+        path.to_path_buf(),
+        meta.dev(),
+        meta.ino(),
+        ghost,
+        classify_safety(path, ghost),
+    );
+    let mounts = parse_mount_points(&fs::read("/proc/self/mountinfo")?);
+    if meta.dev() == root_dev
+        && !mounts.contains(path)
+        && seen_inodes.insert((meta.dev(), meta.ino()))
+    {
+        scan_dir_recursive(
+            path,
+            &mut entry,
+            root_dev,
+            false,
+            &mounts,
+            seen_inodes,
+            &None,
+            &Arc::new(AtomicBool::new(false)),
+            &Arc::new(AtomicU64::new(0)),
+            &Arc::new(AtomicU64::new(0)),
+            &Arc::new(Mutex::new(Instant::now())),
+        );
+        entry
+            .children
+            .sort_by_key(|child| std::cmp::Reverse(child.disk_usage));
+    }
+    Ok(entry)
 }
 
 // Mountinfo escapes whitespace and backslashes as octal bytes. Preserve non-UTF-8 paths.

@@ -101,6 +101,30 @@ fn bind_mount_boundaries_and_ancestor_cycles() {
             .unwrap();
         assert!(cycle.children.is_empty());
     }
+    // Failure reconciliation must keep the original scan's mount exclusions.
+    for target in [&bind, &ancestor, &other_device] {
+        let tree = scan_directory_with_options(
+            &root,
+            None,
+            Arc::new(AtomicBool::new(false)),
+            ScannerOptions::default(),
+        )
+        .unwrap();
+        let mut app = ghostdu::ui::App::new(tree);
+        app.search_query = target.file_name().unwrap().to_string_lossy().into_owned();
+        app.prompt_permanent_delete();
+        app.execute_pending_action();
+        assert!(app.current_status().unwrap().contains("1 failed"));
+        assert_eq!(app.root_entry.size, 7);
+        assert!(app
+            .root_entry
+            .children
+            .iter()
+            .find(|entry| &entry.path == target)
+            .unwrap()
+            .children
+            .is_empty());
+    }
     // Removal must reject both mount points and ancestors containing mounted data.
     for target in [&root, &bind, &ancestor, &other_device] {
         let trash_result = ghostdu::ops::move_to_trash(&[target]);
@@ -116,6 +140,24 @@ fn bind_mount_boundaries_and_ancestor_cycles() {
             b"123456789"
         );
     }
+    // This test runs alone in its child process, so environment changes are isolated.
+    // HOME shares the source mount, but XDG_DATA_HOME selects a different mount.
+    let invalid_xdg = fixture.path().join("invalid-xdg");
+    fs::create_dir(&invalid_xdg).unwrap();
+    fs::write(invalid_xdg.join("Trash"), "not a directory").unwrap();
+    let synthetic_home = other_device.join("home");
+    fs::create_dir(&synthetic_home).unwrap();
+    std::env::set_var("HOME", &synthetic_home);
+    std::env::set_var("XDG_DATA_HOME", &invalid_xdg);
+    let same_mount_source = fixture.path().join("same-mount-source");
+    fs::write(&same_mount_source, "preserve").unwrap();
+    let result = ghostdu::ops::move_to_trash(&[&same_mount_source]);
+    assert!(result.succeeded.is_empty());
+    assert_eq!(
+        result.failed[0].1,
+        std::io::Error::from_raw_os_error(libc::ENOTDIR).to_string()
+    );
+    assert_eq!(fs::read_to_string(&same_mount_source).unwrap(), "preserve");
     // Trashing a normal file on another volume uses that volume's private trash.
     let trash_source = other_device.join("trash-file");
     fs::write(&trash_source, "restore me").unwrap();
@@ -171,6 +213,19 @@ fn bind_mount_boundaries_and_ancestor_cycles() {
         .unwrap()
         .path();
     assert_eq!(fs::read_to_string(stored).unwrap(), "shared location");
+    // A broken XDG trash on the source mount must not redirect into the volume trash.
+    let same_mount_xdg = other_device.join("invalid-data");
+    fs::create_dir(&same_mount_xdg).unwrap();
+    fs::write(same_mount_xdg.join("Trash"), "not a directory").unwrap();
+    std::env::set_var("XDG_DATA_HOME", &same_mount_xdg);
+    fs::write(&trash_source, "must stay").unwrap();
+    let result = ghostdu::ops::move_to_trash(&[&trash_source]);
+    assert!(result.succeeded.is_empty());
+    assert_eq!(
+        result.failed[0].1,
+        std::io::Error::from_raw_os_error(libc::ENOTDIR).to_string()
+    );
+    assert_eq!(fs::read_to_string(&trash_source).unwrap(), "must stay");
     // TempDir cleanup must happen after unmounting the synthetic filesystems.
     for mount in [&ancestor, &bind, &other_device] {
         assert!(Command::new("umount")
