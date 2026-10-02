@@ -666,10 +666,12 @@ impl App {
             }
             ConfirmAction::DockerPrune => match prune_docker_dangling() {
                 Ok(msg) => {
-                    self.set_status(format!("✔ Docker Prune: {}", msg));
                     self.refresh_ghost_info();
+                    self.set_status(format!("✔ Docker Prune: {}", msg));
                 }
                 Err(err) => {
+                    // Some categories may have succeeded before another request failed.
+                    self.refresh_ghost_info();
                     self.set_status(format!("❌ Docker Prune failed: {}", err));
                 }
             },

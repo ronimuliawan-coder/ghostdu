@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -258,7 +259,7 @@ impl FileEntry {
 
     #[inline]
     pub fn safe_items_count(&self) -> usize {
-        if self.delete_safety == DeleteSafety::Safe {
+        if self.delete_safety == DeleteSafety::Safe && self.is_dir {
             1
         } else {
             self.safe_items
@@ -307,7 +308,7 @@ pub fn format_count(count: usize) -> String {
 }
 
 /// Truncates string from the end to fit within `max_width` terminal columns,
-/// appending "..." if truncated. Never splits a char or wide character.
+/// appending "..." if truncated. Never splits a grapheme cluster.
 pub fn truncate_end_by_width(s: &str, max_width: usize) -> String {
     let total_width = s.width();
     if total_width <= max_width {
@@ -315,8 +316,8 @@ pub fn truncate_end_by_width(s: &str, max_width: usize) -> String {
     }
     let marker = if max_width > 3 { "..." } else { "" };
     let mut end = 0;
-    for (index, c) in s.char_indices() {
-        let next_end = index + c.len_utf8();
+    for (index, grapheme) in s.grapheme_indices(true) {
+        let next_end = index + grapheme.len();
         // Sequence widths can differ from the sum of individual character widths.
         let candidate = format!("{}{}", &s[..next_end], marker);
         if candidate.width() > max_width {
@@ -328,7 +329,7 @@ pub fn truncate_end_by_width(s: &str, max_width: usize) -> String {
 }
 
 /// Truncates string from the beginning to fit within `max_width` terminal columns,
-/// prepending "..." if truncated. Never splits a char or wide character.
+/// prepending "..." if truncated. Never splits a grapheme cluster.
 pub fn truncate_start_by_width(s: &str, max_width: usize) -> String {
     let total_width = s.width();
     if total_width <= max_width {
@@ -336,7 +337,7 @@ pub fn truncate_start_by_width(s: &str, max_width: usize) -> String {
     }
     let marker = if max_width > 3 { "..." } else { "" };
     let mut start = s.len();
-    for (index, _) in s.char_indices().rev() {
+    for (index, _) in s.grapheme_indices(true).rev() {
         let candidate = format!("{}{}", marker, &s[index..]);
         if candidate.width() > max_width {
             break;

@@ -2,7 +2,9 @@ use crate::fs::entry::{DeleteSafety, FileEntry};
 use crate::ghost::{classify_path, classify_safety, is_virtual_fs_path};
 use crossbeam_channel::Sender;
 use std::collections::HashSet;
+use std::ffi::OsString;
 use std::fs;
+use std::os::unix::ffi::OsStringExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -66,6 +68,14 @@ pub fn scan_directory_with_options(
         safety,
     );
 
+    let mount_points = if options.cross_mounts {
+        HashSet::new()
+    } else {
+        let mountinfo = fs::read("/proc/self/mountinfo")
+            .map_err(|e| format!("Cannot read mount boundaries: {}", e))?;
+        parse_mount_points(&mountinfo)
+    };
+
     let mut seen_inodes: HashSet<(u64, u64)> = HashSet::new();
     seen_inodes.insert((root_dev, root_ino));
 
@@ -78,6 +88,7 @@ pub fn scan_directory_with_options(
         &mut root_entry,
         root_dev,
         options.cross_mounts,
+        &mount_points,
         &mut seen_inodes,
         &progress_tx,
         &stop_signal,
@@ -109,6 +120,7 @@ fn scan_dir_recursive(
     parent_entry: &mut FileEntry,
     root_dev: u64,
     cross_mounts: bool,
+    mount_points: &HashSet<PathBuf>,
     seen_inodes: &mut HashSet<(u64, u64)>,
     progress_tx: &Option<Sender<ScanProgress>>,
     stop_signal: &Arc<AtomicBool>,
@@ -201,14 +213,16 @@ fn scan_dir_recursive(
             let mut dir_node =
                 FileEntry::new_dir(file_name, path.clone(), dev, ino, ghost_kind, delete_safety);
 
-            // Skip recursing into separate filesystem mounts unless cross_mounts is enabled
-            let is_cross_mount = dev != root_dev;
-            if cross_mounts || !is_cross_mount {
+            // mountinfo also identifies bind mounts whose device matches the root.
+            let is_cross_mount = dev != root_dev || mount_points.contains(&path);
+            // Directory identities prevent cycles and repeated traversal via bind aliases.
+            if (cross_mounts || !is_cross_mount) && seen_inodes.insert((dev, ino)) {
                 scan_dir_recursive(
                     &path,
                     &mut dir_node,
                     root_dev,
                     cross_mounts,
+                    mount_points,
                     seen_inodes,
                     progress_tx,
                     stop_signal,
@@ -250,6 +264,10 @@ fn scan_dir_recursive(
             // Store counted size for aggregation
             file_node.size = counted_size;
             file_node.disk_usage = counted_disk;
+            if is_duplicate_hardlink {
+                file_node.safe_reclaimable = 0;
+                file_node.safe_items = 0;
+            }
 
             sub_entries.push(file_node);
         }
@@ -282,4 +300,53 @@ fn scan_dir_recursive(
         parent_entry.safe_items = total_safe_items;
     }
     parent_entry.children = sub_entries;
+}
+
+// Mountinfo escapes whitespace and backslashes as octal bytes. Preserve non-UTF-8 paths.
+fn parse_mount_points(mountinfo: &[u8]) -> HashSet<PathBuf> {
+    mountinfo
+        .split(|&b| b == b'\n')
+        .filter_map(|line| line.split(|&b| b == b' ').nth(4))
+        .map(|path| {
+            let mut decoded = Vec::with_capacity(path.len());
+            let mut i = 0;
+            while i < path.len() {
+                if path[i] == b'\\' && i + 3 < path.len() {
+                    let escaped = &path[i + 1..i + 4];
+                    let byte = match escaped {
+                        b"040" => Some(b' '),
+                        b"011" => Some(b'\t'),
+                        b"012" => Some(b'\n'),
+                        b"134" => Some(b'\\'),
+                        _ => None,
+                    };
+                    if let Some(byte) = byte {
+                        decoded.push(byte);
+                        i += 4;
+                        continue;
+                    }
+                }
+                decoded.push(path[i]);
+                i += 1;
+            }
+            PathBuf::from(OsString::from_vec(decoded))
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mountinfo_preserves_escaped_and_non_utf8_paths() {
+        let mounts = parse_mount_points(
+            b"1 0 8:1 / / rw - ext4 /dev/root rw\n2 1 8:1 /source /a\\040b\\011c\\012d\\134e\xff rw - ext4 /dev/root rw\n",
+        );
+        assert_eq!(mounts.len(), 2);
+        assert!(mounts.contains(Path::new("/")));
+        assert!(mounts.contains(&PathBuf::from(OsString::from_vec(
+            b"/a b\tc\nd\\e\xff".to_vec()
+        ))));
+    }
 }
