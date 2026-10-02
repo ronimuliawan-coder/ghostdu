@@ -894,3 +894,86 @@ mod ghostdu_scanner {
     pub use ghostdu::ops::delete::permanently_delete;
     pub use ghostdu::ops::trash::move_to_trash;
 }
+
+#[test]
+fn test_truncation_preserves_grapheme_boundaries() {
+    use unicode_segmentation::UnicodeSegmentation;
+    use unicode_width::UnicodeWidthStr;
+
+    for cluster in ["e\u{301}", "👩‍💻", "❤️", "🇮🇩", "👍🏽"] {
+        let input = cluster.repeat(6);
+        for width in 0..=input.width() + 1 {
+            for (truncate, from_start) in [
+                (
+                    ghostdu_scanner::truncate_end_by_width as fn(&str, usize) -> String,
+                    false,
+                ),
+                (
+                    ghostdu_scanner::truncate_start_by_width as fn(&str, usize) -> String,
+                    true,
+                ),
+            ] {
+                let output = truncate(&input, width);
+                assert!(output.width() <= width);
+                let retained = if from_start {
+                    output.trim_start_matches('.')
+                } else {
+                    output.trim_end_matches('.')
+                };
+                assert!(
+                    retained.graphemes(true).all(|g| g == cluster),
+                    "{input:?} -> {output:?}"
+                );
+                if input.width() <= width {
+                    assert_eq!(output, input);
+                }
+            }
+        }
+    }
+    assert_eq!(
+        ghostdu_scanner::truncate_start_by_width("xe\u{301}", 1),
+        "e\u{301}"
+    );
+    assert_eq!(
+        ghostdu_scanner::truncate_end_by_width("e\u{301}x", 1),
+        "e\u{301}"
+    );
+}
+
+#[test]
+fn test_duplicate_safe_hardlink_stored_totals() {
+    let dir = tempfile::tempdir().unwrap();
+    let original = dir.path().join("original.log");
+    fs::write(&original, vec![b'x'; 4096]).unwrap();
+    fs::hard_link(&original, dir.path().join("alias.log")).unwrap();
+    let root = ghostdu_scanner::scan_directory(dir.path(), None, Arc::new(AtomicBool::new(false)))
+        .unwrap();
+    let duplicate = root
+        .children
+        .iter()
+        .find(|entry| entry.disk_usage == 0)
+        .unwrap();
+    let counted = root
+        .children
+        .iter()
+        .find(|entry| entry.disk_usage != 0)
+        .unwrap();
+    assert_eq!((duplicate.safe_reclaimable, duplicate.safe_items), (0, 0));
+    assert_eq!(duplicate.safe_items_count(), 0);
+    assert_eq!(counted.safe_reclaimable, counted.disk_usage);
+    assert_eq!(counted.safe_items, 1);
+    assert_eq!(root.safe_reclaimable, counted.disk_usage);
+    assert_eq!(root.safe_items, 1);
+}
+
+#[test]
+fn test_snap_archives_are_not_virtual_filesystems() {
+    use ghostdu::ghost::is_virtual_fs_path;
+    for path in ["/var/lib/snapd/snaps", "/var/lib/snapd/snaps/core_123.snap"] {
+        assert!(!is_virtual_fs_path(std::path::Path::new(path)));
+    }
+    assert!(is_virtual_fs_path(std::path::Path::new(
+        "/var/lib/snapd/mnt/core"
+    )));
+    assert!(is_virtual_fs_path(std::path::Path::new("/proc/1/stat")));
+}

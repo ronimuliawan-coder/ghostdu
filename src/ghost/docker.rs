@@ -2,7 +2,6 @@ use serde::Deserialize;
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
-use std::process::Command;
 use std::time::Duration;
 
 #[derive(Debug, Clone, Default)]
@@ -142,6 +141,10 @@ fn send_docker_http_request(method: &str, endpoint: &str) -> Result<String, Stri
         .read_to_end(&mut response_bytes)
         .map_err(|e| format!("Failed to read from docker socket: {}", e))?;
 
+    parse_docker_http_response(&response_bytes)
+}
+
+fn parse_docker_http_response(response_bytes: &[u8]) -> Result<String, String> {
     let sep = response_bytes
         .windows(4)
         .position(|w| w == b"\r\n\r\n")
@@ -173,24 +176,30 @@ fn send_docker_http_request(method: &str, endpoint: &str) -> Result<String, Stri
     let body = if is_chunked {
         let mut dechunked: Vec<u8> = Vec::new();
         let mut remaining = raw_body;
-        while let Some(line_end) = remaining.windows(2).position(|w| w == b"\r\n") {
+        loop {
+            let line_end = remaining
+                .windows(2)
+                .position(|w| w == b"\r\n")
+                .ok_or_else(|| "Missing Docker chunk header".to_string())?;
             let hex_str = String::from_utf8_lossy(&remaining[..line_end]);
             let hex_clean = hex_str.split(';').next().unwrap_or("").trim();
-            if let Ok(chunk_len) = usize::from_str_radix(hex_clean, 16) {
-                if chunk_len == 0 {
-                    break;
-                }
-                let data_start = line_end + 2;
-                let data_end = data_start + chunk_len;
-                if data_end <= remaining.len() {
-                    dechunked.extend_from_slice(&remaining[data_start..data_end]);
-                    remaining = remaining.get(data_end + 2..).unwrap_or(&[]);
-                } else {
-                    break;
-                }
-            } else {
+            let chunk_len = usize::from_str_radix(hex_clean, 16)
+                .map_err(|_| "Invalid Docker chunk size".to_string())?;
+            if chunk_len == 0 {
                 break;
             }
+            let data_start = line_end + 2;
+            let data_end = data_start
+                .checked_add(chunk_len)
+                .ok_or_else(|| "Docker chunk size overflow".to_string())?;
+            let chunk_end = data_end
+                .checked_add(2)
+                .ok_or_else(|| "Docker chunk size overflow".to_string())?;
+            if remaining.get(data_end..chunk_end) != Some(b"\r\n") {
+                return Err("Truncated Docker chunk or missing CRLF".to_string());
+            }
+            dechunked.extend_from_slice(&remaining[data_start..data_end]);
+            remaining = &remaining[chunk_end..];
         }
         String::from_utf8_lossy(&dechunked).into_owned()
     } else {
@@ -333,58 +342,124 @@ struct DockerPruneResponse {
 }
 
 pub fn prune_docker_dangling() -> Result<String, String> {
-    let mut messages = Vec::new();
+    // Reporting and mutation must use the same socket, regardless of CLI context/DOCKER_HOST.
+    prune_with_request(send_docker_http_request)
+}
+
+fn prune_with_request(
+    mut request: impl FnMut(&str, &str) -> Result<String, String>,
+) -> Result<String, String> {
+    let mut completed = Vec::new();
+    let mut failed = Vec::new();
     let mut total_reclaimed = 0u64;
-
-    // 1. Prune dangling images
-    if let Ok(res) = send_docker_http_request(
-        "POST",
-        "/images/prune?filters=%7B%22dangling%22%3A%7B%22true%22%3Atrue%7D%7D",
-    ) {
-        if let Ok(p) = serde_json::from_str::<DockerPruneResponse>(&res) {
-            total_reclaimed += p.space_reclaimed;
+    for (category, endpoint) in [
+        (
+            "images",
+            "/images/prune?filters=%7B%22dangling%22%3A%7B%22true%22%3Atrue%7D%7D",
+        ),
+        ("containers", "/containers/prune"),
+        ("volumes", "/volumes/prune"),
+        ("build cache", "/build/prune"),
+    ] {
+        match request("POST", endpoint).and_then(|body| {
+            serde_json::from_str::<DockerPruneResponse>(&body)
+                .map_err(|e| format!("Invalid prune response: {}", e))
+        }) {
+            Ok(result) => {
+                total_reclaimed = total_reclaimed.saturating_add(result.space_reclaimed);
+                completed.push(category);
+            }
+            Err(error) => failed.push(format!("{}: {}", category, error)),
         }
-        messages.push("images");
     }
-    // 2. Prune stopped containers
-    if let Ok(res) = send_docker_http_request("POST", "/containers/prune") {
-        if let Ok(p) = serde_json::from_str::<DockerPruneResponse>(&res) {
-            total_reclaimed += p.space_reclaimed;
-        }
-        messages.push("containers");
-    }
-    // 3. Prune dangling volumes
-    if let Ok(res) = send_docker_http_request("POST", "/volumes/prune") {
-        if let Ok(p) = serde_json::from_str::<DockerPruneResponse>(&res) {
-            total_reclaimed += p.space_reclaimed;
-        }
-        messages.push("volumes");
-    }
-    // 4. Prune build cache
-    if let Ok(res) = send_docker_http_request("POST", "/build/prune") {
-        if let Ok(p) = serde_json::from_str::<DockerPruneResponse>(&res) {
-            total_reclaimed += p.space_reclaimed;
-        }
-        messages.push("build cache");
-    }
-
-    if messages.is_empty() {
-        // Fallback to docker CLI
-        let output = Command::new("docker")
-            .args(["system", "prune", "-f", "--volumes"])
-            .output()
-            .map_err(|e| format!("Failed to run docker CLI prune: {}", e))?;
-        if output.status.success() {
-            Ok("Successfully ran docker system prune".to_string())
+    let summary = format!(
+        "Pruned {} (freed {})",
+        if completed.is_empty() {
+            "none".to_string()
         } else {
-            Err(String::from_utf8_lossy(&output.stderr).to_string())
-        }
+            completed.join(", ")
+        },
+        crate::fs::entry::format_size(total_reclaimed)
+    );
+    if failed.is_empty() {
+        Ok(summary)
     } else {
-        use crate::fs::entry::format_size;
-        Ok(format!(
-            "Pruned {} (freed {})",
-            messages.join(", "),
-            format_size(total_reclaimed)
-        ))
+        Err(format!("{}; failed: {}", summary, failed.join("; ")))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn chunked_response_preserves_split_utf8() {
+        let mut response =
+            b"HTTP/1.1 200 OK\r\ntRaNsFeR-EnCoDiNg: Chunked\r\n\r\n1;ext=yes\r\n".to_vec();
+        response.push(0xc3);
+        response.extend_from_slice(b"\r\n1\r\n\xa9\r\n0\r\n\r\n");
+        assert_eq!(parse_docker_http_response(&response).unwrap(), "é");
+    }
+
+    #[test]
+    fn malformed_chunks_and_http_errors_are_rejected() {
+        for body in [
+            "1\r\na",
+            "4\r\na\r\n",
+            "1\r\naXX",
+            "xyz\r\n",
+            "1\r\na\r\n",
+            "ffffffffffffffff\r\n",
+        ] {
+            let response = format!("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n{body}");
+            assert!(
+                parse_docker_http_response(response.as_bytes()).is_err(),
+                "{body:?}"
+            );
+        }
+        let response = b"HTTP/1.1 403 Forbidden\r\n\r\naccess denied";
+        let error = parse_docker_http_response(response).unwrap_err();
+        assert!(error.contains("403"));
+        assert!(error.contains("access denied"));
+    }
+
+    #[test]
+    fn prune_failure_does_not_switch_execution_paths() {
+        let mut calls = Vec::new();
+        let error = prune_with_request(|method, endpoint| {
+            assert_eq!(method, "POST");
+            calls.push(endpoint.to_string());
+            Err("Docker API error (HTTP 403): access denied".to_string())
+        })
+        .unwrap_err();
+        assert_eq!(calls.len(), 4);
+        assert!(calls[0].starts_with("/images/prune?filters="));
+        assert_eq!(
+            &calls[1..],
+            ["/containers/prune", "/volumes/prune", "/build/prune"]
+        );
+        assert!(error.contains("Pruned none"));
+        assert!(error.contains("403"));
+    }
+
+    #[test]
+    fn prune_reports_success_partial_failure_and_invalid_responses() {
+        let success =
+            prune_with_request(|_, _| Ok(r#"{"SpaceReclaimed":10}"#.to_string())).unwrap();
+        assert!(success.contains("images, containers, volumes, build cache"));
+        assert!(success.contains("40 B"));
+        let partial = prune_with_request(|_, endpoint| {
+            if endpoint == "/containers/prune" {
+                Err("connection closed".to_string())
+            } else {
+                Ok(r#"{"SpaceReclaimed":10}"#.to_string())
+            }
+        })
+        .unwrap_err();
+        assert!(partial.contains("Pruned images, volumes, build cache (freed 30 B)"));
+        assert!(partial.contains("failed: containers: connection closed"));
+        let invalid = prune_with_request(|_, _| Ok("invalid JSON".to_string())).unwrap_err();
+        assert!(invalid.contains("Pruned none"));
+        assert!(invalid.contains("Invalid prune response"));
     }
 }

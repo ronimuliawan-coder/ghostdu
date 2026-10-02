@@ -41,15 +41,23 @@ pub fn permanently_delete<P: AsRef<Path>>(paths: &[P]) -> DeleteResult {
         // For symlinks, we only unlink the link itself (never touching the target),
         // so a symlink pointing to a system path (e.g. ~/etc-link -> /etc) can be safely unlinked.
         if !is_symlink {
-            if let Ok(canonical) = path.canonicalize() {
-                let canon_ghost = classify_path(&canonical);
-                if classify_safety(&canonical, canon_ghost) == DeleteSafety::System {
+            let canonical = match path.canonicalize() {
+                Ok(canonical) => canonical,
+                Err(error) => {
                     result.failed.push((
                         path.to_path_buf(),
-                        "Blocked: Protected system target cannot be deleted".to_string(),
+                        format!("Cannot verify target: {}", error),
                     ));
                     continue;
                 }
+            };
+            let canon_ghost = classify_path(&canonical);
+            if classify_safety(&canonical, canon_ghost) == DeleteSafety::System {
+                result.failed.push((
+                    path.to_path_buf(),
+                    "Blocked: Protected system target cannot be deleted".to_string(),
+                ));
+                continue;
             }
         }
 

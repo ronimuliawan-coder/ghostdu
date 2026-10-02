@@ -358,7 +358,6 @@ pub fn is_virtual_fs_path(path: &Path) -> bool {
         || p.starts_with("/dev/shm/")
         || p == "/dev/pts"
         || p.starts_with("/dev/pts/")
-        || p.starts_with("/var/lib/snapd/snaps/")
         || p.starts_with("/var/lib/snapd/mnt/")
     {
         return true;
