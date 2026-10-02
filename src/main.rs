@@ -30,6 +30,7 @@ use std::{
     time::{Duration, Instant},
 };
 use ui::{handle_key_event, render_ui, App, EventResult};
+use unicode_width::UnicodeWidthStr;
 
 use std::io::IsTerminal;
 
@@ -339,11 +340,14 @@ fn run_headless_summary(target_path: PathBuf) -> Result<(), Box<dyn std::error::
 
         let icon = if entry.is_dir { "📁 " } else { "📄 " };
         let display_name = format!("{}{}", icon, entry.name);
+        let name = truncate_end_by_width(&display_name, 40);
+        let padding = " ".repeat(40usize.saturating_sub(name.width()));
         let badge = entry.ghost_kind.badge();
 
         println!(
-            "     {:<40} {:<12} {:<18} {:<12}",
-            truncate_end_by_width(&display_name, 40),
+            "     {}{} {:<12} {:<18} {:<12}",
+            name,
+            padding,
             format_size(entry.disk_usage),
             bar_text,
             badge

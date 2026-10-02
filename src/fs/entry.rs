@@ -1,5 +1,5 @@
 use std::path::PathBuf;
-use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+use unicode_width::UnicodeWidthStr;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(dead_code)]
@@ -313,33 +313,18 @@ pub fn truncate_end_by_width(s: &str, max_width: usize) -> String {
     if total_width <= max_width {
         return s.to_string();
     }
-    if max_width <= 3 {
-        let mut res = String::new();
-        let mut cur_w = 0;
-        for c in s.chars() {
-            let char_w = c.width().unwrap_or(0);
-            if cur_w + char_w > max_width {
-                break;
-            }
-            res.push(c);
-            cur_w += char_w;
-        }
-        return res;
-    }
-
-    let budget = max_width - 3;
-    let mut res = String::new();
-    let mut cur_w = 0;
-    for c in s.chars() {
-        let char_w = c.width().unwrap_or(0);
-        if cur_w + char_w > budget {
+    let marker = if max_width > 3 { "..." } else { "" };
+    let mut end = 0;
+    for (index, c) in s.char_indices() {
+        let next_end = index + c.len_utf8();
+        // Sequence widths can differ from the sum of individual character widths.
+        let candidate = format!("{}{}", &s[..next_end], marker);
+        if candidate.width() > max_width {
             break;
         }
-        res.push(c);
-        cur_w += char_w;
+        end = next_end;
     }
-    res.push_str("...");
-    res
+    format!("{}{}", &s[..end], marker)
 }
 
 /// Truncates string from the beginning to fit within `max_width` terminal columns,
@@ -349,33 +334,14 @@ pub fn truncate_start_by_width(s: &str, max_width: usize) -> String {
     if total_width <= max_width {
         return s.to_string();
     }
-    if max_width <= 3 {
-        let mut chars = Vec::new();
-        let mut cur_w = 0;
-        for c in s.chars().rev() {
-            let char_w = c.width().unwrap_or(0);
-            if cur_w + char_w > max_width {
-                break;
-            }
-            chars.push(c);
-            cur_w += char_w;
-        }
-        chars.reverse();
-        return chars.into_iter().collect();
-    }
-
-    let budget = max_width - 3;
-    let mut chars = Vec::new();
-    let mut cur_w = 0;
-    for c in s.chars().rev() {
-        let char_w = c.width().unwrap_or(0);
-        if cur_w + char_w > budget {
+    let marker = if max_width > 3 { "..." } else { "" };
+    let mut start = s.len();
+    for (index, _) in s.char_indices().rev() {
+        let candidate = format!("{}{}", marker, &s[index..]);
+        if candidate.width() > max_width {
             break;
         }
-        chars.push(c);
-        cur_w += char_w;
+        start = index;
     }
-    chars.reverse();
-    let tail: String = chars.into_iter().collect();
-    format!("...{}", tail)
+    format!("{}{}", marker, &s[start..])
 }
