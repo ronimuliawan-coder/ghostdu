@@ -32,7 +32,7 @@ pub fn permanently_delete<P: AsRef<Path>>(paths: &[P]) -> DeleteResult {
     result
 }
 
-fn prepare_target(path: &Path) -> io::Result<(File, CString, File)> {
+pub(super) fn prepare_target(path: &Path) -> io::Result<(File, CString, File)> {
     check_safety(path)?;
     let name = path
         .file_name()
@@ -66,7 +66,7 @@ fn prepare_target(path: &Path) -> io::Result<(File, CString, File)> {
 fn check_safety(path: &Path) -> io::Result<()> {
     if classify_safety(path, classify_path(path)) == DeleteSafety::System {
         Err(io::Error::other(
-            "Blocked: Protected system file/directory cannot be deleted",
+            "Blocked: Protected system file/directory cannot be removed",
         ))
     } else {
         Ok(())
@@ -102,7 +102,7 @@ fn directory_entries(target: &File) -> io::Result<(File, Vec<CString>)> {
     Ok((directory, names))
 }
 
-fn inspect_tree(target: &File) -> io::Result<()> {
+pub(super) fn inspect_tree(target: &File) -> io::Result<()> {
     if target.metadata()?.is_dir() {
         let (directory, names) = directory_entries(target)?;
         for name in names {
@@ -112,7 +112,7 @@ fn inspect_tree(target: &File) -> io::Result<()> {
     Ok(())
 }
 
-fn verify_identity(parent: &File, name: &CStr, target: &File) -> io::Result<()> {
+pub(super) fn verify_identity(parent: &File, name: &CStr, target: &File) -> io::Result<()> {
     let current = open_child(parent, name)?.metadata()?;
     let checked = target.metadata()?;
     if (current.dev(), current.ino()) != (checked.dev(), checked.ino()) {

@@ -1025,3 +1025,33 @@ fn test_failed_deletion_reconciles_stale_tree() {
     assert!(app.selected_paths.is_empty());
     assert!(app.current_status().unwrap().contains("1 failed"));
 }
+
+#[test]
+fn test_cleanup_preserves_navigation_when_preceding_sibling_is_removed() {
+    for fail_one in [false, true] {
+        let fixture = tempfile::tempdir().unwrap();
+        for name in ["a", "b", "c"] {
+            fs::create_dir(fixture.path().join(name)).unwrap();
+        }
+        let mut root =
+            ghostdu_scanner::scan_directory(fixture.path(), None, Arc::new(AtomicBool::new(false)))
+                .unwrap();
+        root.children
+            .sort_by(|left, right| left.name.cmp(&right.name));
+        let current = fixture.path().join("b");
+        let mut app = ghostdu::ui::App::new(root);
+        assert!(app.navigate_to_path(&current));
+        app.action_targets = vec![fixture.path().join("a")];
+        if fail_one {
+            app.action_targets.push(fixture.path().join("missing"));
+        }
+        app.pending_action = Some(ghostdu::ui::ConfirmAction::PermanentDelete);
+        app.execute_pending_action();
+        assert_eq!(app.current_dir_entry().path, current);
+        assert!(!fixture.path().join("a").exists());
+        assert!(fixture.path().join("c").exists());
+        if fail_one {
+            assert!(app.current_status().unwrap().contains("1 failed"));
+        }
+    }
+}

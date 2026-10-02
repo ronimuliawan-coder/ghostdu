@@ -22,7 +22,9 @@
 - **Safe-to-Clean Quick Filter (`c`)**: Press `c` anytime to instantly filter the view to show only 🟢 **`SAFE`** cleanable items.
 - **Active Deletion Guardrails**: Any attempt to delete critical system directories triggers an active safeguard lock—the confirmation key `y` is disarmed to prevent catastrophic system damage.
 
-Permanent deletion uses Linux directory handles and refuses to cross mount points, including bind mounts. It requires Linux 5.6+ (`openat2`) and fails closed if the kernel or sandbox cannot provide these safeguards. Existing mounted descendants are checked before removal. Filesystem changes or I/O errors can still cause partial deletion; failed operations trigger a rescan and show an error. This is not a rollback mechanism.
+Permanent deletion and trash moves use Linux directory handles and refuse to cross mount points, including bind mounts. They require Linux 5.6+ (`openat2`) and fail closed if the kernel or sandbox cannot provide these safeguards. Existing mounted descendants are checked before removal. Filesystem changes or I/O errors can still cause partial deletion; failed operations trigger a rescan and show an error. This is not a rollback mechanism.
+
+Trash moves write FreeDesktop `.trashinfo` metadata and use an atomic rename between pinned directories. Home and per-volume trash locations must be private and owned by the current user. Unsupported cross-filesystem moves fail without copying or removing the source.
 
 Reclaimable-space estimates conservatively exclude files with multiple hard links, even if all links appear in the scan. Disk-usage totals still count their blocks once.
 

@@ -103,6 +103,9 @@ fn bind_mount_boundaries_and_ancestor_cycles() {
     }
     // Removal must reject both mount points and ancestors containing mounted data.
     for target in [&root, &bind, &ancestor, &other_device] {
+        let trash_result = ghostdu::ops::move_to_trash(&[target]);
+        assert!(trash_result.succeeded.is_empty());
+        assert_eq!(trash_result.failed.len(), 1);
         let result = ghostdu::ops::permanently_delete(&[target]);
         assert!(result.succeeded.is_empty());
         assert_eq!(result.failed.len(), 1);
@@ -113,6 +116,61 @@ fn bind_mount_boundaries_and_ancestor_cycles() {
             b"123456789"
         );
     }
+    // Trashing a normal file on another volume uses that volume's private trash.
+    let trash_source = other_device.join("trash-file");
+    fs::write(&trash_source, "restore me").unwrap();
+    let result = ghostdu::ops::move_to_trash(&[&trash_source]);
+    assert!(result.failed.is_empty(), "{:?}", result.failed);
+    assert_eq!(result.succeeded.len(), 1);
+    assert!(!trash_source.exists());
+    let private_trash = fs::read_dir(&other_device)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .find(|path| {
+            path.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with(".Trash-")
+        })
+        .unwrap();
+    let stored = fs::read_dir(private_trash.join("files"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    assert_eq!(fs::read_to_string(stored).unwrap(), "restore me");
+    let metadata = fs::read_dir(private_trash.join("info"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    assert!(fs::read_to_string(metadata)
+        .unwrap()
+        .contains("Path=trash-file\n"));
+
+    // Also support the FreeDesktop sticky shared .Trash/<uid> layout.
+    use std::os::unix::fs::PermissionsExt;
+    let shared_trash = other_device.join(".Trash");
+    fs::create_dir(&shared_trash).unwrap();
+    fs::set_permissions(&shared_trash, fs::Permissions::from_mode(0o1777)).unwrap();
+    fs::write(&trash_source, "shared location").unwrap();
+    let result = ghostdu::ops::move_to_trash(&[&trash_source]);
+    assert!(result.failed.is_empty(), "{:?}", result.failed);
+    let user_trash = fs::read_dir(&shared_trash)
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let stored = fs::read_dir(user_trash.join("files"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    assert_eq!(fs::read_to_string(stored).unwrap(), "shared location");
     // TempDir cleanup must happen after unmounting the synthetic filesystems.
     for mount in [&ancestor, &bind, &other_device] {
         assert!(Command::new("umount")
