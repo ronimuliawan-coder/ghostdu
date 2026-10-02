@@ -4,7 +4,9 @@ use crate::ghost::{
     classify_path, classify_safety, fetch_docker_disk_info, prune_docker_dangling,
     scan_deleted_open_files, DeletedOpenFile, DockerDiskInfo,
 };
-use crate::ops::{move_to_trash, permanently_delete};
+use crate::ops::delete::permanently_delete_confirmed;
+use crate::ops::trash::move_to_trash_confirmed;
+use crate::ops::{TargetIdentities, TargetIdentity};
 use std::cell::Cell;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -82,6 +84,8 @@ pub struct App {
     pub root_entry: FileEntry,
     pub path_stack: Vec<usize>, // Index stack navigating into child directories
     pub selected_paths: HashSet<PathBuf>,
+    selected_identities: TargetIdentities,
+    action_identities: TargetIdentities,
     pub active_view: ActiveView,
     pub previous_view: ActiveView,
     pub ghost_filter: GhostFilterMode,
@@ -123,6 +127,8 @@ impl App {
             root_entry,
             path_stack: Vec::new(),
             selected_paths: HashSet::new(),
+            selected_identities: TargetIdentities::new(),
+            action_identities: TargetIdentities::new(),
             active_view: ActiveView::Filesystem,
             previous_view: ActiveView::Filesystem,
             ghost_filter: GhostFilterMode::ShowAll,
@@ -422,8 +428,9 @@ impl App {
             let p = target.path.clone();
             if self.selected_paths.contains(&p) {
                 self.selected_paths.remove(&p);
+                self.selected_identities.remove(&p);
             } else {
-                self.selected_paths.insert(p);
+                self.select_path(p);
             }
         }
     }
@@ -439,12 +446,69 @@ impl App {
         if all_selected {
             for p in &paths {
                 self.selected_paths.remove(p);
+                self.selected_identities.remove(p);
             }
         } else {
             for p in paths {
-                self.selected_paths.insert(p);
+                self.select_path(p);
             }
         }
+    }
+
+    fn select_path(&mut self, path: PathBuf) {
+        // Do not silently rebind an existing selection to a replacement object.
+        if self.selected_paths.contains(&path) {
+            return;
+        }
+        match TargetIdentity::capture(&path) {
+            Ok(identity) => {
+                self.selected_identities.insert(path.clone(), identity);
+                self.selected_paths.insert(path);
+            }
+            Err(error) => self.set_status(format!("Cannot select item: {error}")),
+        }
+    }
+
+    fn capture_confirmation(&mut self, targets: &[PathBuf]) -> bool {
+        self.action_identities.clear();
+        for path in targets {
+            let identity = if self.selected_paths.contains(path) {
+                self.selected_identities
+                    .get(path)
+                    .cloned()
+                    .filter(|identity| identity.matches_path(path))
+                    .ok_or_else(|| {
+                        std::io::Error::other(
+                            "Selection changed; select it again and confirm a new action",
+                        )
+                    })
+            } else {
+                TargetIdentity::capture(path)
+            };
+            match identity {
+                Ok(identity) => {
+                    self.action_identities.insert(path.clone(), identity);
+                }
+                Err(error) => {
+                    self.selected_paths.remove(path);
+                    self.selected_identities.remove(path);
+                    self.action_identities.clear();
+                    self.set_status(format!("Cannot confirm action: {error}"));
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
+    fn discard_changed_selections(&mut self) {
+        self.selected_paths.retain(|path| {
+            self.selected_identities
+                .get(path)
+                .is_some_and(|identity| identity.matches_path(path))
+        });
+        self.selected_identities
+            .retain(|path, _| self.selected_paths.contains(path));
     }
 
     /// Selected items count and total size
@@ -526,6 +590,9 @@ impl App {
             }
         }
 
+        if !has_system && !self.capture_confirmation(&targets) {
+            return;
+        }
         self.action_targets = targets;
         self.action_total_size = total_size;
         self.action_has_system = has_system;
@@ -570,6 +637,9 @@ impl App {
             }
         }
 
+        if !has_system && !self.capture_confirmation(&targets) {
+            return;
+        }
         self.action_targets = targets;
         self.action_total_size = total_size;
         self.action_has_system = has_system;
@@ -588,6 +658,7 @@ impl App {
             + self.docker_info.build_cache_reclaimable_size;
 
         self.action_targets.clear();
+        self.action_identities.clear();
         self.action_total_size = total_reclaimable;
         self.action_has_system = false;
         self.action_has_recheck = false;
@@ -617,7 +688,7 @@ impl App {
         match action {
             ConfirmAction::MoveToTrash => {
                 let targets = std::mem::take(&mut self.action_targets);
-                let result = move_to_trash(&targets);
+                let result = move_to_trash_confirmed(&targets, &self.action_identities);
                 let count = result.succeeded.len();
                 let failed_count = result.failed.len();
 
@@ -636,14 +707,14 @@ impl App {
                     self.set_status(format!("✔ Moved {} items to Wastebin", count));
                 } else {
                     self.set_status(format!(
-                        "Moved {} to wastebin, {} failed (permissions/cross-fs)",
-                        count, failed_count
+                        "Moved {} to wastebin, {} failed: {}",
+                        count, failed_count, result.failed[0].1
                     ));
                 }
             }
             ConfirmAction::PermanentDelete => {
                 let targets = std::mem::take(&mut self.action_targets);
-                let result = permanently_delete(&targets);
+                let result = permanently_delete_confirmed(&targets, &self.action_identities);
                 let count = result.succeeded.len();
                 let failed_count = result.failed.len();
 
@@ -658,7 +729,7 @@ impl App {
                     self.navigate_to_path(&current_path);
                     true
                 } else {
-                    self.reconcile_after_delete_failure(&current_path)
+                    self.reconcile_after_delete_failure(&current_path, &result.failed)
                 };
                 if count > 0 || failed_count > 0 {
                     self.refresh_fs_info();
@@ -693,6 +764,8 @@ impl App {
             },
         }
 
+        self.action_identities.clear();
+        self.discard_changed_selections();
         // Adjust cursor
         let total = self.visible_children().len();
         if self.cursor_index >= total && total > 0 {
@@ -705,28 +778,65 @@ impl App {
         self.active_view = self.previous_view;
     }
 
-    fn reconcile_after_delete_failure(&mut self, current_path: &Path) -> bool {
-        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        match crate::fs::scanner::scan_directory(&self.root_entry.path, None, stop) {
-            Ok(root) => {
-                self.root_entry = root;
-                self.navigate_to_path(current_path);
-                self.selected_paths
-                    .retain(|path| std::fs::symlink_metadata(path).is_ok());
-                true
-            }
-            Err(_) => {
-                self.root_entry.has_err = true;
-                self.navigate_to_path(current_path);
-                false
+    fn reconcile_after_delete_failure(
+        &mut self,
+        current_path: &Path,
+        failed: &[(PathBuf, String)],
+    ) -> bool {
+        // Coalesce overlapping failed targets; never rescan unrelated siblings.
+        let mut paths: Vec<_> = failed.iter().map(|(path, _)| path.clone()).collect();
+        paths.sort();
+        paths.dedup();
+        let mut roots: Vec<PathBuf> = Vec::new();
+        for path in paths {
+            if !roots.last().is_some_and(|root| path.starts_with(root)) {
+                roots.push(path);
             }
         }
+        fn retained_inodes(entry: &FileEntry, roots: &[PathBuf], seen: &mut HashSet<(u64, u64)>) {
+            if roots.iter().any(|root| entry.path.starts_with(root)) {
+                return;
+            }
+            if entry.is_dir || entry.size > 0 || entry.disk_usage > 0 || entry.safe_items > 0 {
+                seen.insert((entry.dev, entry.ino));
+            }
+            for child in &entry.children {
+                retained_inodes(child, roots, seen);
+            }
+        }
+        fn has_errors(entry: &FileEntry) -> bool {
+            entry.has_err || entry.children.iter().any(has_errors)
+        }
+        let mut seen = HashSet::new();
+        retained_inodes(&self.root_entry, &roots, &mut seen);
+        let mut reconciled = true;
+        for path in roots {
+            match crate::fs::scanner::rescan_entry(&path, self.root_entry.dev, &mut seen) {
+                Ok(entry) => {
+                    reconciled &= !has_errors(&entry);
+                    self.replace_subtree(&path, entry);
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    self.remove_path_from_tree(&path)
+                }
+                Err(_) => {
+                    reconciled = false;
+                }
+            }
+        }
+        if !reconciled {
+            self.root_entry.has_err = true;
+        }
+        self.navigate_to_path(current_path);
+        self.discard_changed_selections();
+        reconciled
     }
 
     /// Cancel pending confirmation
     pub fn cancel_modal(&mut self) {
         self.pending_action = None;
         self.action_targets.clear();
+        self.action_identities.clear();
         self.action_total_size = 0;
         self.action_safety_blocked = false;
         self.action_has_recheck = false;
@@ -857,6 +967,7 @@ impl App {
 
     /// Refresh filesystem stats, directory tree, Docker storage, and ghost files without restarting
     pub fn refresh_all(&mut self) {
+        self.discard_changed_selections();
         let current_path = self.current_dir_entry().path.clone();
         let is_at_root = self.path_stack.is_empty();
 
@@ -934,5 +1045,71 @@ impl App {
 
         self.refresh_fs_info();
         !self.path_stack.is_empty()
+    }
+}
+
+#[cfg(test)]
+mod reconciliation_tests {
+    use super::*;
+    use std::fs;
+    use std::sync::{atomic::AtomicBool, Arc};
+
+    #[test]
+    fn partial_failure_updates_ancestors_and_coalesces_nested_targets() {
+        let fixture = tempfile::tempdir().unwrap();
+        let affected = fixture.path().join("affected");
+        fs::create_dir(&affected).unwrap();
+        let removed = affected.join("removed");
+        let remaining = affected.join("remaining");
+        fs::write(&removed, "gone").unwrap();
+        fs::write(&remaining, "keep").unwrap();
+        let root = crate::fs::scanner::scan_directory(
+            fixture.path(),
+            None,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .unwrap();
+        let mut app = App::new(root);
+        assert!(app.navigate_to_path(&affected));
+        app.select_all_visible();
+        fs::remove_file(&removed).unwrap();
+        assert!(app.reconcile_after_delete_failure(
+            &affected,
+            &[
+                (affected.clone(), "partial failure".into()),
+                (remaining.clone(), "nested failure".into()),
+            ]
+        ));
+        assert_eq!(app.current_dir_entry().path, affected);
+        assert_eq!(app.current_dir_entry().children.len(), 1);
+        assert_eq!(app.root_entry.size, 4);
+        assert_eq!(app.root_entry.items_count, 3);
+        assert_eq!(app.selected_paths, HashSet::from([remaining]));
+    }
+
+    #[test]
+    fn unreadable_target_retains_cached_tree_and_marks_it_stale() {
+        let fixture = tempfile::tempdir().unwrap();
+        let parent = fixture.path().join("parent");
+        fs::create_dir(&parent).unwrap();
+        let target = parent.join("target");
+        fs::write(&target, "keep").unwrap();
+        let root = crate::fs::scanner::scan_directory(
+            fixture.path(),
+            None,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .unwrap();
+        let mut app = App::new(root);
+        fs::rename(&parent, fixture.path().join("original")).unwrap();
+        // A symlink loop reliably fails metadata resolution even when running as root.
+        std::os::unix::fs::symlink("parent", &parent).unwrap();
+        assert!(!app.reconcile_after_delete_failure(fixture.path(), &[(target, "failed".into())]));
+        assert!(app.root_entry.has_err);
+        assert_eq!(app.root_entry.children[0].children.len(), 1);
+        assert_eq!(
+            fs::read_to_string(fixture.path().join("original/target")).unwrap(),
+            "keep"
+        );
     }
 }

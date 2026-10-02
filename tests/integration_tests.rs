@@ -1015,10 +1015,11 @@ fn test_failed_deletion_reconciles_stale_tree() {
     let root = ghostdu_scanner::scan_directory(dir.path(), None, Arc::new(AtomicBool::new(false)))
         .unwrap();
     let mut app = ghostdu::ui::App::new(root);
+    app.search_query = "removed".into();
+    app.toggle_selection();
+    app.prompt_permanent_delete();
     fs::remove_file(&removed).unwrap();
-    app.selected_paths.insert(removed.clone());
-    app.action_targets = vec![removed];
-    app.pending_action = Some(ghostdu::ui::ConfirmAction::PermanentDelete);
+    app.search_query.clear();
     app.execute_pending_action();
     assert_eq!(app.root_entry.children.len(), 1);
     assert_eq!(app.root_entry.children[0].name, "remaining");
@@ -1040,12 +1041,18 @@ fn test_cleanup_preserves_navigation_when_preceding_sibling_is_removed() {
             .sort_by(|left, right| left.name.cmp(&right.name));
         let current = fixture.path().join("b");
         let mut app = ghostdu::ui::App::new(root);
-        assert!(app.navigate_to_path(&current));
-        app.action_targets = vec![fixture.path().join("a")];
+        app.sort_mode = ghostdu::ui::SortMode::ByName;
+        app.toggle_selection(); // a
         if fail_one {
-            app.action_targets.push(fixture.path().join("missing"));
+            app.cursor_to_end(); // c
+            app.toggle_selection();
         }
-        app.pending_action = Some(ghostdu::ui::ConfirmAction::PermanentDelete);
+        app.prompt_permanent_delete();
+        if fail_one {
+            fs::rename(fixture.path().join("c"), fixture.path().join("old-c")).unwrap();
+            fs::create_dir(fixture.path().join("c")).unwrap();
+        }
+        assert!(app.navigate_to_path(&current));
         app.execute_pending_action();
         assert_eq!(app.current_dir_entry().path, current);
         assert!(!fixture.path().join("a").exists());
@@ -1054,4 +1061,115 @@ fn test_cleanup_preserves_navigation_when_preceding_sibling_is_removed() {
             assert!(app.current_status().unwrap().contains("1 failed"));
         }
     }
+}
+
+#[test]
+fn confirmation_rejects_replacement_files_directories_and_symlinks() {
+    for trash in [false, true] {
+        for kind in ["file", "directory", "symlink"] {
+            let fixture = tempfile::tempdir().unwrap();
+            let source = fixture.path().join("selected");
+            match kind {
+                "directory" => fs::create_dir(&source).unwrap(),
+                "symlink" => std::os::unix::fs::symlink("missing-target", &source).unwrap(),
+                _ => fs::write(&source, "original").unwrap(),
+            }
+            let root = ghostdu_scanner::scan_directory(
+                fixture.path(),
+                None,
+                Arc::new(AtomicBool::new(false)),
+            )
+            .unwrap();
+            let mut app = ghostdu::ui::App::new(root);
+            if trash {
+                app.prompt_move_to_trash();
+            } else {
+                app.prompt_permanent_delete();
+            }
+            assert!(app.pending_action.is_some());
+            fs::rename(&source, fixture.path().join("original")).unwrap();
+            fs::write(&source, "replacement must survive").unwrap();
+            app.execute_pending_action();
+            assert_eq!(
+                fs::read_to_string(&source).unwrap(),
+                "replacement must survive"
+            );
+            assert!(fs::symlink_metadata(fixture.path().join("original")).is_ok());
+            assert!(app.current_status().unwrap().contains("Target changed"));
+        }
+    }
+}
+
+#[test]
+fn stale_selections_require_new_confirmation_and_refresh_discards_them() {
+    for refresh in [false, true] {
+        let fixture = tempfile::tempdir().unwrap();
+        let source = fixture.path().join("selected");
+        fs::write(&source, "original").unwrap();
+        let root =
+            ghostdu_scanner::scan_directory(fixture.path(), None, Arc::new(AtomicBool::new(false)))
+                .unwrap();
+        let mut app = ghostdu::ui::App::new(root);
+        app.toggle_selection();
+        fs::rename(&source, fixture.path().join("original")).unwrap();
+        fs::write(&source, "replacement").unwrap();
+        if refresh {
+            app.refresh_all();
+        } else {
+            app.prompt_permanent_delete();
+            assert!(app.pending_action.is_none());
+            assert!(app.current_status().unwrap().contains("Selection changed"));
+        }
+        assert!(app.selected_paths.is_empty());
+        assert_eq!(fs::read_to_string(&source).unwrap(), "replacement");
+    }
+}
+
+#[test]
+fn failed_deletion_rescans_only_affected_subtrees_and_preserves_hardlink_totals() {
+    let fixture = tempfile::tempdir().unwrap();
+    let root_path = fixture.path().join("root");
+    let affected = root_path.join("affected");
+    let unrelated = root_path.join("unrelated");
+    fs::create_dir_all(&affected).unwrap();
+    fs::create_dir(&unrelated).unwrap();
+    fs::write(affected.join("old"), "old payload").unwrap();
+    let shared = unrelated.join("shared");
+    fs::write(&shared, vec![b'x'; 8192]).unwrap();
+    let root = ghostdu_scanner::scan_directory(&root_path, None, Arc::new(AtomicBool::new(false)))
+        .unwrap();
+    let expected_disk = root
+        .children
+        .iter()
+        .find(|child| child.path == unrelated)
+        .unwrap()
+        .disk_usage;
+    let mut app = ghostdu::ui::App::new(root);
+    app.search_query = "affected".into();
+    app.prompt_permanent_delete();
+    fs::rename(&affected, fixture.path().join("original")).unwrap();
+    fs::create_dir(&affected).unwrap();
+    fs::hard_link(&shared, affected.join("shared-link")).unwrap();
+    // A full-root scan would discover this. Reconciliation must leave it for a user refresh.
+    fs::write(unrelated.join("not-part-of-reconciliation"), "new sibling").unwrap();
+    app.execute_pending_action();
+    let updated = app
+        .root_entry
+        .children
+        .iter()
+        .find(|child| child.path == affected)
+        .unwrap();
+    assert_eq!(updated.children.len(), 1);
+    assert_eq!(updated.children[0].name, "shared-link");
+    assert_eq!(updated.disk_usage, 0);
+    let retained = app
+        .root_entry
+        .children
+        .iter()
+        .find(|child| child.path == unrelated)
+        .unwrap();
+    assert_eq!(retained.children.len(), 1);
+    assert_eq!(app.root_entry.disk_usage, expected_disk);
+    assert_eq!(app.root_entry.items_count, 5);
+    assert!(app.current_status().unwrap().contains("1 failed"));
 }
