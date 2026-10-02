@@ -163,6 +163,7 @@ pub struct FileEntry {
     pub path: PathBuf,
     pub size: u64,             // Apparent file size in bytes
     pub disk_usage: u64,       // Allocated disk space (blocks * 512)
+    pub reclaimable: u64,      // Conservative blocks freed; excludes all multiply-linked files
     pub items_count: usize,    // Total recursive items count
     pub safe_reclaimable: u64, // Precomputed recursive safe reclaimable bytes
     pub safe_items: usize,     // Precomputed recursive safe items count
@@ -199,6 +200,7 @@ impl FileEntry {
             path,
             size,
             disk_usage,
+            reclaimable: disk_usage,
             items_count: 1,
             safe_reclaimable,
             safe_items,
@@ -226,6 +228,7 @@ impl FileEntry {
             path,
             size: 0,
             disk_usage: 0,
+            reclaimable: 0,
             items_count: 1,
             safe_reclaimable: 0,
             safe_items: 0,
@@ -251,7 +254,7 @@ impl FileEntry {
     #[inline]
     pub fn safe_reclaimable_bytes(&self) -> u64 {
         if self.delete_safety == DeleteSafety::Safe {
-            self.disk_usage
+            self.reclaimable
         } else {
             self.safe_reclaimable
         }

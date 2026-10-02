@@ -22,6 +22,10 @@
 - **Safe-to-Clean Quick Filter (`c`)**: Press `c` anytime to instantly filter the view to show only 🟢 **`SAFE`** cleanable items.
 - **Active Deletion Guardrails**: Any attempt to delete critical system directories triggers an active safeguard lock—the confirmation key `y` is disarmed to prevent catastrophic system damage.
 
+Permanent deletion uses Linux directory handles and refuses to cross mount points, including bind mounts. It requires Linux 5.6+ (`openat2`) and fails closed if the kernel or sandbox cannot provide these safeguards. Existing mounted descendants are checked before removal. Filesystem changes or I/O errors can still cause partial deletion; failed operations trigger a rescan and show an error. This is not a rollback mechanism.
+
+Reclaimable-space estimates conservatively exclude files with multiple hard links, even if all links appear in the scan. Disk-usage totals still count their blocks once.
+
 ### 🏷️ 16 Linux Disk Category Badges
 High-impact disk consumers across modern Linux desktop and developer environments are automatically recognized and badged:
 - `🗑️ TRASH` — Wastebin & FreeDesktop trash
@@ -43,6 +47,7 @@ High-impact disk consumers across modern Linux desktop and developer environment
 
 ### 🐳 Docker & Unlinked Open Ghost Files
 - **Docker Engine Direct Inspection**: Communicates directly with `/var/run/docker.sock` to report active vs reclaimable images, stopped containers, dangling volumes, and BuildKit caches.
+- **Docker authority**: Reporting and pruning use only `/var/run/docker.sock` under the invoking user's existing socket permissions. Pruning affects eligible resources across that daemon. Ghostdu does not change socket permissions, elevate privileges, or switch to the Docker CLI's configured context.
 - **Open Unlinked Ghost File Discovery**: Scans `/proc/*/fd` to expose deleted files that are still held open by active processes and silently consuming disk space.
 - **Dedicated Ghost Inspector (`Tab` / `g`)**: Dedicated panel showing Docker storage breakdown and open deleted files with one-touch pruning (`p`).
 - **Live Filter Toggles (`G`)**: In the explorer tree, press `G` to cycle between *Show All*, *Hide Ghost Files*, or *Ghost Files ONLY*.
