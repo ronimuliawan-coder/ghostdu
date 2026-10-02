@@ -613,6 +613,7 @@ impl App {
             }
         };
 
+        let current_path = self.current_dir_entry().path.clone();
         match action {
             ConfirmAction::MoveToTrash => {
                 let targets = std::mem::take(&mut self.action_targets);
@@ -626,6 +627,7 @@ impl App {
                     self.remove_path_from_tree(path);
                 }
 
+                self.navigate_to_path(&current_path);
                 if count > 0 {
                     self.refresh_fs_info();
                 }
@@ -652,7 +654,12 @@ impl App {
                 }
 
                 // A failed recursive deletion may already have removed children.
-                let reconciled = failed_count == 0 || self.reconcile_after_delete_failure();
+                let reconciled = if failed_count == 0 {
+                    self.navigate_to_path(&current_path);
+                    true
+                } else {
+                    self.reconcile_after_delete_failure(&current_path)
+                };
                 if count > 0 || failed_count > 0 {
                     self.refresh_fs_info();
                 }
@@ -698,19 +705,19 @@ impl App {
         self.active_view = self.previous_view;
     }
 
-    fn reconcile_after_delete_failure(&mut self) -> bool {
-        let current_path = self.current_dir_entry().path.clone();
+    fn reconcile_after_delete_failure(&mut self, current_path: &Path) -> bool {
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         match crate::fs::scanner::scan_directory(&self.root_entry.path, None, stop) {
             Ok(root) => {
                 self.root_entry = root;
-                self.navigate_to_path(&current_path);
+                self.navigate_to_path(current_path);
                 self.selected_paths
                     .retain(|path| std::fs::symlink_metadata(path).is_ok());
                 true
             }
             Err(_) => {
                 self.root_entry.has_err = true;
+                self.navigate_to_path(current_path);
                 false
             }
         }
