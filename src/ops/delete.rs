@@ -1,3 +1,5 @@
+use crate::fs::entry::DeleteSafety;
+use crate::ghost::{classify_path, classify_safety};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -12,7 +14,43 @@ pub fn permanently_delete<P: AsRef<Path>>(paths: &[P]) -> DeleteResult {
 
     for path_ref in paths {
         let path = path_ref.as_ref();
-        let remove_res = if path.is_dir() {
+
+        // Safety gate: reject critical system directories
+        let ghost = classify_path(path);
+        if classify_safety(path, ghost) == DeleteSafety::System {
+            result.failed.push((
+                path.to_path_buf(),
+                "Blocked: Protected system file/directory cannot be deleted".to_string(),
+            ));
+            continue;
+        }
+
+        // Also check canonicalized target to guard against symlinks pointing into system roots
+        if let Ok(canonical) = path.canonicalize() {
+            let canon_ghost = classify_path(&canonical);
+            if classify_safety(&canonical, canon_ghost) == DeleteSafety::System {
+                result.failed.push((
+                    path.to_path_buf(),
+                    "Blocked: Protected system target cannot be deleted".to_string(),
+                ));
+                continue;
+            }
+        }
+
+        // Query symlink metadata without following the link
+        let meta = match fs::symlink_metadata(path) {
+            Ok(m) => m,
+            Err(e) => {
+                result.failed.push((path.to_path_buf(), e.to_string()));
+                continue;
+            }
+        };
+
+        // If the path is a symlink (even to a directory), we must ONLY unlink it with remove_file
+        // Calling remove_dir_all would follow the symlink and destroy the target's contents!
+        let remove_res = if meta.file_type().is_symlink() {
+            fs::remove_file(path)
+        } else if meta.is_dir() {
             fs::remove_dir_all(path)
         } else {
             fs::remove_file(path)

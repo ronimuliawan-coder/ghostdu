@@ -517,11 +517,194 @@ fn test_system_deletion_guardrail() {
     assert!(PathBuf::from("/etc").exists());
 }
 
+#[test]
+fn test_symlink_to_directory_deletion_preserves_target() {
+    let temp_dir = tempfile::tempdir().expect("create temp dir");
+    let base = temp_dir.path();
+
+    // Create target directory with file inside
+    let target_dir = base.join("real_photos");
+    fs::create_dir_all(&target_dir).unwrap();
+    let photo_file = target_dir.join("photo.jpg");
+    fs::write(&photo_file, "precious data").unwrap();
+
+    // Create symlink to directory: ~/symlink_to_photos -> ~/real_photos
+    let symlink_path = base.join("symlink_to_photos");
+    std::os::unix::fs::symlink(&target_dir, &symlink_path).unwrap();
+
+    // Confirm setup
+    assert!(symlink_path.exists());
+    assert!(symlink_path.is_dir()); // follows link!
+    assert!(photo_file.exists());
+
+    // Call permanently_delete on the SYMLINK
+    let res = ghostdu_scanner::permanently_delete(std::slice::from_ref(&symlink_path));
+    assert_eq!(res.succeeded.len(), 1);
+    assert_eq!(res.succeeded[0], symlink_path);
+    assert!(res.failed.is_empty());
+
+    // The symlink must be gone
+    assert!(!symlink_path.exists());
+    // CRITICAL INVARIANT: The target directory and its contents MUST be 100% intact!
+    assert!(target_dir.exists(), "Target directory must not be deleted!");
+    assert!(
+        photo_file.exists(),
+        "Files inside target directory must not be deleted!"
+    );
+    assert_eq!(fs::read_to_string(&photo_file).unwrap(), "precious data");
+}
+
+#[test]
+fn test_backend_deletion_safety_gate() {
+    // 1. Direct call to permanently_delete with /etc must fail without touching disk
+    let res = ghostdu_scanner::permanently_delete(&[PathBuf::from("/etc")]);
+    assert!(res.succeeded.is_empty());
+    assert_eq!(res.failed.len(), 1);
+    assert!(res.failed[0].1.contains("Blocked: Protected system"));
+
+    // 2. Direct call to move_to_trash with /usr must fail
+    let res_trash = ghostdu_scanner::move_to_trash(&[PathBuf::from("/usr")]);
+    assert!(res_trash.succeeded.is_empty());
+    assert_eq!(res_trash.failed.len(), 1);
+    assert!(res_trash.failed[0].1.contains("Blocked: Protected system"));
+
+    // 3. Symlink pointing to /etc must also be rejected by canonical target check
+    let temp_dir = tempfile::tempdir().expect("create temp dir");
+    let evil_link = temp_dir.path().join("link_to_etc");
+    std::os::unix::fs::symlink("/etc", &evil_link).unwrap();
+
+    let res_link = ghostdu_scanner::permanently_delete(&[evil_link]);
+    assert!(res_link.succeeded.is_empty());
+    assert_eq!(res_link.failed.len(), 1);
+    assert!(res_link.failed[0]
+        .1
+        .contains("Blocked: Protected system target"));
+}
+
+#[test]
+fn test_docker_system_df_parsing_fixture() {
+    let canned_json = r#"{
+        "Images": [
+            {
+                "Id": "sha256:dangling1234567890abcdef",
+                "RepoTags": ["<none>:<none>"],
+                "Size": 500000000,
+                "Containers": 0
+            },
+            {
+                "Id": "sha256:taggedused1234567890abcdef",
+                "RepoTags": ["ubuntu:latest"],
+                "Size": 700000000,
+                "Containers": 2
+            },
+            {
+                "Id": "sha256:taggedunused123456789abcdef",
+                "RepoTags": ["alpine:3.19"],
+                "Size": 10000000,
+                "Containers": 0
+            }
+        ],
+        "Containers": [
+            {
+                "Id": "c1",
+                "Names": ["/my-stopped-app"],
+                "SizeRw": 50000,
+                "State": "exited",
+                "Status": "Exited (0) 2 hours ago"
+            },
+            {
+                "Id": "c2",
+                "Names": ["/my-dead-container"],
+                "SizeRw": 30000,
+                "State": "dead",
+                "Status": "Dead"
+            },
+            {
+                "Id": "c3",
+                "Names": ["/my-running-web"],
+                "SizeRw": 90000,
+                "State": "running",
+                "Status": "Up 3 hours"
+            }
+        ],
+        "Volumes": [
+            {
+                "Name": "dangling_vol",
+                "UsageData": {
+                    "Size": 120000000,
+                    "RefCount": 0
+                }
+            }
+        ],
+        "BuildCache": [
+            {
+                "ID": "bc1",
+                "Size": 200000000,
+                "Reclaimable": true
+            }
+        ]
+    }"#;
+
+    let info = ghostdu_scanner::parse_docker_df_json(canned_json).expect("parse canned docker df");
+    assert!(info.is_available);
+    assert_eq!(info.images_count, 3);
+    // Only the untagged image with containers == 0 is dangling (500 MB), NOT alpine (tagged)!
+    assert_eq!(info.images_reclaimable_size, 500000000);
+    // Containers: stopped (exited + dead) = 50000 + 30000 = 80000 bytes reclaimable
+    assert_eq!(info.containers_count, 3);
+    assert_eq!(info.containers_reclaimable_size, 80000);
+    // Volume: 120 MB reclaimable
+    assert_eq!(info.volumes_reclaimable_size, 120000000);
+    // Build Cache: 200 MB reclaimable
+    assert_eq!(info.build_cache_total_size, 200000000);
+    assert_eq!(info.build_cache_reclaimable_size, 200000000);
+}
+
+#[test]
+fn test_non_ascii_unicode_safety() {
+    let non_ascii_inputs = [
+        "café/résumé.txt",
+        "📁 photos/🎉 party.png",
+        "ドキュメント/日本語.md",
+        "Здравствуйте/мир.log",
+        "🚀🔥💻✨/data",
+    ];
+
+    for s in &non_ascii_inputs {
+        let count = s.chars().count();
+        for max_len in 0..count + 10 {
+            // Slicing using char count and take should never panic
+            if count > max_len && max_len > 3 {
+                let head: String = s.chars().take(max_len - 3).collect();
+                let display = format!("{}...", head);
+                assert!(display.ends_with("..."));
+            }
+        }
+    }
+}
+
+#[test]
+fn test_scanner_cross_mount_option() {
+    let temp_dir = tempfile::tempdir().expect("create temp dir");
+    let base = temp_dir.path();
+    let sub = base.join("subdir");
+    fs::create_dir_all(&sub).unwrap();
+    fs::write(sub.join("file.txt"), "hello").unwrap();
+
+    let stop_signal = Arc::new(AtomicBool::new(false));
+    let options = ghostdu_scanner::ScannerOptions {
+        cross_mounts: false,
+    };
+    let root =
+        ghostdu_scanner::scan_directory_with_options(base, None, stop_signal, options).unwrap();
+    assert_eq!(root.children.len(), 1);
+}
+
 // Minimal exposure for integration testing
 mod ghostdu_scanner {
     pub use ghostdu::fs::entry::{DeleteSafety, GhostKind};
-    pub use ghostdu::fs::scanner::scan_directory;
-    pub use ghostdu::ghost::{classify_path, classify_safety};
+    pub use ghostdu::fs::scanner::{scan_directory, scan_directory_with_options, ScannerOptions};
+    pub use ghostdu::ghost::{classify_path, classify_safety, parse_docker_df_json};
     pub use ghostdu::ops::delete::permanently_delete;
     pub use ghostdu::ops::trash::move_to_trash;
 }

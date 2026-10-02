@@ -53,6 +53,10 @@ fn handle_help_keys(app: &mut App, key: KeyEvent) -> EventResult {
 
 fn handle_item_info_keys(app: &mut App, key: KeyEvent) -> EventResult {
     match key.code {
+        KeyCode::Char('r') | KeyCode::Char('R') => {
+            app.open_item_info();
+            app.set_status("Item details refreshed");
+        }
         KeyCode::Char('i')
         | KeyCode::Char('I')
         | KeyCode::Char('q')

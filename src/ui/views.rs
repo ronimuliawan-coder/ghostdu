@@ -2269,8 +2269,10 @@ fn render_footer(f: &mut Frame, app: &App, area: Rect) {
 
     if let Some(status) = app.current_status() {
         let max_status_len = (area.width as usize).saturating_sub(6);
-        let display_status = if status.len() > max_status_len && max_status_len > 3 {
-            format!("{}...", &status[..max_status_len - 3])
+        let char_count = status.chars().count();
+        let display_status = if char_count > max_status_len && max_status_len > 3 {
+            let truncated: String = status.chars().take(max_status_len - 3).collect();
+            format!("{}...", truncated)
         } else {
             status.to_string()
         };

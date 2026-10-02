@@ -236,18 +236,33 @@ impl FileEntry {
     }
 
     pub fn safe_reclaimable_bytes(&self) -> u64 {
-        self.children
-            .iter()
-            .filter(|c| c.delete_safety == DeleteSafety::Safe)
-            .map(|c| c.disk_usage)
-            .sum()
+        if self.delete_safety == DeleteSafety::Safe {
+            return self.disk_usage;
+        }
+        let mut sum = 0u64;
+        for c in &self.children {
+            if c.delete_safety == DeleteSafety::Safe {
+                sum = sum.saturating_add(c.disk_usage);
+            } else if c.is_dir {
+                sum = sum.saturating_add(c.safe_reclaimable_bytes());
+            }
+        }
+        sum
     }
 
     pub fn safe_items_count(&self) -> usize {
-        self.children
-            .iter()
-            .filter(|c| c.delete_safety == DeleteSafety::Safe)
-            .count()
+        if self.delete_safety == DeleteSafety::Safe {
+            return 1;
+        }
+        let mut count = 0usize;
+        for c in &self.children {
+            if c.delete_safety == DeleteSafety::Safe {
+                count += 1;
+            } else if c.is_dir {
+                count += c.safe_items_count();
+            }
+        }
+        count
     }
 }
 

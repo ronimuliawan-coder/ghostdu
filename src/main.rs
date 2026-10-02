@@ -32,7 +32,7 @@ use std::io::IsTerminal;
 
 /// ghostdu: Modern, ultra-fast native Linux disk usage & ghost file analyzer
 #[derive(Parser, Debug)]
-#[command(name = "ghostdu", author = "Ron", version = "0.1.0")]
+#[command(name = "ghostdu", author = "Ron", version)]
 #[command(
     about = "Modern, ultra-fast native Linux disk usage & ghost file analyzer with wastebin support"
 )]
@@ -187,11 +187,7 @@ fn run_app<B: ratatui::backend::Backend>(
                     Line::from(vec![
                         Span::styled("Scanning: ", Style::default().fg(Color::DarkGray)),
                         Span::styled(
-                            if path_str.len() > 44 {
-                                format!("...{}", &path_str[path_str.len() - 41..])
-                            } else {
-                                path_str.to_string()
-                            },
+                            truncate_start_chars(&path_str, 44),
                             Style::default().fg(Color::Yellow),
                         ),
                     ]),
@@ -344,11 +340,7 @@ fn run_headless_summary(target_path: PathBuf) -> Result<(), Box<dyn std::error::
 
         println!(
             "     {:<40} {:<12} {:<18} {:<12}",
-            if display_name.len() > 40 {
-                format!("{}...", &display_name[..37])
-            } else {
-                display_name
-            },
+            truncate_end_chars(&display_name, 40),
             format_size(entry.disk_usage),
             bar_text,
             badge
@@ -423,4 +415,25 @@ fn run_headless_summary(target_path: PathBuf) -> Result<(), Box<dyn std::error::
 
     println!("════════════════════════════════════════════════════════════════════════════════");
     Ok(())
+}
+
+fn truncate_start_chars(s: &str, max_chars: usize) -> String {
+    let char_count = s.chars().count();
+    if char_count > max_chars && max_chars > 3 {
+        let skip_count = char_count - (max_chars - 3);
+        let tail: String = s.chars().skip(skip_count).collect();
+        format!("...{}", tail)
+    } else {
+        s.to_string()
+    }
+}
+
+fn truncate_end_chars(s: &str, max_chars: usize) -> String {
+    let char_count = s.chars().count();
+    if char_count > max_chars && max_chars > 3 {
+        let head: String = s.chars().take(max_chars - 3).collect();
+        format!("{}...", head)
+    } else {
+        s.to_string()
+    }
 }

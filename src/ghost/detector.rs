@@ -84,12 +84,13 @@ pub fn classify_path(path: &Path) -> GhostKind {
     {
         return GhostKind::VmOrIso;
     }
-    if file_name.ends_with(".iso")
-        || file_name.ends_with(".qcow2")
-        || file_name.ends_with(".vdi")
-        || file_name.ends_with(".vmdk")
-        || file_name.ends_with(".ova")
-        || file_name.ends_with(".qcow")
+    let lower_name = file_name.to_lowercase();
+    if lower_name.ends_with(".iso")
+        || lower_name.ends_with(".qcow2")
+        || lower_name.ends_with(".vdi")
+        || lower_name.ends_with(".vmdk")
+        || lower_name.ends_with(".ova")
+        || lower_name.ends_with(".qcow")
     {
         return GhostKind::VmOrIso;
     }
@@ -103,7 +104,7 @@ pub fn classify_path(path: &Path) -> GhostKind {
     {
         return GhostKind::AiModel;
     }
-    if file_name.ends_with(".gguf") || file_name.ends_with(".safetensors") {
+    if lower_name.ends_with(".gguf") || lower_name.ends_with(".safetensors") {
         return GhostKind::AiModel;
     }
 
@@ -140,26 +141,32 @@ pub fn classify_path(path: &Path) -> GhostKind {
         return GhostKind::BrowserCache;
     }
 
-    // 11. System & App Logs
+    // 11. System & App Logs (require directory context or recognizable log extensions)
     if path_str.contains("/var/log")
         || path_str.contains("/.npm/_logs")
-        || file_name == "journal"
-        || file_name == "log"
-        || file_name == "logs"
-        || file_name.ends_with(".log")
-        || file_name.ends_with(".log.gz")
-        || file_name.ends_with(".log.1")
-        || file_name.ends_with(".log.old")
+        || (path_str.contains("/.local/state/") && (lower_name == "log" || lower_name == "logs"))
+        || (lower_name == "journal" && path_str.contains("/log"))
+        || lower_name.ends_with(".log")
+        || lower_name.ends_with(".log.gz")
+        || lower_name.ends_with(".log.1")
+        || lower_name.ends_with(".log.old")
     {
         return GhostKind::LogFiles;
     }
 
     // 12. Project dependencies (separated from transient build caches)
-    match file_name {
-        "node_modules" | "vendor" | ".venv" | "venv" | "site-packages" | "dist-packages" => {
-            return GhostKind::DependencyTree;
-        }
-        _ => {}
+    // Matches dependency root as well as nested files inside dependencies
+    if matches!(
+        file_name,
+        "node_modules" | "vendor" | ".venv" | "venv" | "site-packages" | "dist-packages"
+    ) || path_str.contains("/node_modules/")
+        || path_str.contains("/.venv/")
+        || path_str.contains("/venv/")
+        || path_str.contains("/vendor/")
+        || path_str.contains("/site-packages/")
+        || path_str.contains("/dist-packages/")
+    {
+        return GhostKind::DependencyTree;
     }
 
     // 13. Package manager caches (Arch pacman, apt, dnf, AUR helpers)
@@ -173,13 +180,37 @@ pub fn classify_path(path: &Path) -> GhostKind {
     }
 
     // 14. Common heavy build and compiler caches
-    match file_name {
-        "target" | "__pycache__" | ".pytest_cache" | ".next" | ".nuxt" | ".svelte-kit"
-        | ".turbo" | ".gradle" | ".cargo/registry" | ".cargo/git" | "go-build" | ".mypy_cache"
-        | ".ruff_cache" | "ccache" => {
-            return GhostKind::BuildCache;
-        }
-        _ => {}
+    // Matches build cache root as well as nested files inside
+    if matches!(
+        file_name,
+        "target"
+            | "__pycache__"
+            | ".pytest_cache"
+            | ".next"
+            | ".nuxt"
+            | ".svelte-kit"
+            | ".turbo"
+            | ".gradle"
+            | ".cargo/registry"
+            | ".cargo/git"
+            | "go-build"
+            | ".mypy_cache"
+            | ".ruff_cache"
+            | "ccache"
+    ) || path_str.contains("/target/")
+        || path_str.contains("/__pycache__/")
+        || path_str.contains("/.pytest_cache/")
+        || path_str.contains("/.next/")
+        || path_str.contains("/.nuxt/")
+        || path_str.contains("/.turbo/")
+        || path_str.contains("/.gradle/")
+        || path_str.contains("/.cargo/registry/")
+        || path_str.contains("/.cargo/git/")
+        || path_str.contains("/go-build/")
+        || path_str.contains("/.mypy_cache/")
+        || path_str.contains("/.ruff_cache/")
+    {
+        return GhostKind::BuildCache;
     }
 
     // 15. Fallback for general ~/.cache folders
@@ -245,9 +276,7 @@ pub fn classify_safety(path: &Path, ghost: GhostKind) -> DeleteSafety {
         | GhostKind::PackageCache
         | GhostKind::BrowserCache
         | GhostKind::CoreDump
-        | GhostKind::DeletedOpen
-        | GhostKind::DockerOverlay
-        | GhostKind::DockerBuildkit => {
+        | GhostKind::DeletedOpen => {
             return DeleteSafety::Safe;
         }
         // Steam shadercache is 100% safe to remove; compatdata / wine prefixes contain prefixes/saves so recheck
@@ -258,12 +287,18 @@ pub fn classify_safety(path: &Path, ghost: GhostKind) -> DeleteSafety {
                 return DeleteSafety::Recheck;
             }
         }
-        // Rotated or old logs or journal logs are safe to clean
+        // Rotated or old logs or journal logs are safe to clean, but /var/log container itself is Recheck!
         GhostKind::LogFiles => {
+            if p == "/var/log" || p == "/var/log/" {
+                return DeleteSafety::Recheck;
+            }
             return DeleteSafety::Safe;
         }
         // Dependencies, AI weights, ISOs, Snapshots, Flatpak/Snap app data, Docker volumes require recheck
-        GhostKind::DependencyTree
+        // Docker overlay & buildkit MUST be pruned via daemon prune, never raw rm -rf
+        GhostKind::DockerOverlay
+        | GhostKind::DockerBuildkit
+        | GhostKind::DependencyTree
         | GhostKind::AiModel
         | GhostKind::VmOrIso
         | GhostKind::SystemSnapshot
@@ -324,6 +359,8 @@ pub fn is_virtual_fs_path(path: &Path) -> bool {
         || p.starts_with("/dev/shm/")
         || p == "/dev/pts"
         || p.starts_with("/dev/pts/")
+        || p.starts_with("/var/lib/snapd/snaps/")
+        || p.starts_with("/var/lib/snapd/mnt/")
     {
         return true;
     }

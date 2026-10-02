@@ -201,6 +201,12 @@ impl App {
     /// Filtered and sorted child list for display
     pub fn visible_children(&self) -> Vec<&FileEntry> {
         let current = self.current_dir_entry();
+        let query_lower = if self.search_query.is_empty() {
+            None
+        } else {
+            Some(self.search_query.to_lowercase())
+        };
+
         let mut list: Vec<&FileEntry> = current
             .children
             .iter()
@@ -214,13 +220,9 @@ impl App {
             })
             .filter(|entry| {
                 // 2. Search filter
-                if self.search_query.is_empty() {
-                    true
-                } else {
-                    entry
-                        .name
-                        .to_lowercase()
-                        .contains(&self.search_query.to_lowercase())
+                match &query_lower {
+                    None => true,
+                    Some(q) => entry.name.to_lowercase().contains(q),
                 }
             })
             .filter(|entry| {
@@ -448,6 +450,9 @@ impl App {
     /// Selected items count and total size
     pub fn selection_summary(&self) -> (usize, u64) {
         let count = self.selected_paths.len();
+        if count == 0 {
+            return (0, 0);
+        }
         let mut total_size = 0u64;
 
         // Traverse tree to calculate sizes
@@ -621,6 +626,10 @@ impl App {
                     self.remove_path_from_tree(path);
                 }
 
+                if count > 0 {
+                    self.refresh_fs_info();
+                }
+
                 if failed_count == 0 {
                     self.set_status(format!("✔ Moved {} items to Wastebin", count));
                 } else {
@@ -640,6 +649,10 @@ impl App {
                 for path in &result.succeeded {
                     self.selected_paths.remove(path);
                     self.remove_path_from_tree(path);
+                }
+
+                if count > 0 {
+                    self.refresh_fs_info();
                 }
 
                 if failed_count == 0 {

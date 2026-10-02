@@ -18,8 +18,7 @@ pub struct ScanProgress {
     pub is_finished: bool,
 }
 
-#[allow(dead_code)]
-#[derive(Default)]
+#[derive(Debug, Clone, Copy, Default)]
 pub struct ScannerOptions {
     pub cross_mounts: bool,
 }
@@ -28,6 +27,20 @@ pub fn scan_directory(
     root_path: &Path,
     progress_tx: Option<Sender<ScanProgress>>,
     stop_signal: Arc<AtomicBool>,
+) -> Result<FileEntry, String> {
+    scan_directory_with_options(
+        root_path,
+        progress_tx,
+        stop_signal,
+        ScannerOptions::default(),
+    )
+}
+
+pub fn scan_directory_with_options(
+    root_path: &Path,
+    progress_tx: Option<Sender<ScanProgress>>,
+    stop_signal: Arc<AtomicBool>,
+    options: ScannerOptions,
 ) -> Result<FileEntry, String> {
     let canonical = root_path
         .canonicalize()
@@ -64,6 +77,7 @@ pub fn scan_directory(
         &canonical,
         &mut root_entry,
         root_dev,
+        options.cross_mounts,
         &mut seen_inodes,
         &progress_tx,
         &stop_signal,
@@ -94,6 +108,7 @@ fn scan_dir_recursive(
     dir_path: &Path,
     parent_entry: &mut FileEntry,
     root_dev: u64,
+    cross_mounts: bool,
     seen_inodes: &mut HashSet<(u64, u64)>,
     progress_tx: &Option<Sender<ScanProgress>>,
     stop_signal: &Arc<AtomicBool>,
@@ -186,18 +201,22 @@ fn scan_dir_recursive(
             let mut dir_node =
                 FileEntry::new_dir(file_name, path.clone(), dev, ino, ghost_kind, delete_safety);
 
-            // Recurse into subdirectory
-            scan_dir_recursive(
-                &path,
-                &mut dir_node,
-                root_dev,
-                seen_inodes,
-                progress_tx,
-                stop_signal,
-                files_counter,
-                bytes_counter,
-                last_progress,
-            );
+            // Skip recursing into separate filesystem mounts unless cross_mounts is enabled
+            let is_cross_mount = dev != root_dev;
+            if cross_mounts || !is_cross_mount {
+                scan_dir_recursive(
+                    &path,
+                    &mut dir_node,
+                    root_dev,
+                    cross_mounts,
+                    seen_inodes,
+                    progress_tx,
+                    stop_signal,
+                    files_counter,
+                    bytes_counter,
+                    last_progress,
+                );
+            }
 
             // Sort child entries descending by disk usage
             dir_node
