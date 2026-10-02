@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(dead_code)]
@@ -159,9 +160,11 @@ impl DeleteSafety {
 pub struct FileEntry {
     pub name: String,
     pub path: PathBuf,
-    pub size: u64,          // Apparent file size in bytes
-    pub disk_usage: u64,    // Allocated disk space (blocks * 512)
-    pub items_count: usize, // Total recursive items count
+    pub size: u64,             // Apparent file size in bytes
+    pub disk_usage: u64,       // Allocated disk space (blocks * 512)
+    pub items_count: usize,    // Total recursive items count
+    pub safe_reclaimable: u64, // Precomputed recursive safe reclaimable bytes
+    pub safe_items: usize,     // Precomputed recursive safe items count
     pub is_dir: bool,
     pub is_symlink: bool,
     pub dev: u64,
@@ -185,12 +188,19 @@ impl FileEntry {
         ghost_kind: GhostKind,
         delete_safety: DeleteSafety,
     ) -> Self {
+        let (safe_reclaimable, safe_items) = if delete_safety == DeleteSafety::Safe {
+            (disk_usage, 1)
+        } else {
+            (0, 0)
+        };
         Self {
             name,
             path,
             size,
             disk_usage,
             items_count: 1,
+            safe_reclaimable,
+            safe_items,
             is_dir: false,
             is_symlink,
             dev,
@@ -216,6 +226,8 @@ impl FileEntry {
             size: 0,
             disk_usage: 0,
             items_count: 1,
+            safe_reclaimable: 0,
+            safe_items: 0,
             is_dir: true,
             is_symlink: false,
             dev,
@@ -235,34 +247,22 @@ impl FileEntry {
         }
     }
 
+    #[inline]
     pub fn safe_reclaimable_bytes(&self) -> u64 {
         if self.delete_safety == DeleteSafety::Safe {
-            return self.disk_usage;
+            self.disk_usage
+        } else {
+            self.safe_reclaimable
         }
-        let mut sum = 0u64;
-        for c in &self.children {
-            if c.delete_safety == DeleteSafety::Safe {
-                sum = sum.saturating_add(c.disk_usage);
-            } else if c.is_dir {
-                sum = sum.saturating_add(c.safe_reclaimable_bytes());
-            }
-        }
-        sum
     }
 
+    #[inline]
     pub fn safe_items_count(&self) -> usize {
         if self.delete_safety == DeleteSafety::Safe {
-            return 1;
+            1
+        } else {
+            self.safe_items
         }
-        let mut count = 0usize;
-        for c in &self.children {
-            if c.delete_safety == DeleteSafety::Safe {
-                count += 1;
-            } else if c.is_dir {
-                count += c.safe_items_count();
-            }
-        }
-        count
     }
 }
 
@@ -304,4 +304,78 @@ pub fn format_count(count: usize) -> String {
     } else {
         format!("{} items", s)
     }
+}
+
+/// Truncates string from the end to fit within `max_width` terminal columns,
+/// appending "..." if truncated. Never splits a char or wide character.
+pub fn truncate_end_by_width(s: &str, max_width: usize) -> String {
+    let total_width = s.width();
+    if total_width <= max_width {
+        return s.to_string();
+    }
+    if max_width <= 3 {
+        let mut res = String::new();
+        let mut cur_w = 0;
+        for c in s.chars() {
+            let char_w = c.width().unwrap_or(0);
+            if cur_w + char_w > max_width {
+                break;
+            }
+            res.push(c);
+            cur_w += char_w;
+        }
+        return res;
+    }
+
+    let budget = max_width - 3;
+    let mut res = String::new();
+    let mut cur_w = 0;
+    for c in s.chars() {
+        let char_w = c.width().unwrap_or(0);
+        if cur_w + char_w > budget {
+            break;
+        }
+        res.push(c);
+        cur_w += char_w;
+    }
+    res.push_str("...");
+    res
+}
+
+/// Truncates string from the beginning to fit within `max_width` terminal columns,
+/// prepending "..." if truncated. Never splits a char or wide character.
+pub fn truncate_start_by_width(s: &str, max_width: usize) -> String {
+    let total_width = s.width();
+    if total_width <= max_width {
+        return s.to_string();
+    }
+    if max_width <= 3 {
+        let mut chars = Vec::new();
+        let mut cur_w = 0;
+        for c in s.chars().rev() {
+            let char_w = c.width().unwrap_or(0);
+            if cur_w + char_w > max_width {
+                break;
+            }
+            chars.push(c);
+            cur_w += char_w;
+        }
+        chars.reverse();
+        return chars.into_iter().collect();
+    }
+
+    let budget = max_width - 3;
+    let mut chars = Vec::new();
+    let mut cur_w = 0;
+    for c in s.chars().rev() {
+        let char_w = c.width().unwrap_or(0);
+        if cur_w + char_w > budget {
+            break;
+        }
+        chars.push(c);
+        cur_w += char_w;
+    }
+    chars.reverse();
+    let tail: String = chars.into_iter().collect();
+    format!("...{}", tail)
 }

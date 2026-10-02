@@ -54,7 +54,9 @@ fn handle_help_keys(app: &mut App, key: KeyEvent) -> EventResult {
 fn handle_item_info_keys(app: &mut App, key: KeyEvent) -> EventResult {
     match key.code {
         KeyCode::Char('r') | KeyCode::Char('R') => {
+            let previous_view = app.previous_view;
             app.open_item_info();
+            app.previous_view = previous_view;
             app.set_status("Item details refreshed");
         }
         KeyCode::Char('i')

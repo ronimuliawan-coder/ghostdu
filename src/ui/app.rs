@@ -726,14 +726,26 @@ impl App {
             let mut total_size = 0u64;
             let mut total_disk = 0u64;
             let mut total_items = 0usize;
+            let mut total_safe_reclaimable = 0u64;
+            let mut total_safe_items = 0usize;
             for child in &entry.children {
                 total_size = total_size.saturating_add(child.size);
                 total_disk = total_disk.saturating_add(child.disk_usage);
                 total_items = total_items.saturating_add(child.items_count);
+                total_safe_reclaimable =
+                    total_safe_reclaimable.saturating_add(child.safe_reclaimable_bytes());
+                total_safe_items = total_safe_items.saturating_add(child.safe_items_count());
             }
             entry.size = total_size;
             entry.disk_usage = total_disk;
             entry.items_count = total_items + 1;
+            if entry.delete_safety == DeleteSafety::Safe {
+                entry.safe_reclaimable = total_disk;
+                entry.safe_items = 1;
+            } else {
+                entry.safe_reclaimable = total_safe_reclaimable;
+                entry.safe_items = total_safe_items;
+            }
         }
 
         remove_rec(&mut self.root_entry, path);
@@ -763,14 +775,26 @@ impl App {
             let mut total_size = 0u64;
             let mut total_disk = 0u64;
             let mut total_items = 0usize;
+            let mut total_safe_reclaimable = 0u64;
+            let mut total_safe_items = 0usize;
             for child in &entry.children {
                 total_size = total_size.saturating_add(child.size);
                 total_disk = total_disk.saturating_add(child.disk_usage);
                 total_items = total_items.saturating_add(child.items_count);
+                total_safe_reclaimable =
+                    total_safe_reclaimable.saturating_add(child.safe_reclaimable_bytes());
+                total_safe_items = total_safe_items.saturating_add(child.safe_items_count());
             }
             entry.size = total_size;
             entry.disk_usage = total_disk;
             entry.items_count = total_items + 1;
+            if entry.delete_safety == DeleteSafety::Safe {
+                entry.safe_reclaimable = total_disk;
+                entry.safe_items = 1;
+            } else {
+                entry.safe_reclaimable = total_safe_reclaimable;
+                entry.safe_items = total_safe_items;
+            }
         }
 
         replace_rec(&mut self.root_entry, target, &new_node);

@@ -142,12 +142,15 @@ fn send_docker_http_request(method: &str, endpoint: &str) -> Result<String, Stri
         .read_to_end(&mut response_bytes)
         .map_err(|e| format!("Failed to read from docker socket: {}", e))?;
 
-    let response = String::from_utf8_lossy(&response_bytes);
-    let (header, raw_body) = response
-        .split_once("\r\n\r\n")
+    let sep = response_bytes
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
         .ok_or_else(|| "Invalid HTTP response from docker socket".to_string())?;
 
-    let status_line = header.lines().next().unwrap_or("");
+    let header_str = String::from_utf8_lossy(&response_bytes[..sep]);
+    let raw_body = &response_bytes[sep + 4..];
+
+    let status_line = header_str.lines().next().unwrap_or("");
     let status_code: u16 = status_line
         .split_whitespace()
         .nth(1)
@@ -158,24 +161,30 @@ fn send_docker_http_request(method: &str, endpoint: &str) -> Result<String, Stri
         return Err(format!(
             "Docker API error (HTTP {}): {}",
             status_code,
-            raw_body.trim()
+            String::from_utf8_lossy(raw_body).trim()
         ));
     }
 
-    let body = if header.contains("Transfer-Encoding: chunked") {
-        let mut dechunked = String::new();
+    let is_chunked = header_str.lines().any(|l| {
+        let l = l.to_ascii_lowercase();
+        l.starts_with("transfer-encoding:") && l.contains("chunked")
+    });
+
+    let body = if is_chunked {
+        let mut dechunked: Vec<u8> = Vec::new();
         let mut remaining = raw_body;
-        while let Some(line_end) = remaining.find("\r\n") {
-            let hex_len_str = remaining[..line_end].trim();
-            if let Ok(chunk_len) = usize::from_str_radix(hex_len_str, 16) {
+        while let Some(line_end) = remaining.windows(2).position(|w| w == b"\r\n") {
+            let hex_str = String::from_utf8_lossy(&remaining[..line_end]);
+            let hex_clean = hex_str.split(';').next().unwrap_or("").trim();
+            if let Ok(chunk_len) = usize::from_str_radix(hex_clean, 16) {
                 if chunk_len == 0 {
                     break;
                 }
                 let data_start = line_end + 2;
                 let data_end = data_start + chunk_len;
                 if data_end <= remaining.len() {
-                    dechunked.push_str(&remaining[data_start..data_end]);
-                    remaining = &remaining[data_end + 2..];
+                    dechunked.extend_from_slice(&remaining[data_start..data_end]);
+                    remaining = remaining.get(data_end + 2..).unwrap_or(&[]);
                 } else {
                     break;
                 }
@@ -183,9 +192,9 @@ fn send_docker_http_request(method: &str, endpoint: &str) -> Result<String, Stri
                 break;
             }
         }
-        dechunked
+        String::from_utf8_lossy(&dechunked).into_owned()
     } else {
-        raw_body.to_string()
+        String::from_utf8_lossy(raw_body).into_owned()
     };
 
     Ok(body)

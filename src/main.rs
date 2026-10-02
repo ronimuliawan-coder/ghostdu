@@ -7,7 +7,10 @@ use crossterm::{
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
-use fs::{format_count, format_size, scan_directory, ScanProgress};
+use fs::{
+    format_count, format_size, scan_directory, truncate_end_by_width, truncate_start_by_width,
+    ScanProgress,
+};
 use ratatui::{
     backend::CrosstermBackend,
     layout::{Alignment, Rect},
@@ -187,7 +190,7 @@ fn run_app<B: ratatui::backend::Backend>(
                     Line::from(vec![
                         Span::styled("Scanning: ", Style::default().fg(Color::DarkGray)),
                         Span::styled(
-                            truncate_start_chars(&path_str, 44),
+                            truncate_start_by_width(&path_str, 44),
                             Style::default().fg(Color::Yellow),
                         ),
                     ]),
@@ -340,7 +343,7 @@ fn run_headless_summary(target_path: PathBuf) -> Result<(), Box<dyn std::error::
 
         println!(
             "     {:<40} {:<12} {:<18} {:<12}",
-            truncate_end_chars(&display_name, 40),
+            truncate_end_by_width(&display_name, 40),
             format_size(entry.disk_usage),
             bar_text,
             badge
@@ -415,25 +418,4 @@ fn run_headless_summary(target_path: PathBuf) -> Result<(), Box<dyn std::error::
 
     println!("════════════════════════════════════════════════════════════════════════════════");
     Ok(())
-}
-
-fn truncate_start_chars(s: &str, max_chars: usize) -> String {
-    let char_count = s.chars().count();
-    if char_count > max_chars && max_chars > 3 {
-        let skip_count = char_count - (max_chars - 3);
-        let tail: String = s.chars().skip(skip_count).collect();
-        format!("...{}", tail)
-    } else {
-        s.to_string()
-    }
-}
-
-fn truncate_end_chars(s: &str, max_chars: usize) -> String {
-    let char_count = s.chars().count();
-    if char_count > max_chars && max_chars > 3 {
-        let head: String = s.chars().take(max_chars - 3).collect();
-        format!("{}...", head)
-    } else {
-        s.to_string()
-    }
 }

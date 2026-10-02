@@ -568,17 +568,24 @@ fn test_backend_deletion_safety_gate() {
     assert_eq!(res_trash.failed.len(), 1);
     assert!(res_trash.failed[0].1.contains("Blocked: Protected system"));
 
-    // 3. Symlink pointing to /etc must also be rejected by canonical target check
+    // 3. Symlink pointing to /etc CAN be safely unlinked without touching /etc
     let temp_dir = tempfile::tempdir().expect("create temp dir");
-    let evil_link = temp_dir.path().join("link_to_etc");
-    std::os::unix::fs::symlink("/etc", &evil_link).unwrap();
+    let link_to_etc = temp_dir.path().join("my_link_to_etc");
+    std::os::unix::fs::symlink("/etc", &link_to_etc).unwrap();
 
-    let res_link = ghostdu_scanner::permanently_delete(&[evil_link]);
-    assert!(res_link.succeeded.is_empty());
-    assert_eq!(res_link.failed.len(), 1);
-    assert!(res_link.failed[0]
-        .1
-        .contains("Blocked: Protected system target"));
+    let res_link = ghostdu_scanner::permanently_delete(std::slice::from_ref(&link_to_etc));
+    assert_eq!(res_link.succeeded.len(), 1);
+    assert!(!link_to_etc.exists());
+    assert!(std::path::Path::new("/etc").exists());
+
+    // 4. Non-symlink traversal path resolving to /etc is rejected by canonical check
+    let sneaky_path = temp_dir.path().join("../../../../../../../../../etc");
+    if sneaky_path.canonicalize().is_ok() {
+        let res_sneaky = ghostdu_scanner::permanently_delete(&[sneaky_path]);
+        assert!(res_sneaky.succeeded.is_empty());
+        assert_eq!(res_sneaky.failed.len(), 1);
+        assert!(res_sneaky.failed[0].1.contains("Blocked: Protected system"));
+    }
 }
 
 #[test]
@@ -700,9 +707,118 @@ fn test_scanner_cross_mount_option() {
     assert_eq!(root.children.len(), 1);
 }
 
+#[test]
+fn test_reclaimable_precomputed_aggregates_o1() {
+    let temp_dir = tempfile::tempdir().expect("create temp dir");
+    let base = temp_dir.path();
+    let cache_dir = base.join(".cache").join("app");
+    fs::create_dir_all(&cache_dir).unwrap();
+    fs::write(cache_dir.join("cached.dat"), vec![0u8; 10000]).unwrap();
+    let user_dir = base.join("Documents");
+    fs::create_dir_all(&user_dir).unwrap();
+    fs::write(user_dir.join("notes.txt"), "my notes").unwrap();
+
+    let stop_signal = Arc::new(AtomicBool::new(false));
+    let root = ghostdu_scanner::scan_directory(base, None, stop_signal).unwrap();
+
+    // safe_reclaimable_bytes and safe_items_count are precomputed and O(1)
+    assert!(root.safe_reclaimable_bytes() > 0);
+    assert_eq!(root.safe_items_count(), 1); // .cache is 1 safe directory
+}
+
+#[test]
+fn test_target_substring_safety_and_cargo_cache_roots() {
+    // 1. Files inside an arbitrary path containing '/target/' must NOT be classified as BuildCache
+    let doc_in_target = PathBuf::from("/home/user/Documents/target/financial_report.pdf");
+    assert_ne!(
+        ghostdu_scanner::classify_path(&doc_in_target),
+        ghostdu_scanner::GhostKind::BuildCache
+    );
+
+    // 2. Exact cargo registry and git roots MUST be classified as BuildCache
+    let cargo_registry = PathBuf::from("/home/user/.cargo/registry");
+    let cargo_git = PathBuf::from("/home/user/.cargo/git");
+    assert_eq!(
+        ghostdu_scanner::classify_path(&cargo_registry),
+        ghostdu_scanner::GhostKind::BuildCache
+    );
+    assert_eq!(
+        ghostdu_scanner::classify_path(&cargo_git),
+        ghostdu_scanner::GhostKind::BuildCache
+    );
+}
+
+#[test]
+fn test_unicode_width_truncation_with_wide_characters() {
+    use unicode_width::UnicodeWidthStr;
+
+    // String with 2-column wide characters (Japanese and Emoji)
+    let wide_str = "🚀 こんにちは世界 📦";
+
+    let trunc_end = ghostdu_scanner::truncate_end_by_width(wide_str, 12);
+    assert!(trunc_end.width() <= 12);
+    assert!(trunc_end.ends_with("..."));
+
+    let trunc_start = ghostdu_scanner::truncate_start_by_width(wide_str, 12);
+    assert!(trunc_start.width() <= 12);
+    assert!(trunc_start.starts_with("..."));
+}
+
+#[test]
+fn test_item_info_refresh_preserves_previous_view() {
+    let mut root = ghostdu_scanner::FileEntry::new_dir(
+        "root".to_string(),
+        PathBuf::from("/test"),
+        1,
+        1,
+        ghostdu_scanner::GhostKind::None,
+        ghostdu_scanner::DeleteSafety::UserData,
+    );
+    root.children.push(ghostdu_scanner::FileEntry::new_file(
+        "file.txt".to_string(),
+        PathBuf::from("/test/file.txt"),
+        100,
+        1024,
+        false,
+        1,
+        2,
+        ghostdu_scanner::GhostKind::None,
+        ghostdu_scanner::DeleteSafety::UserData,
+    ));
+    let mut app = ghostdu::ui::App::new(root);
+
+    // Initial view: Filesystem
+    assert_eq!(app.active_view, ghostdu::ui::ActiveView::Filesystem);
+
+    // Open modal: previous_view becomes Filesystem, active_view becomes ItemInfoModal
+    app.open_item_info();
+    assert_eq!(app.active_view, ghostdu::ui::ActiveView::ItemInfoModal);
+    assert_eq!(app.previous_view, ghostdu::ui::ActiveView::Filesystem);
+
+    // Trigger 'r' event
+    let key = crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Char('r'),
+        crossterm::event::KeyModifiers::NONE,
+    );
+    ghostdu::ui::handle_key_event(&mut app, key);
+
+    // CRITICAL BUG CHECK: previous_view MUST remain Filesystem, not get overwritten by ItemInfoModal!
+    assert_eq!(app.previous_view, ghostdu::ui::ActiveView::Filesystem);
+
+    // Now press 'q' or 'Esc' to close modal
+    let esc_key = crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Esc,
+        crossterm::event::KeyModifiers::NONE,
+    );
+    ghostdu::ui::handle_key_event(&mut app, esc_key);
+    assert_eq!(app.active_view, ghostdu::ui::ActiveView::Filesystem);
+}
+
 // Minimal exposure for integration testing
 mod ghostdu_scanner {
-    pub use ghostdu::fs::entry::{DeleteSafety, GhostKind};
+    pub use ghostdu::fs::entry::{
+        truncate_end_by_width, truncate_start_by_width, DeleteSafety, FileEntry, GhostKind,
+    };
     pub use ghostdu::fs::scanner::{scan_directory, scan_directory_with_options, ScannerOptions};
     pub use ghostdu::ghost::{classify_path, classify_safety, parse_docker_df_json};
     pub use ghostdu::ops::delete::permanently_delete;

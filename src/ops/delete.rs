@@ -25,18 +25,6 @@ pub fn permanently_delete<P: AsRef<Path>>(paths: &[P]) -> DeleteResult {
             continue;
         }
 
-        // Also check canonicalized target to guard against symlinks pointing into system roots
-        if let Ok(canonical) = path.canonicalize() {
-            let canon_ghost = classify_path(&canonical);
-            if classify_safety(&canonical, canon_ghost) == DeleteSafety::System {
-                result.failed.push((
-                    path.to_path_buf(),
-                    "Blocked: Protected system target cannot be deleted".to_string(),
-                ));
-                continue;
-            }
-        }
-
         // Query symlink metadata without following the link
         let meta = match fs::symlink_metadata(path) {
             Ok(m) => m,
@@ -45,6 +33,25 @@ pub fn permanently_delete<P: AsRef<Path>>(paths: &[P]) -> DeleteResult {
                 continue;
             }
         };
+
+        let is_symlink = meta.file_type().is_symlink();
+
+        // For non-symlink paths, check canonicalized target to guard against paths
+        // (like relative paths or paths with ..) that resolve into system roots.
+        // For symlinks, we only unlink the link itself (never touching the target),
+        // so a symlink pointing to a system path (e.g. ~/etc-link -> /etc) can be safely unlinked.
+        if !is_symlink {
+            if let Ok(canonical) = path.canonicalize() {
+                let canon_ghost = classify_path(&canonical);
+                if classify_safety(&canonical, canon_ghost) == DeleteSafety::System {
+                    result.failed.push((
+                        path.to_path_buf(),
+                        "Blocked: Protected system target cannot be deleted".to_string(),
+                    ));
+                    continue;
+                }
+            }
+        }
 
         // If the path is a symlink (even to a directory), we must ONLY unlink it with remove_file
         // Calling remove_dir_all would follow the symlink and destroy the target's contents!

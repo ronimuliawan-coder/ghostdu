@@ -1,5 +1,6 @@
 use crate::fs::entry::DeleteSafety;
 use crate::ghost::{classify_path, classify_safety};
+use std::fs;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Default)]
@@ -24,15 +25,22 @@ pub fn move_to_trash<P: AsRef<Path>>(paths: &[P]) -> TrashResult {
             continue;
         }
 
-        // Also check canonicalized target
-        if let Ok(canonical) = path.canonicalize() {
-            let canon_ghost = classify_path(&canonical);
-            if classify_safety(&canonical, canon_ghost) == DeleteSafety::System {
-                result.failed.push((
-                    path.to_path_buf(),
-                    "Blocked: Protected system target cannot be moved to trash".to_string(),
-                ));
-                continue;
+        // Query symlink metadata without following the link
+        let is_symlink = fs::symlink_metadata(path)
+            .map(|m| m.file_type().is_symlink())
+            .unwrap_or(false);
+
+        // For non-symlink paths, check canonicalized target
+        if !is_symlink {
+            if let Ok(canonical) = path.canonicalize() {
+                let canon_ghost = classify_path(&canonical);
+                if classify_safety(&canonical, canon_ghost) == DeleteSafety::System {
+                    result.failed.push((
+                        path.to_path_buf(),
+                        "Blocked: Protected system target cannot be moved to trash".to_string(),
+                    ));
+                    continue;
+                }
             }
         }
 

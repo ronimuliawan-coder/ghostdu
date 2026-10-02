@@ -191,13 +191,12 @@ pub fn classify_path(path: &Path) -> GhostKind {
             | ".svelte-kit"
             | ".turbo"
             | ".gradle"
-            | ".cargo/registry"
-            | ".cargo/git"
             | "go-build"
             | ".mypy_cache"
             | ".ruff_cache"
             | "ccache"
-    ) || path_str.contains("/target/")
+    ) || path_str.ends_with("/.cargo/registry")
+        || path_str.ends_with("/.cargo/git")
         || path_str.contains("/__pycache__/")
         || path_str.contains("/.pytest_cache/")
         || path_str.contains("/.next/")

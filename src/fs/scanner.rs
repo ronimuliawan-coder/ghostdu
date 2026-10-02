@@ -1,4 +1,4 @@
-use crate::fs::entry::FileEntry;
+use crate::fs::entry::{DeleteSafety, FileEntry};
 use crate::ghost::{classify_path, classify_safety, is_virtual_fs_path};
 use crossbeam_channel::Sender;
 use std::collections::HashSet;
@@ -259,15 +259,27 @@ fn scan_dir_recursive(
     let mut total_size = 0u64;
     let mut total_disk = 0u64;
     let mut total_items = 0usize;
+    let mut total_safe_reclaimable = 0u64;
+    let mut total_safe_items = 0usize;
 
     for child in &sub_entries {
         total_size = total_size.saturating_add(child.size);
         total_disk = total_disk.saturating_add(child.disk_usage);
         total_items = total_items.saturating_add(child.items_count);
+        total_safe_reclaimable =
+            total_safe_reclaimable.saturating_add(child.safe_reclaimable_bytes());
+        total_safe_items = total_safe_items.saturating_add(child.safe_items_count());
     }
 
     parent_entry.size = total_size;
     parent_entry.disk_usage = total_disk;
     parent_entry.items_count = total_items + 1; // plus the directory itself
+    if parent_entry.delete_safety == DeleteSafety::Safe {
+        parent_entry.safe_reclaimable = total_disk;
+        parent_entry.safe_items = 1;
+    } else {
+        parent_entry.safe_reclaimable = total_safe_reclaimable;
+        parent_entry.safe_items = total_safe_items;
+    }
     parent_entry.children = sub_entries;
 }
