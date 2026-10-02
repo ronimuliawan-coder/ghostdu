@@ -765,6 +765,76 @@ fn test_unicode_width_truncation_with_wide_characters() {
 }
 
 #[test]
+fn test_truncation_measures_complete_unicode_sequences() {
+    use unicode_width::UnicodeWidthStr;
+
+    let inputs = [
+        "",
+        "plain ASCII filename.txt",
+        "日本語のファイル名.txt",
+        "❤️❤️❤️❤️❤️❤️",
+        "👩‍💻👩‍💻👩‍💻/notes.txt",
+        "e\u{301}e\u{301}/notes.txt",
+    ];
+    for input in inputs {
+        for max_width in 0..=input.width() + 3 {
+            for truncate in [
+                ghostdu_scanner::truncate_end_by_width,
+                ghostdu_scanner::truncate_start_by_width,
+            ] {
+                let result = truncate(input, max_width);
+                assert!(
+                    result.width() <= max_width,
+                    "{input:?} truncated to {max_width} cells produced {result:?} ({} cells)",
+                    result.width()
+                );
+                if input.width() <= max_width {
+                    assert_eq!(result, input);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn test_summary_columns_align_for_unicode_names() {
+    use unicode_width::UnicodeWidthStr;
+
+    let dir = tempfile::tempdir().unwrap();
+    let names = [
+        "ascii.txt".to_string(),
+        "日本語.log".to_string(),
+        "e\u{301}👩‍💻.txt".to_string(),
+        "❤️".repeat(24),
+        "界".repeat(24),
+    ];
+    for name in &names {
+        fs::write(dir.path().join(name), "").unwrap();
+    }
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_ghostdu"))
+        .arg("--summary")
+        .arg(dir.path())
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{:?}", output);
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let rows: Vec<_> = stdout
+        .lines()
+        .filter(|line| line.starts_with("     📄 "))
+        .collect();
+    assert_eq!(rows.len(), names.len());
+    for row in rows {
+        let size_start = row.find("0 B").unwrap();
+        assert_eq!(row[..size_start].width(), 46, "{row}");
+        let bar_start = row.find('[').unwrap();
+        assert_eq!(row[..bar_start].width(), 59, "{row}");
+        if let Some(category_start) = row.find("📜 LOGS") {
+            assert_eq!(row[..category_start].width(), 79, "{row}");
+        }
+    }
+}
+
+#[test]
 fn test_item_info_refresh_preserves_previous_view() {
     let mut root = ghostdu_scanner::FileEntry::new_dir(
         "root".to_string(),
