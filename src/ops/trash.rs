@@ -440,6 +440,18 @@ fn move_prepared_with_hook(
             hook(MovePhase::MetadataSynced, info, &info_name);
             verify_identity(parent, name, target)?;
             hook(MovePhase::Verified, info, &info_name);
+            // Security Threat Model Note:
+            // In POSIX/Linux, `renameat` takes directory file descriptors and entry names.
+            // There is no kernel-level atomic compare-and-rename syscall.
+            // While `verify_identity` confirms that the directory entry matches the confirmed
+            // (dev, ino) immediately before moving, in an untrusted shared-writer directory
+            // (e.g. world-writable /tmp), a concurrent local writer with write permissions
+            // in `parent` could replace the directory entry between verification and
+            // `renameat`. Identity checks establish continuity, not serialization against
+            // concurrent writers. `renameat` operates strictly on the directory entry
+            // itself and never follows the final symlink. Destructive actions running
+            // with elevated authority should ensure appropriate directory permissions
+            // (sticky bit) or namespace isolation.
             // Both directories stay pinned. Never re-resolve the user's source path or copy/delete.
             renameat_with(parent, name, files, &stored_name, RenameFlags::NOREPLACE)?;
             hook(MovePhase::Renamed, info, &info_name);
