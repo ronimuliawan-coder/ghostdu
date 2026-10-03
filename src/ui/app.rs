@@ -454,8 +454,9 @@ impl App {
                 .filter(|path| !self.selected_paths.contains(*path))
                 .count();
             let before = self.selected_paths.len();
+            let limit = self.selection_limit();
             for p in paths {
-                if !self.select_path(p) {
+                if !self.select_path_with_limit(p, limit.as_ref()) {
                     let reason = self
                         .current_status()
                         .unwrap_or("Selection stopped")
@@ -491,14 +492,20 @@ impl App {
         Ok(MAX_SELECTIONS.min(self.selected_identities.len().saturating_add(available)))
     }
 
-    fn select_path(&mut self, path: PathBuf) -> bool {
+    fn select_path_with_limit(
+        &mut self,
+        path: PathBuf,
+        limit_res: Result<&usize, &std::io::Error>,
+    ) -> bool {
         // Do not silently rebind an existing selection to a replacement object.
         if self.selected_paths.contains(&path) {
             return true;
         }
-        match self.selection_limit() {
-            Ok(limit) if self.selected_identities.len() >= limit => {
-                self.set_status(format!("Selection limit reached ({limit} items); deselect items to leave file handles available"));
+        match limit_res {
+            Ok(&limit) if self.selected_identities.len() >= limit => {
+                self.set_status(format!(
+                    "Selection limit reached ({limit} items); deselect items to leave file handles available"
+                ));
                 return false;
             }
             Err(error) => {
@@ -518,6 +525,11 @@ impl App {
                 false
             }
         }
+    }
+
+    fn select_path(&mut self, path: PathBuf) -> bool {
+        let limit = self.selection_limit();
+        self.select_path_with_limit(path, limit.as_ref())
     }
 
     fn capture_confirmation(&mut self, targets: &[PathBuf]) -> bool {
@@ -1131,6 +1143,24 @@ mod reconciliation_tests {
     fn selections_leave_descriptor_headroom_and_report_partial_batches() {
         const CHILD_LIMIT: &str = "GHOSTDU_SELECTION_LIMIT_CHILD";
         if let Ok(value) = std::env::var(CHILD_LIMIT) {
+            // Close inherited file descriptors from parent environments (e.g. IDEs)
+            // to ensure a hermetic environment for RLIMIT testing.
+            if let Ok(entries) = fs::read_dir("/proc/self/fd") {
+                let fds_to_close: Vec<i32> = entries
+                    .filter_map(|e| e.ok())
+                    .filter_map(|e| e.file_name().to_str()?.parse::<i32>().ok())
+                    .filter(|&fd| fd > 2)
+                    .filter(|&fd| {
+                        // Do not close the descriptor opened by read_dir itself.
+                        fs::read_link(format!("/proc/self/fd/{fd}"))
+                            .map(|target| !target.ends_with("fd"))
+                            .unwrap_or(true)
+                    })
+                    .collect();
+                for fd in fds_to_close {
+                    unsafe { libc::close(fd) };
+                }
+            }
             let fixture = tempfile::tempdir().unwrap();
             for index in 0..300 {
                 fs::write(fixture.path().join(format!("file-{index}")), "x").unwrap();

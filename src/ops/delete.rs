@@ -159,8 +159,17 @@ fn remove_at_with_hook(
     }
     verify_identity(parent, name, target)?;
     after_verification(parent, name);
-    // The final name can still change after verification; this is not an atomic
-    // compare-and-unlink. unlinkat never follows a replacement final symlink.
+    // Security Threat Model Note:
+    // In POSIX/Linux, `unlinkat` takes a directory file descriptor and an entry name.
+    // There is no kernel-level atomic compare-and-unlink syscall.
+    // While `verify_identity` confirms that the directory entry matches the confirmed
+    // (dev, ino) immediately before unlinking, in an untrusted shared-writer directory
+    // (e.g. world-writable /tmp), a concurrent local writer with write permissions in `parent`
+    // could replace the directory entry between verification and `unlinkat`.
+    // Note that `unlinkat` with `AtFlags::empty()` / `AtFlags::REMOVEDIR` operates strictly
+    // on the directory entry itself and never follows symlinks. Users operating in multi-tenant
+    // shared writable environments should ensure appropriate directory permissions (sticky bit)
+    // or namespace isolation.
     unlinkat(
         parent,
         name,

@@ -46,12 +46,13 @@ fn trash_with_destination<P: AsRef<Path>>(
 ) -> TrashResult {
     let mut result = TrashResult::default();
     let mut destinations = HashMap::new();
+    let topology = MountTopology::load();
     for path in paths {
         let path = path.as_ref();
         let moved: io::Result<()> = (|| {
             let (parent, name, target) = prepare_target(path)?;
             verify(path, &target)?;
-            check_trash_mounts(&target)?;
+            topology.check_target(&target)?;
             let original = fd_path(&parent)?.join(OsStr::from_bytes(name.to_bytes()));
             let uncached;
             let destination = if let Some(mount) = mount_id(&parent)? {
@@ -89,21 +90,67 @@ fn trash_with_destination<P: AsRef<Path>>(
     result
 }
 
-/// A rename does not visit descendants. Check mount topology rather than opening
-/// the whole subtree; final target/mount resolution is still pinned by prepare_target.
-fn check_trash_mounts(target: &File) -> io::Result<()> {
-    if !target.metadata()?.is_dir() {
-        return Ok(());
+#[derive(Default)]
+struct MountTrieNode {
+    is_mount: bool,
+    children: HashMap<std::ffi::OsString, MountTrieNode>,
+}
+
+impl MountTrieNode {
+    fn insert(&mut self, path: &Path) {
+        let mut curr = self;
+        for comp in path.components() {
+            let key = comp.as_os_str().to_os_string();
+            curr = curr.children.entry(key).or_default();
+        }
+        curr.is_mount = true;
     }
-    let path = fd_path(target)?;
-    let topology = fs::read("/proc/self/mountinfo")?;
-    if crate::fs::scanner::parse_mount_points(&topology)
-        .iter()
-        .any(|mount| mount.starts_with(&path))
-    {
-        return Err(io::Error::from_raw_os_error(libc::EXDEV));
+
+    fn has_mount_at_or_under(&self, path: &Path) -> bool {
+        let mut curr = self;
+        for comp in path.components() {
+            match curr.children.get(comp.as_os_str()) {
+                Some(next) => curr = next,
+                None => return false,
+            }
+        }
+        curr.is_mount || !curr.children.is_empty()
     }
-    Ok(())
+}
+
+/// Shared mount topology index loaded once per trash batch.
+/// Evaluates directory targets against an in-memory prefix trie in O(depth) rather
+/// than repeatedly rereading and parsing /proc/self/mountinfo on every target.
+struct MountTopology {
+    root: io::Result<MountTrieNode>,
+}
+
+impl MountTopology {
+    fn load() -> Self {
+        let root = fs::read("/proc/self/mountinfo").map(|topology| {
+            let mut root = MountTrieNode::default();
+            for mount in crate::fs::scanner::parse_mount_points(&topology) {
+                root.insert(&mount);
+            }
+            root
+        });
+        Self { root }
+    }
+
+    fn check_target(&self, target: &File) -> io::Result<()> {
+        if !target.metadata()?.is_dir() {
+            return Ok(());
+        }
+        let root = match &self.root {
+            Ok(root) => root,
+            Err(e) => return Err(io::Error::new(e.kind(), e.to_string())),
+        };
+        let path = fd_path(target)?;
+        if root.has_mount_at_or_under(&path) {
+            return Err(io::Error::from_raw_os_error(libc::EXDEV));
+        }
+        Ok(())
+    }
 }
 
 struct TrashDestination {
