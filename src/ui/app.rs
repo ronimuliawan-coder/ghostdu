@@ -1355,18 +1355,21 @@ impl App {
         self.active_view = ActiveView::ConfirmModal;
     }
 
-    /// Open the process-termination confirmation. Callers must pass PIDs taken
-    /// from the ghost table, never free-form input. Captures the process start
-    /// time so a recycled PID cannot be signalled after the table goes stale.
-    pub fn prompt_kill_process(&mut self, pid: u32, name: String) {
+    /// Open the process-termination confirmation for a ghost-table PID. The row,
+    /// confirmation, and signal bind to one process instance: the table is
+    /// rescanned, a replacement PID is refused instead of adopted, the modal
+    /// shows the freshly validated name, and the instance is pinned with a
+    /// pidfd. Callers pass PIDs from the ghost table, never free-form input.
+    pub fn prompt_kill_process(&mut self, pid: u32) {
         // The ghost table is a snapshot; re-confirm the PID still holds one.
         self.deleted_open_files = crate::ghost::scan_deleted_open_files();
-        if !self.deleted_open_files.iter().any(|f| f.pid == pid) {
+        let Some(entry) = self.deleted_open_files.iter().find(|f| f.pid == pid) else {
             self.set_status(format!(
                 "Process {pid} no longer holds ghost files; table refreshed"
             ));
             return;
-        }
+        };
+        let name = entry.process_name.clone();
         let Some(start_time) = proc_start_time(pid) else {
             self.set_status(format!("Process {pid} exited before confirmation"));
             return;
@@ -2055,7 +2058,7 @@ mod reconciliation_tests {
         .unwrap();
         let mut app = App::new(root);
         // Unknown PID: confirmation never opens, table refresh reported.
-        app.prompt_kill_process(2_147_000_000, "test-proc".to_string());
+        app.prompt_kill_process(2_147_000_000);
         assert!(app.pending_action.is_none());
         assert_ne!(app.active_view, ActiveView::ConfirmModal);
         // Recycled PID: stored start time mismatches the live process.

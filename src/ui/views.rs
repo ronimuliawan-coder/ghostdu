@@ -2630,17 +2630,39 @@ fn render_footer(f: &mut Frame, app: &App, area: Rect) {
             }
             spans
         }
-        ActiveView::ConfirmModal => vec![
-            Span::styled(
-                " [y] Confirm Action ",
-                Style::default().fg(Color::Black).bg(Color::Yellow),
-            ),
-            Span::raw(" "),
-            Span::styled(
-                " [n / Esc] Cancel ",
-                Style::default().fg(Color::White).bg(Color::DarkGray),
-            ),
-        ],
+        ActiveView::ConfirmModal => {
+            // The kill confirmation answers 1/2, not y.
+            if matches!(&app.pending_action, Some(ConfirmAction::KillProcess { .. })) {
+                vec![
+                    Span::styled(
+                        " [1] SIGTERM ",
+                        Style::default().fg(Color::Black).bg(Color::Yellow),
+                    ),
+                    Span::raw(" "),
+                    Span::styled(
+                        " [2] SIGKILL ",
+                        Style::default().fg(Color::White).bg(Color::Red),
+                    ),
+                    Span::raw(" "),
+                    Span::styled(
+                        " [n / Esc] Cancel ",
+                        Style::default().fg(Color::White).bg(Color::DarkGray),
+                    ),
+                ]
+            } else {
+                vec![
+                    Span::styled(
+                        " [y] Confirm Action ",
+                        Style::default().fg(Color::Black).bg(Color::Yellow),
+                    ),
+                    Span::raw(" "),
+                    Span::styled(
+                        " [n / Esc] Cancel ",
+                        Style::default().fg(Color::White).bg(Color::DarkGray),
+                    ),
+                ]
+            }
+        }
         ActiveView::HelpModal => vec![Span::styled(
             " [? / Esc] Close Help ",
             Style::default().fg(Color::White).bg(Color::DarkGray),
