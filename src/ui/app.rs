@@ -74,11 +74,12 @@ impl SortMode {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConfirmAction {
     MoveToTrash,
     PermanentDelete,
     DockerPrune,
+    KillProcess { pid: u32, name: String },
 }
 
 pub struct App {
@@ -804,6 +805,37 @@ impl App {
         self.active_view = ActiveView::ConfirmModal;
     }
 
+    /// Open the process-termination confirmation. Callers must pass PIDs taken
+    /// from the ghost table, never free-form input.
+    pub fn prompt_kill_process(&mut self, pid: u32, name: String) {
+        self.pending_action = Some(ConfirmAction::KillProcess { pid, name });
+        self.previous_view = self.active_view;
+        self.active_view = ActiveView::ConfirmModal;
+    }
+
+    /// Send a signal to a ghost-table process, then refresh the ghost table.
+    /// `sigterm` selects SIGTERM (graceful) over SIGKILL. Kernel ESRCH/EPERM
+    /// surface as status messages.
+    pub fn execute_kill(&mut self, pid: u32, sigterm: bool) {
+        let signal = if sigterm {
+            libc::SIGTERM
+        } else {
+            libc::SIGKILL
+        };
+        // kill has no preconditions beyond a live PID.
+        let result = unsafe { libc::kill(pid as i32, signal) };
+        self.pending_action = None;
+        self.active_view = self.previous_view;
+        if result != 0 {
+            let error = std::io::Error::last_os_error();
+            self.set_status(format!("Cannot signal process {pid}: {error}"));
+            return;
+        }
+        self.deleted_open_files = crate::ghost::scan_deleted_open_files();
+        self.ghost_cursor_index = 0;
+        self.set_status(format!("Signaled process {pid}; ghost table refreshed"));
+    }
+
     /// Execute pending action after user confirms
     pub fn execute_pending_action(&mut self) {
         if self.action_safety_blocked {
@@ -912,6 +944,11 @@ impl App {
                     self.set_status(format!("❌ Docker Prune failed: {}", err));
                 }
             },
+            // Termination uses the 1/2 number keys, never y. Reaching here
+            // means an unexpected confirm path; cancel without signaling.
+            ConfirmAction::KillProcess { .. } => {
+                self.cancel_modal();
+            }
         }
 
         self.action_identities.clear();
@@ -1269,6 +1306,32 @@ mod reconciliation_tests {
     use super::*;
     use std::fs;
     use std::sync::{atomic::AtomicBool, Arc};
+
+    #[test]
+    fn kill_flow_confirms_then_reports_missing_process() {
+        let fixture = tempfile::tempdir().unwrap();
+        let root = crate::fs::scanner::scan_directory(
+            fixture.path(),
+            None,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .unwrap();
+        let mut app = App::new(root);
+        app.prompt_kill_process(42, "test-proc".to_string());
+        assert_eq!(app.active_view, ActiveView::ConfirmModal);
+        assert!(matches!(
+            app.pending_action,
+            Some(ConfirmAction::KillProcess { pid: 42, .. })
+        ));
+        // Positive PID below i32::MAX that cannot exist (default pid_max is
+        // far lower); kill(-1) would signal everything, so never test that.
+        app.execute_kill(2_147_000_000, true);
+        assert!(app.pending_action.is_none());
+        assert!(app
+            .current_status()
+            .unwrap_or("")
+            .contains("Cannot signal process"));
+    }
 
     #[test]
     fn sparse_and_missing_updates_skip_unrelated_descendants() {

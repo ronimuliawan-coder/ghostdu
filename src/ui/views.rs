@@ -1592,7 +1592,7 @@ fn render_deleted_open_summary(f: &mut Frame, app: &App, area: Rect) {
 }
 
 fn render_confirm_modal(f: &mut Frame, app: &App, screen: Rect) {
-    let action = match app.pending_action {
+    let action = match &app.pending_action {
         Some(a) => a,
         None => return,
     };
@@ -1825,6 +1825,54 @@ fn render_confirm_modal(f: &mut Frame, app: &App, screen: Rect) {
 
                 (title, border_color, prompt, infos)
             }
+            ConfirmAction::KillProcess { pid, name } => {
+                let title = " ☠️  TERMINATE PROCESS (GHOST FILE) ";
+                let border_color = Color::Red;
+
+                let prompt = Line::from(vec![
+                    Span::styled(
+                        " [1] SIGTERM ",
+                        Style::default()
+                            .bg(Color::Yellow)
+                            .fg(Color::Black)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::raw("    "),
+                    Span::styled(
+                        " [2] SIGKILL ",
+                        Style::default()
+                            .bg(Color::Red)
+                            .fg(Color::White)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::raw("    "),
+                    Span::styled(
+                        " [n / Esc] Cancel ",
+                        Style::default().bg(Color::DarkGray).fg(Color::White),
+                    ),
+                ]);
+
+                let infos = vec![
+                    Line::from(Span::styled(
+                        format!("Terminate '{name}' (PID {pid})?"),
+                        Style::default()
+                            .fg(Color::White)
+                            .add_modifier(Modifier::BOLD),
+                    )),
+                    Line::from(""),
+                    Line::from(Span::styled(
+                        "Freed ghost space returns to disk once it exits.",
+                        Style::default().fg(Color::LightGreen),
+                    )),
+                    Line::from(Span::styled(
+                        "Prefer SIGTERM: SIGKILL on databases risks corruption.",
+                        Style::default().fg(Color::Yellow),
+                    )),
+                    Line::from(""),
+                ];
+
+                (title, border_color, prompt, infos)
+            }
         }
     };
 
@@ -1856,7 +1904,7 @@ fn render_help_modal(f: &mut Frame, screen: Rect) {
         screen.width.saturating_sub(2)
     };
     let popup_height = if is_wide {
-        16.min(screen.height.saturating_sub(2))
+        18.min(screen.height.saturating_sub(2))
     } else {
         22.min(screen.height.saturating_sub(2))
     };
@@ -1954,7 +2002,7 @@ fn render_help_modal(f: &mut Frame, screen: Rect) {
                     .add_modifier(Modifier::BOLD),
             )),
             Line::from("  Space: Sel │ t/w: Trash │ d/D: Delete │ i: Info"),
-            Line::from("  !: Shell │ o: Open │ y: Copy path"),
+            Line::from("  !: Shell │ o: Open │ y: Copy │ K: Kill (ghost)"),
             Line::from(""),
             Line::from(Span::styled(
                 "SAFETY & MODES: ",
@@ -2339,6 +2387,7 @@ fn render_footer(f: &mut Frame, app: &App, area: Rect) {
                     ("[Tab] Explorer", Color::Black, Color::LightCyan),
                     ("[1/2] Tab", Color::White, Color::DarkGray),
                     ("[p] Prune Docker", Color::Black, Color::Yellow),
+                    ("[K] Kill proc", Color::Black, Color::Red),
                     ("[r] Refresh", Color::Black, Color::Green),
                     ("[q] Back", Color::White, Color::DarkGray),
                 ]
@@ -2346,6 +2395,7 @@ fn render_footer(f: &mut Frame, app: &App, area: Rect) {
                 vec![
                     ("[Tab] Explorer", Color::Black, Color::LightCyan),
                     ("[p] Prune", Color::Black, Color::Yellow),
+                    ("[K] Kill", Color::Black, Color::Red),
                     ("[r] Ref", Color::Black, Color::Green),
                     ("[q] Back", Color::White, Color::DarkGray),
                 ]
