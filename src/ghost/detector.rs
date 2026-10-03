@@ -1,6 +1,15 @@
 use crate::fs::entry::{DeleteSafety, GhostKind};
 use std::path::Path;
 
+/// Case-insensitive ASCII suffix match without allocating a lowercased copy.
+/// `classify_path` runs per scanned entry, so a `to_lowercase()` here adds one
+/// heap allocation per file. Byte comparison is safe (no char-boundary panic).
+// ponytail: ASCII-only folding; these ASCII suffixes can't match non-ASCII names either way
+fn has_suffix_ignore_ascii_case(name: &str, suffix: &str) -> bool {
+    name.len() >= suffix.len()
+        && name.as_bytes()[name.len() - suffix.len()..].eq_ignore_ascii_case(suffix.as_bytes())
+}
+
 pub fn classify_path(path: &Path) -> GhostKind {
     let path_str = path.to_string_lossy();
     let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
@@ -84,13 +93,12 @@ pub fn classify_path(path: &Path) -> GhostKind {
     {
         return GhostKind::VmOrIso;
     }
-    let lower_name = file_name.to_lowercase();
-    if lower_name.ends_with(".iso")
-        || lower_name.ends_with(".qcow2")
-        || lower_name.ends_with(".vdi")
-        || lower_name.ends_with(".vmdk")
-        || lower_name.ends_with(".ova")
-        || lower_name.ends_with(".qcow")
+    if has_suffix_ignore_ascii_case(file_name, ".iso")
+        || has_suffix_ignore_ascii_case(file_name, ".qcow2")
+        || has_suffix_ignore_ascii_case(file_name, ".vdi")
+        || has_suffix_ignore_ascii_case(file_name, ".vmdk")
+        || has_suffix_ignore_ascii_case(file_name, ".ova")
+        || has_suffix_ignore_ascii_case(file_name, ".qcow")
     {
         return GhostKind::VmOrIso;
     }
@@ -104,7 +112,9 @@ pub fn classify_path(path: &Path) -> GhostKind {
     {
         return GhostKind::AiModel;
     }
-    if lower_name.ends_with(".gguf") || lower_name.ends_with(".safetensors") {
+    if has_suffix_ignore_ascii_case(file_name, ".gguf")
+        || has_suffix_ignore_ascii_case(file_name, ".safetensors")
+    {
         return GhostKind::AiModel;
     }
 
@@ -144,12 +154,13 @@ pub fn classify_path(path: &Path) -> GhostKind {
     // 11. System & App Logs (require directory context or recognizable log extensions)
     if path_str.contains("/var/log")
         || path_str.contains("/.npm/_logs")
-        || (path_str.contains("/.local/state/") && (lower_name == "log" || lower_name == "logs"))
-        || (lower_name == "journal" && path_str.contains("/log"))
-        || lower_name.ends_with(".log")
-        || lower_name.ends_with(".log.gz")
-        || lower_name.ends_with(".log.1")
-        || lower_name.ends_with(".log.old")
+        || (path_str.contains("/.local/state/")
+            && (file_name.eq_ignore_ascii_case("log") || file_name.eq_ignore_ascii_case("logs")))
+        || (file_name.eq_ignore_ascii_case("journal") && path_str.contains("/log"))
+        || has_suffix_ignore_ascii_case(file_name, ".log")
+        || has_suffix_ignore_ascii_case(file_name, ".log.gz")
+        || has_suffix_ignore_ascii_case(file_name, ".log.1")
+        || has_suffix_ignore_ascii_case(file_name, ".log.old")
     {
         return GhostKind::LogFiles;
     }
@@ -455,6 +466,18 @@ mod tests {
         assert_eq!(
             classify_path(&PathBuf::from("/home/ron/Downloads/archlinux.iso")),
             GhostKind::VmOrIso
+        );
+        assert_eq!(
+            classify_path(&PathBuf::from("/home/ron/Downloads/archlinux.ISO")),
+            GhostKind::VmOrIso
+        );
+        assert_eq!(
+            classify_path(&PathBuf::from("/home/ron/models/mistral.GGUF")),
+            GhostKind::AiModel
+        );
+        assert_eq!(
+            classify_path(&PathBuf::from("/home/ron/project/APP.LOG")),
+            GhostKind::LogFiles
         );
         assert_eq!(
             classify_path(&PathBuf::from("/home/ron/.ollama/models/blobs/sha256-abc")),
