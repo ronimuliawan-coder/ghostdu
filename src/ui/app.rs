@@ -155,6 +155,8 @@ pub struct App {
     pub pending_action: Option<ConfirmAction>,
     pub action_targets: Vec<PathBuf>,
     pub action_total_size: u64,
+    /// Scroll offset for the multi-target list in the confirmation modal.
+    pub confirm_list_offset: usize,
     pub action_safety_blocked: bool,
     pub action_has_recheck: bool,
     pub action_has_system: bool,
@@ -207,6 +209,7 @@ impl App {
             pending_action: None,
             action_targets: Vec::new(),
             action_total_size: 0,
+            confirm_list_offset: 0,
             action_safety_blocked: false,
             action_has_recheck: false,
             action_has_system: false,
@@ -852,6 +855,7 @@ impl App {
         self.action_has_system = has_system;
         self.action_has_recheck = has_recheck;
         self.action_safety_blocked = has_system;
+        self.confirm_list_offset = 0;
         self.pending_action = Some(action);
         self.previous_view = self.active_view;
         self.active_view = ActiveView::ConfirmModal;
@@ -2024,6 +2028,46 @@ mod reconciliation_tests {
         app.janitor_action(true);
         assert_eq!(app.active_view, ActiveView::ConfirmModal);
         assert!(!app.action_targets.is_empty());
+    }
+
+    #[test]
+    fn confirm_list_scrolls_through_frozen_batch() {
+        use crate::ui::handle_key_event;
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let fixture = tempfile::tempdir().unwrap();
+        let chrome = fixture.path().join(".cache").join("google-chrome");
+        fs::create_dir_all(&chrome).unwrap();
+        fs::write(chrome.join("data"), vec![0u8; 10000]).unwrap();
+        fs::write(fixture.path().join("a.log"), vec![0u8; 1000]).unwrap();
+        fs::write(fixture.path().join("b.log"), vec![0u8; 1000]).unwrap();
+        let root = crate::fs::scanner::scan_directory(
+            fixture.path(),
+            None,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .unwrap();
+        let mut app = App::new(root);
+        app.open_janitor();
+        app.toggle_janitor_all();
+        app.janitor_action(true);
+        assert_eq!(app.active_view, ActiveView::ConfirmModal);
+        assert!(app.action_targets.len() > 1);
+        assert_eq!(app.confirm_list_offset, 0);
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        handle_key_event(&mut app, key(KeyCode::Down));
+        assert_eq!(app.confirm_list_offset, 1);
+        handle_key_event(&mut app, key(KeyCode::Down));
+        handle_key_event(&mut app, key(KeyCode::Down));
+        assert_eq!(
+            app.confirm_list_offset,
+            app.action_targets.len().saturating_sub(1)
+        );
+        handle_key_event(&mut app, key(KeyCode::Up));
+        assert_eq!(
+            app.confirm_list_offset,
+            app.action_targets.len().saturating_sub(2)
+        );
     }
 
     #[test]

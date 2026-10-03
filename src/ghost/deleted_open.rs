@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fs;
 use std::os::unix::fs::MetadataExt;
 use std::path::PathBuf;
@@ -30,6 +31,8 @@ pub(crate) fn proc_start_time(pid: u32) -> Option<u64> {
 
 pub fn scan_deleted_open_files() -> Vec<DeletedOpenFile> {
     let mut deleted_files = Vec::new();
+    // One stat read per PID, not per FD row.
+    let mut start_times: HashMap<u32, Option<u64>> = HashMap::new();
     let proc_dir = match fs::read_dir("/proc") {
         Ok(d) => d,
         Err(_) => return deleted_files,
@@ -99,7 +102,9 @@ pub fn scan_deleted_open_files() -> Vec<DeletedOpenFile> {
                     original_path: clean_path,
                     size,
                     fd: fd_entry.file_name().to_string_lossy().to_string(),
-                    start_time: proc_start_time(pid),
+                    start_time: *start_times
+                        .entry(pid)
+                        .or_insert_with(|| proc_start_time(pid)),
                 });
             }
         }
