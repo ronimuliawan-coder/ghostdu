@@ -74,6 +74,8 @@ pub fn render_ui(f: &mut Frame, app: &App) {
                 render_ghost_inspector(f, app, chunks[1]);
             } else if app.previous_view == ActiveView::TopFiles {
                 render_top_files(f, app, chunks[1]);
+            } else if app.previous_view == ActiveView::Janitor {
+                render_janitor(f, app, chunks[1]);
             } else {
                 render_filesystem_view(f, app, chunks[1]);
             }
@@ -1758,8 +1760,11 @@ fn render_confirm_modal(f: &mut Frame, app: &App, screen: Rect) {
         None => return,
     };
 
+    // Multi-target batches get an inspectable frozen target list; the window
+    // shows a page with scroll hints instead of rebuilding per frame.
+    let show_targets = !app.action_safety_blocked && app.action_targets.len() > 1;
     let popup_width = 65.min(screen.width.saturating_sub(4));
-    let popup_height = 14.min(screen.height.saturating_sub(4));
+    let popup_height = if show_targets { 21 } else { 14 }.min(screen.height.saturating_sub(4));
 
     let area = Rect {
         x: (screen.width.saturating_sub(popup_width)) / 2,
@@ -1770,7 +1775,7 @@ fn render_confirm_modal(f: &mut Frame, app: &App, screen: Rect) {
 
     f.render_widget(Clear, area);
 
-    let (title, border_color, prompt_line, info_lines) = if app.action_safety_blocked {
+    let (title, border_color, prompt_line, mut info_lines) = if app.action_safety_blocked {
         let title = " ⛔  DELETION BLOCKED — SYSTEM PROTECTION ";
         let border_color = Color::Red;
 
@@ -2042,6 +2047,46 @@ fn render_confirm_modal(f: &mut Frame, app: &App, screen: Rect) {
         .constraints([Constraint::Min(4), Constraint::Length(2)])
         .margin(1)
         .split(area);
+
+    if show_targets {
+        const PAGE: usize = 6;
+        let total = app.action_targets.len();
+        let offset = app.confirm_list_offset.min(total.saturating_sub(1));
+        let scope = if app.previous_view == ActiveView::Janitor {
+            match app.janitor_scope {
+                crate::ui::app::JanitorScope::Current => " — scope: current folder",
+                crate::ui::app::JanitorScope::Global => " — scope: whole scan",
+            }
+        } else {
+            ""
+        };
+        info_lines.push(Line::from(Span::styled(
+            format!("Targets ({total}){scope} — ↑↓ to inspect:"),
+            Style::default()
+                .fg(Color::LightCyan)
+                .add_modifier(Modifier::BOLD),
+        )));
+        if offset > 0 {
+            info_lines.push(Line::from(Span::styled(
+                format!("  … {} more above", offset),
+                Style::default().fg(Color::DarkGray),
+            )));
+        }
+        let budget = (popup_width as usize).saturating_sub(10).max(8);
+        for target in app.action_targets.iter().skip(offset).take(PAGE) {
+            info_lines.push(Line::from(format!(
+                "  • {}",
+                truncate_path(&target.to_string_lossy(), budget)
+            )));
+        }
+        let shown = offset + PAGE.min(total.saturating_sub(offset));
+        if shown < total {
+            info_lines.push(Line::from(Span::styled(
+                format!("  … {} more below", total - shown),
+                Style::default().fg(Color::DarkGray),
+            )));
+        }
+    }
 
     let modal_block = Block::default()
         .borders(Borders::ALL)

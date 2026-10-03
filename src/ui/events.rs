@@ -59,6 +59,23 @@ pub fn handle_key_event(app: &mut App, key: KeyEvent) -> EventResult {
 }
 
 fn handle_confirm_keys(app: &mut App, key: KeyEvent) -> EventResult {
+    // Scroll the frozen multi-target list without touching the confirmation.
+    if app.action_targets.len() > 1 {
+        match key.code {
+            KeyCode::Up => {
+                app.confirm_list_offset = app.confirm_list_offset.saturating_sub(1);
+                return EventResult::Continue;
+            }
+            KeyCode::Down => {
+                let max = app.action_targets.len().saturating_sub(1);
+                if app.confirm_list_offset < max {
+                    app.confirm_list_offset += 1;
+                }
+                return EventResult::Continue;
+            }
+            _ => {}
+        }
+    }
     // Process termination answers 1/2 instead of y/n. Execution consumes the
     // stored confirmation, so no fresh PID crosses this boundary.
     let killing = matches!(&app.pending_action, Some(ConfirmAction::KillProcess { .. }));
