@@ -52,6 +52,7 @@ pub fn handle_key_event(app: &mut App, key: KeyEvent) -> EventResult {
         ActiveView::HelpModal => handle_help_keys(app, key),
         ActiveView::ItemInfoModal => handle_item_info_keys(app, key),
         ActiveView::GhostInspector => handle_ghost_keys(app, key),
+        ActiveView::TopFiles => handle_top_files_keys(app, key),
         ActiveView::Filesystem => handle_filesystem_keys(app, key),
     }
 }
@@ -170,6 +171,35 @@ fn handle_ghost_keys(app: &mut App, key: KeyEvent) -> EventResult {
         KeyCode::Char('?') => {
             app.previous_view = app.active_view;
             app.active_view = ActiveView::HelpModal;
+        }
+        _ => {}
+    }
+    EventResult::Continue
+}
+
+fn handle_top_files_keys(app: &mut App, key: KeyEvent) -> EventResult {
+    match key.code {
+        KeyCode::Char('j') | KeyCode::Down => {
+            if !app.top_files.is_empty() {
+                app.top_cursor = (app.top_cursor + 1).min(app.top_files.len() - 1);
+            }
+        }
+        KeyCode::Char('k') | KeyCode::Up => {
+            app.top_cursor = app.top_cursor.saturating_sub(1);
+        }
+        KeyCode::Home => app.top_cursor = 0,
+        KeyCode::End => {
+            app.top_cursor = app.top_files.len().saturating_sub(1);
+        }
+        KeyCode::Enter => {
+            if !app.jump_to_top_file() {
+                app.set_status("Cannot jump: file no longer in tree");
+            }
+        }
+        KeyCode::Char('t') => app.top_file_action(true),
+        KeyCode::Char('d') | KeyCode::Char('D') => app.top_file_action(false),
+        KeyCode::Esc | KeyCode::Char('q') | KeyCode::Tab | KeyCode::Char('g') => {
+            app.active_view = ActiveView::Filesystem;
         }
         _ => {}
     }
@@ -322,6 +352,10 @@ fn handle_filesystem_keys(app: &mut App, key: KeyEvent) -> EventResult {
         // Utilities
         KeyCode::Char('i') | KeyCode::Char('I') => {
             app.open_item_info();
+            EventResult::Continue
+        }
+        KeyCode::Char('T') => {
+            app.open_top_files();
             EventResult::Continue
         }
         // Shell & desktop integration: suspend for a subshell, or fire-and-forget.
