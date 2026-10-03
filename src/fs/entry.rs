@@ -298,6 +298,17 @@ impl ExportEnvelope {
             root,
         }
     }
+
+    /// Reject exports from an unknown format before importing.
+    pub fn check_format_version(&self) -> std::io::Result<()> {
+        if self.format_version != EXPORT_FORMAT_VERSION {
+            return Err(std::io::Error::other(format!(
+                "Unsupported export format version {} (this tool reads {})",
+                self.format_version, EXPORT_FORMAT_VERSION
+            )));
+        }
+        Ok(())
+    }
 }
 
 pub fn format_size(bytes: u64) -> String {

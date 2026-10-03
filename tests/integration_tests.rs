@@ -798,13 +798,14 @@ fn test_export_envelope_carries_version() {
     let back: ghostdu::fs::ExportEnvelope = serde_json::from_str(&json).unwrap();
     assert_eq!(back.format_version, ghostdu::fs::EXPORT_FORMAT_VERSION);
     assert_eq!(back.root.children.len(), 1);
+    back.check_format_version().unwrap();
 }
 
 #[test]
 fn test_reclaimable_precomputed_aggregates_o1() {
     let temp_dir = tempfile::tempdir().expect("create temp dir");
     let base = temp_dir.path();
-    let cache_dir = base.join(".cache").join("app");
+    let cache_dir = base.join(".cache").join("thumbnails");
     fs::create_dir_all(&cache_dir).unwrap();
     fs::write(cache_dir.join("cached.dat"), vec![0u8; 10000]).unwrap();
     let user_dir = base.join("Documents");
@@ -1075,7 +1076,7 @@ fn test_snap_archives_are_not_virtual_filesystems() {
 #[test]
 fn test_external_hardlinks_do_not_inflate_safe_directory_savings() {
     let fixture = tempfile::tempdir().unwrap();
-    let safe = fixture.path().join(".cache");
+    let safe = fixture.path().join("target");
     fs::create_dir(&safe).unwrap();
     fs::write(safe.join("linked"), vec![b'x'; 8192]).unwrap();
     fs::hard_link(safe.join("linked"), fixture.path().join("outside")).unwrap();
