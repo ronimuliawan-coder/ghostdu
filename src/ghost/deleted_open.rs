@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::fs;
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
@@ -84,8 +83,6 @@ pub(crate) fn describe_pid_ghost(pid: u32) -> Option<(String, u64)> {
 
 pub fn scan_deleted_open_files() -> Vec<DeletedOpenFile> {
     let mut deleted_files = Vec::new();
-    // One stat read per PID, not per FD row.
-    let mut start_times: HashMap<u32, Option<u64>> = HashMap::new();
     let proc_dir = match fs::read_dir("/proc") {
         Ok(d) => d,
         Err(_) => return deleted_files,
@@ -105,7 +102,13 @@ pub fn scan_deleted_open_files() -> Vec<DeletedOpenFile> {
             Err(_) => continue, // Permission denied or process exited
         };
 
+        // Validate one PID instance across the complete FD qualification:
+        // capture identity first, publish rows only if it still matches after.
+        // Otherwise an exit plus PID reuse could pair old file evidence with
+        // the replacement's identity.
+        let start_time = proc_start_time(pid);
         let mut comm_name: Option<String> = None;
+        let mut pid_deleted_files = Vec::new();
 
         for fd_entry in fd_entries.flatten() {
             let fd_path = fd_entry.path();
@@ -122,16 +125,18 @@ pub fn scan_deleted_open_files() -> Vec<DeletedOpenFile> {
                     .map(|s| s.trim().to_string());
             }
 
-            deleted_files.push(DeletedOpenFile {
+            pid_deleted_files.push(DeletedOpenFile {
                 pid,
                 process_name: comm_name.clone().unwrap_or_else(|| "unknown".to_string()),
                 original_path: clean_path,
                 size,
                 fd: fd_entry.file_name().to_string_lossy().to_string(),
-                start_time: *start_times
-                    .entry(pid)
-                    .or_insert_with(|| proc_start_time(pid)),
+                start_time,
             });
+        }
+
+        if proc_start_time(pid) == start_time {
+            deleted_files.extend(pid_deleted_files);
         }
     }
 
@@ -158,6 +163,25 @@ mod tests {
         assert_eq!(Some(start), proc_start_time(own));
         drop(held);
         assert!(describe_pid_ghost(2_147_000_000).is_none());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn scan_publishes_rows_for_stable_instance() {
+        // The scanner's own deleted file must appear with this instance's
+        // start time: evidence and identity captured as one.
+        let held = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(held.path(), vec![0u8; 100]).unwrap();
+        std::fs::remove_file(held.path()).unwrap();
+        let own = std::process::id();
+        let expected = proc_start_time(own);
+        let rows = scan_deleted_open_files();
+        let row = rows
+            .iter()
+            .find(|r| r.pid == own)
+            .expect("own deleted file row");
+        assert_eq!(row.start_time, expected);
+        drop(held);
     }
 
     #[test]
