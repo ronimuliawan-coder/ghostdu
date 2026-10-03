@@ -66,10 +66,13 @@ pub fn render_ui(f: &mut Frame, app: &App) {
     match app.active_view {
         ActiveView::Filesystem => render_filesystem_view(f, app, chunks[1]),
         ActiveView::GhostInspector => render_ghost_inspector(f, app, chunks[1]),
+        ActiveView::TopFiles => render_top_files(f, app, chunks[1]),
         ActiveView::ConfirmModal => {
             // Render underlying view then overlay modal
             if app.previous_view == ActiveView::GhostInspector {
                 render_ghost_inspector(f, app, chunks[1]);
+            } else if app.previous_view == ActiveView::TopFiles {
+                render_top_files(f, app, chunks[1]);
             } else {
                 render_filesystem_view(f, app, chunks[1]);
             }
@@ -1591,6 +1594,55 @@ fn render_deleted_open_summary(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(Paragraph::new(line).block(block), area);
 }
 
+fn render_top_files(f: &mut Frame, app: &App, area: Rect) {
+    let header = Row::new(vec!["Rank", "Size", "Safety", "Path"]);
+    let path_budget = area.width.saturating_sub(28) as usize;
+    let rows: Vec<Row> = app
+        .top_files
+        .iter()
+        .enumerate()
+        .map(|(index, top)| {
+            let size = if app.apparent_size {
+                format_size(top.size)
+            } else {
+                format_size(top.disk_usage)
+            };
+            Row::new(vec![
+                format!("{:>4}", index + 1),
+                size,
+                top.safety.badge().to_string(),
+                truncate_path(&top.path.to_string_lossy(), path_budget.max(8)),
+            ])
+        })
+        .collect();
+    let widths = [
+        Constraint::Length(6),
+        Constraint::Length(12),
+        Constraint::Length(9),
+        Constraint::Min(10),
+    ];
+    let table = Table::new(rows, widths)
+        .header(header)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(Color::LightCyan))
+                .title(
+                    " 🏆 Top 50 Largest Files (Enter: jump │ t: trash │ d: delete │ Esc: back) ",
+                ),
+        )
+        .row_highlight_style(
+            Style::default()
+                .bg(Color::DarkGray)
+                .add_modifier(Modifier::BOLD),
+        )
+        .highlight_symbol("▶ ");
+    let mut state = ratatui::widgets::TableState::default();
+    state.select(Some(app.top_cursor));
+    f.render_stateful_widget(table, area, &mut state);
+}
+
 fn render_confirm_modal(f: &mut Frame, app: &App, screen: Rect) {
     let action = match &app.pending_action {
         Some(a) => a,
@@ -1947,6 +1999,7 @@ fn render_help_modal(f: &mut Frame, screen: Rect) {
             Line::from("  Home / End   Top / Bottom"),
             Line::from(""),
             Line::from("  i            Item & Disk info"),
+            Line::from("  T            Top 50 largest files"),
             Line::from("  ! / o / y    Shell here / Open / Copy path"),
             Line::from("  s            Cycle sort order"),
             Line::from("  A            Toggle Apparent size"),
@@ -2398,6 +2451,33 @@ fn render_footer(f: &mut Frame, app: &App, area: Rect) {
                     ("[K] Kill", Color::Black, Color::Red),
                     ("[r] Ref", Color::Black, Color::Green),
                     ("[q] Back", Color::White, Color::DarkGray),
+                ]
+            };
+            let mut spans = Vec::new();
+            for (idx, (label, fg, bg)) in candidate_keys.into_iter().enumerate() {
+                if idx > 0 {
+                    spans.push(Span::raw(" "));
+                }
+                spans.push(Span::styled(
+                    format!(" {} ", label),
+                    Style::default().fg(fg).bg(bg),
+                ));
+            }
+            spans
+        }
+        ActiveView::TopFiles => {
+            let candidate_keys: Vec<(&str, Color, Color)> = if area.width >= 80 {
+                vec![
+                    ("[Enter] Jump to file", Color::Black, Color::LightCyan),
+                    ("[t] Trash", Color::Black, Color::Yellow),
+                    ("[d] Delete", Color::Black, Color::Red),
+                    ("[Esc] Back", Color::White, Color::DarkGray),
+                ]
+            } else {
+                vec![
+                    ("[Enter] Jump", Color::Black, Color::LightCyan),
+                    ("[t/d] Act", Color::Black, Color::Yellow),
+                    ("[Esc] Back", Color::White, Color::DarkGray),
                 ]
             };
             let mut spans = Vec::new();

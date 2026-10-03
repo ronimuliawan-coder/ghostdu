@@ -16,9 +16,21 @@ use std::path::{Path, PathBuf};
 pub enum ActiveView {
     Filesystem,
     GhostInspector,
+    TopFiles,
     HelpModal,
     ConfirmModal,
     ItemInfoModal,
+}
+
+/// One ranked row of the Top-50 leaderboard. Snapshot data for display; the
+/// destructive actions re-verify the live target before touching disk.
+#[derive(Debug, Clone)]
+pub struct TopFile {
+    pub path: PathBuf,
+    pub name: String,
+    pub size: u64,
+    pub disk_usage: u64,
+    pub safety: DeleteSafety,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -113,6 +125,8 @@ pub struct App {
     pub deleted_open_files: Vec<DeletedOpenFile>,
     pub ghost_tab_index: usize, // 0 = Docker, 1 = Deleted-Open Files
     pub ghost_cursor_index: usize,
+    pub top_files: Vec<TopFile>,
+    pub top_cursor: usize,
     pub ghost_docker_scroll_offset: Cell<usize>,
     pub ghost_deleted_scroll_offset: Cell<usize>,
 
@@ -155,6 +169,8 @@ impl App {
             deleted_open_files,
             ghost_tab_index: 0,
             ghost_cursor_index: 0,
+            top_files: Vec::new(),
+            top_cursor: 0,
             ghost_docker_scroll_offset: Cell::new(0),
             ghost_deleted_scroll_offset: Cell::new(0),
             fs_info,
@@ -714,30 +730,7 @@ impl App {
             self.set_status("No item selected to move to wastebin");
             return;
         }
-
-        let mut has_system = false;
-        let mut has_recheck = false;
-        for path in &targets {
-            let ghost = classify_path(path);
-            let safety = classify_safety(path, ghost);
-            if safety == DeleteSafety::System {
-                has_system = true;
-            } else if safety == DeleteSafety::Recheck {
-                has_recheck = true;
-            }
-        }
-
-        if !has_system && !self.capture_confirmation(&targets) {
-            return;
-        }
-        self.action_targets = targets;
-        self.action_total_size = total_size;
-        self.action_has_system = has_system;
-        self.action_has_recheck = has_recheck;
-        self.action_safety_blocked = has_system;
-        self.pending_action = Some(ConfirmAction::MoveToTrash);
-        self.previous_view = self.active_view;
-        self.active_view = ActiveView::ConfirmModal;
+        self.open_action_confirm(targets, total_size, ConfirmAction::MoveToTrash);
     }
 
     /// Prepare Permanent Deletion confirmation
@@ -761,7 +754,16 @@ impl App {
             self.set_status("No item selected to permanently delete");
             return;
         }
+        self.open_action_confirm(targets, total_size, ConfirmAction::PermanentDelete);
+    }
 
+    /// Shared confirmation gate: system check, identity capture, modal setup.
+    fn open_action_confirm(
+        &mut self,
+        targets: Vec<PathBuf>,
+        total_size: u64,
+        action: ConfirmAction,
+    ) {
         let mut has_system = false;
         let mut has_recheck = false;
         for path in &targets {
@@ -782,9 +784,85 @@ impl App {
         self.action_has_system = has_system;
         self.action_has_recheck = has_recheck;
         self.action_safety_blocked = has_system;
-        self.pending_action = Some(ConfirmAction::PermanentDelete);
+        self.pending_action = Some(action);
         self.previous_view = self.active_view;
         self.active_view = ActiveView::ConfirmModal;
+    }
+
+    /// Rank the largest files across the scanned tree (files only, no symlinks).
+    fn rank_top_files(root: &FileEntry) -> Vec<TopFile> {
+        fn collect(entry: &FileEntry, out: &mut Vec<TopFile>) {
+            if !entry.is_dir && !entry.is_symlink {
+                out.push(TopFile {
+                    path: entry.path.clone(),
+                    name: entry.name.clone(),
+                    size: entry.size,
+                    disk_usage: entry.disk_usage,
+                    safety: entry.delete_safety,
+                });
+            }
+            for child in &entry.children {
+                collect(child, out);
+            }
+        }
+        let mut files = Vec::new();
+        collect(root, &mut files);
+        files.sort_by_key(|f| std::cmp::Reverse(f.disk_usage));
+        files.truncate(50);
+        files
+    }
+
+    /// Open the Top-50 leaderboard, ranked on demand from the live tree.
+    pub fn open_top_files(&mut self) {
+        let files = Self::rank_top_files(&self.root_entry);
+        if files.is_empty() {
+            self.set_status("No files in the scanned tree");
+            return;
+        }
+        self.top_files = files;
+        self.top_cursor = 0;
+        self.previous_view = self.active_view;
+        self.active_view = ActiveView::TopFiles;
+    }
+
+    /// Jump from the leaderboard to the file's parent in the explorer.
+    pub fn jump_to_top_file(&mut self) -> bool {
+        let target = match self.top_files.get(self.top_cursor) {
+            Some(top) => top.path.clone(),
+            None => return false,
+        };
+        let parent = target
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| self.root_entry.path.clone());
+        if !self.navigate_to_path(&parent) {
+            return false;
+        }
+        self.active_view = ActiveView::Filesystem;
+        let visible = self.visible_children();
+        if let Some(index) = visible.iter().position(|e| e.path == target) {
+            self.cursor_index = index;
+        }
+        true
+    }
+
+    /// Trash or delete the highlighted leaderboard row through the standard
+    /// confirmation flow (live identity re-verified before any mutation).
+    pub fn top_file_action(&mut self, to_trash: bool) {
+        let Some(top) = self.top_files.get(self.top_cursor).cloned() else {
+            return;
+        };
+        let total = if self.apparent_size {
+            top.size
+        } else {
+            top.disk_usage
+        };
+        let action = if to_trash {
+            ConfirmAction::MoveToTrash
+        } else {
+            ConfirmAction::PermanentDelete
+        };
+        self.open_action_confirm(vec![top.path], total, action);
     }
 
     /// Prepare Docker Prune confirmation
@@ -963,6 +1041,11 @@ impl App {
         self.action_has_recheck = false;
         self.action_has_system = false;
         self.active_view = self.previous_view;
+        // The leaderboard snapshot predates the mutation; rebuild it in place.
+        if self.active_view == ActiveView::TopFiles {
+            self.top_files = Self::rank_top_files(&self.root_entry);
+            self.top_cursor = self.top_cursor.min(self.top_files.len().saturating_sub(1));
+        }
     }
 
     /// Refresh one subtree after external changes (e.g. subshell exit) using the
@@ -1306,6 +1389,38 @@ mod reconciliation_tests {
     use super::*;
     use std::fs;
     use std::sync::{atomic::AtomicBool, Arc};
+
+    #[test]
+    fn top_files_rank_jump_and_confirm() {
+        let fixture = tempfile::tempdir().unwrap();
+        fs::write(fixture.path().join("small.txt"), "x").unwrap();
+        fs::write(fixture.path().join("big.txt"), vec![0u8; 10000]).unwrap();
+        let sub = fixture.path().join("sub");
+        fs::create_dir(&sub).unwrap();
+        fs::write(sub.join("mid.txt"), vec![0u8; 1000]).unwrap();
+        let root = crate::fs::scanner::scan_directory(
+            fixture.path(),
+            None,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .unwrap();
+        let mut app = App::new(root);
+        app.open_top_files();
+        assert_eq!(app.active_view, ActiveView::TopFiles);
+        assert_eq!(app.top_files.len(), 3);
+        assert_eq!(app.top_files[0].name, "big.txt");
+        // Jump lands the explorer cursor on the file's parent entry.
+        app.top_cursor = 1;
+        assert!(app.jump_to_top_file());
+        assert_eq!(app.active_view, ActiveView::Filesystem);
+        let visible = app.visible_children();
+        assert_eq!(visible[app.cursor_index].name, "mid.txt");
+        // Direct action opens the standard confirmation for the row.
+        app.open_top_files();
+        app.top_file_action(true);
+        assert_eq!(app.active_view, ActiveView::ConfirmModal);
+        assert_eq!(app.action_targets.len(), 1);
+    }
 
     #[test]
     fn kill_flow_confirms_then_reports_missing_process() {
