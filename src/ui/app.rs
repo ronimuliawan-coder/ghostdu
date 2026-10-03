@@ -449,23 +449,74 @@ impl App {
                 self.selected_identities.remove(p);
             }
         } else {
+            let requested = paths
+                .iter()
+                .filter(|path| !self.selected_paths.contains(*path))
+                .count();
+            let before = self.selected_paths.len();
             for p in paths {
-                self.select_path(p);
+                if !self.select_path(p) {
+                    let reason = self
+                        .current_status()
+                        .unwrap_or("Selection stopped")
+                        .to_string();
+                    self.set_status(format!(
+                        "Selected {} of {} additional items; {}",
+                        self.selected_paths.len() - before,
+                        requested,
+                        reason
+                    ));
+                    break;
+                }
             }
         }
     }
 
-    fn select_path(&mut self, path: PathBuf) {
+    fn selection_limit(&self) -> std::io::Result<usize> {
+        const MAX_SELECTIONS: usize = 256;
+        let mut limit = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // getrlimit writes a valid rlimit to this live, writable object.
+        if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let soft = usize::try_from(limit.rlim_cur).unwrap_or(usize::MAX);
+        // Leave headroom for traversal, trash destinations, sockets and the UI.
+        let reserve = 64.min(soft / 2).max(1);
+        let open = std::fs::read_dir("/proc/self/fd")?
+            .try_fold(0usize, |count, entry| entry.map(|_| count + 1))?;
+        let available = soft.saturating_sub(open).saturating_sub(reserve);
+        Ok(MAX_SELECTIONS.min(self.selected_identities.len().saturating_add(available)))
+    }
+
+    fn select_path(&mut self, path: PathBuf) -> bool {
         // Do not silently rebind an existing selection to a replacement object.
         if self.selected_paths.contains(&path) {
-            return;
+            return true;
+        }
+        match self.selection_limit() {
+            Ok(limit) if self.selected_identities.len() >= limit => {
+                self.set_status(format!("Selection limit reached ({limit} items); deselect items to leave file handles available"));
+                return false;
+            }
+            Err(error) => {
+                self.set_status(format!("Cannot determine safe selection limit: {error}"));
+                return false;
+            }
+            Ok(_) => {}
         }
         match TargetIdentity::capture(&path) {
             Ok(identity) => {
                 self.selected_identities.insert(path.clone(), identity);
                 self.selected_paths.insert(path);
+                true
             }
-            Err(error) => self.set_status(format!("Cannot select item: {error}")),
+            Err(error) => {
+                self.set_status(format!("Cannot select item: {error}"));
+                false
+            }
         }
     }
 
@@ -904,6 +955,7 @@ impl App {
         fn apply(
             entry: &mut FileEntry,
             updates: &mut HashMap<PathBuf, Option<FileEntry>>,
+            ancestors: &HashSet<PathBuf>,
             visited: &mut usize,
         ) -> bool {
             if updates.is_empty() {
@@ -923,8 +975,8 @@ impl App {
                     } else {
                         return false;
                     }
-                } else {
-                    changed |= apply(child, updates, visited);
+                } else if child.is_dir && ancestors.contains(&child.path) {
+                    changed |= apply(child, updates, ancestors, visited);
                 }
                 true
             });
@@ -933,8 +985,12 @@ impl App {
             }
             changed
         }
+        let ancestors = updates
+            .keys()
+            .flat_map(|path| path.ancestors().skip(1).map(Path::to_path_buf))
+            .collect();
         let mut visited = 0;
-        apply(&mut self.root_entry, &mut updates, &mut visited);
+        apply(&mut self.root_entry, &mut updates, &ancestors, &mut visited);
         // Navigation is restored from its saved path by action callers.
         let mut curr = &self.root_entry;
         let mut valid_depth = 0;
@@ -1043,6 +1099,103 @@ mod reconciliation_tests {
     use super::*;
     use std::fs;
     use std::sync::{atomic::AtomicBool, Arc};
+
+    #[test]
+    fn sparse_and_missing_updates_skip_unrelated_descendants() {
+        let fixture = tempfile::tempdir().unwrap();
+        let unrelated = fixture.path().join("unrelated");
+        let affected = fixture.path().join("affected");
+        fs::create_dir(&unrelated).unwrap();
+        fs::create_dir(&affected).unwrap();
+        for index in 0..512 {
+            fs::write(unrelated.join(format!("file-{index}")), "large").unwrap();
+        }
+        let target = affected.join("target");
+        fs::write(&target, "x").unwrap();
+        let root = crate::fs::scanner::scan_directory(
+            fixture.path(),
+            None,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .unwrap();
+        let mut app = App::new(root);
+        assert_eq!(app.root_entry.children[0].path, unrelated);
+        let visited = app.apply_tree_updates(HashMap::from([(target, None)]));
+        assert_eq!(visited, 3); // root, affected directory, direct target
+        let visited = app.apply_tree_updates(HashMap::from([(affected.join("missing"), None)]));
+        assert_eq!(visited, 2); // root and affected; unrelated children never visited
+        assert_eq!(app.root_entry.children[0].children.len(), 512);
+    }
+
+    #[test]
+    fn selections_leave_descriptor_headroom_and_report_partial_batches() {
+        const CHILD_LIMIT: &str = "GHOSTDU_SELECTION_LIMIT_CHILD";
+        if let Ok(value) = std::env::var(CHILD_LIMIT) {
+            let fixture = tempfile::tempdir().unwrap();
+            for index in 0..300 {
+                fs::write(fixture.path().join(format!("file-{index}")), "x").unwrap();
+            }
+            let root = crate::fs::scanner::scan_directory(
+                fixture.path(),
+                None,
+                Arc::new(AtomicBool::new(false)),
+            )
+            .unwrap();
+            let mut app = App::new(root);
+            let mut limit = libc::rlimit {
+                rlim_cur: 0,
+                rlim_max: 0,
+            };
+            // This test branch is a disposable subprocess; it never alters the suite's limit.
+            assert_eq!(
+                unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) },
+                0
+            );
+            limit.rlim_cur = value.parse::<libc::rlim_t>().unwrap().min(limit.rlim_max);
+            assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) }, 0);
+            let expected = app.selection_limit().unwrap();
+            assert!(expected > 0 && expected <= 256);
+            app.select_all_visible();
+            assert_eq!(app.selected_paths.len(), expected);
+            assert!(app
+                .current_status()
+                .unwrap()
+                .contains(&format!("Selected {expected} of 300")));
+            assert!(app
+                .current_status()
+                .unwrap()
+                .contains("Selection limit reached"));
+            // Leave usable capacity for operations after the cap is reached.
+            let extra: Vec<_> = (0..16)
+                .map(|_| fs::File::open("/dev/null").unwrap())
+                .collect();
+            drop(extra);
+            let selected = app.selected_paths.iter().next().unwrap().clone();
+            app.search_query = selected.file_name().unwrap().to_string_lossy().into_owned();
+            // Find the exact selected row even if the search also matches a longer name.
+            app.cursor_index = app
+                .visible_children()
+                .iter()
+                .position(|entry| entry.path == selected)
+                .unwrap();
+            app.toggle_selection();
+            assert_eq!(app.selected_paths.len(), expected - 1);
+            assert!(app.select_path(selected));
+            assert_eq!(app.selected_paths.len(), expected);
+            return;
+        }
+        for limit in ["96", "1024"] {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "ui::app::reconciliation_tests::selections_leave_descriptor_headroom_and_report_partial_batches"])
+                .env(CHILD_LIMIT, limit).output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
 
     #[test]
     fn bulk_tree_updates_visit_each_cached_node_at_most_once() {

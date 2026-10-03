@@ -1,4 +1,4 @@
-use super::delete::{inspect_tree, prepare_target, verify_identity};
+use super::delete::{prepare_target, verify_identity};
 use rustix::fs::{
     mkdirat, openat2, renameat_with, unlinkat, AtFlags, Mode, OFlags, RenameFlags, ResolveFlags,
     CWD,
@@ -51,7 +51,7 @@ fn trash_with_destination<P: AsRef<Path>>(
         let moved: io::Result<()> = (|| {
             let (parent, name, target) = prepare_target(path)?;
             verify(path, &target)?;
-            inspect_tree(&target)?;
+            check_trash_mounts(&target)?;
             let original = fd_path(&parent)?.join(OsStr::from_bytes(name.to_bytes()));
             let uncached;
             let destination = if let Some(mount) = mount_id(&parent)? {
@@ -87,6 +87,23 @@ fn trash_with_destination<P: AsRef<Path>>(
         }
     }
     result
+}
+
+/// A rename does not visit descendants. Check mount topology rather than opening
+/// the whole subtree; final target/mount resolution is still pinned by prepare_target.
+fn check_trash_mounts(target: &File) -> io::Result<()> {
+    if !target.metadata()?.is_dir() {
+        return Ok(());
+    }
+    let path = fd_path(target)?;
+    let topology = fs::read("/proc/self/mountinfo")?;
+    if crate::fs::scanner::parse_mount_points(&topology)
+        .iter()
+        .any(|mount| mount.starts_with(&path))
+    {
+        return Err(io::Error::from_raw_os_error(libc::EXDEV));
+    }
+    Ok(())
 }
 
 struct TrashDestination {
@@ -404,6 +421,45 @@ fn move_prepared_with_hook(
 mod tests {
     use super::*;
     use std::os::unix::fs::symlink;
+
+    #[test]
+    fn trash_directory_does_not_open_ordinary_descendants() {
+        use std::io::Read;
+        use std::os::fd::FromRawFd;
+        let fixture = tempfile::tempdir().unwrap();
+        let source = fixture.path().join("source");
+        let nested = source.join("nested");
+        fs::create_dir_all(&nested).unwrap();
+        for index in 0..512 {
+            fs::write(nested.join(format!("file-{index}")), "payload").unwrap();
+        }
+        // Observe actual opens of descendants, without timing-dependent assertions.
+        let fd = unsafe { libc::inotify_init1(libc::IN_NONBLOCK | libc::IN_CLOEXEC) };
+        assert!(fd >= 0);
+        // fd is freshly owned, and the watch path is a valid NUL-terminated string.
+        let mut events = unsafe { File::from_raw_fd(fd) };
+        let name = std::ffi::CString::new(nested.as_os_str().as_bytes()).unwrap();
+        assert!(unsafe { libc::inotify_add_watch(fd, name.as_ptr(), libc::IN_OPEN) } >= 0);
+        let result = trash_with_destination(
+            &[&source],
+            |_, _| Ok(()),
+            |parent| Ok((private_directory(parent, Path::new("Trash"))?, None)),
+        );
+        assert!(result.failed.is_empty(), "{:?}", result.failed);
+        assert_eq!(result.succeeded.len(), 1);
+        let mut buffer = [0u8; 4096];
+        assert_eq!(
+            events.read(&mut buffer).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        let stored = fs::read_dir(fixture.path().join("Trash/files"))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        assert_eq!(fs::read_dir(stored.join("nested")).unwrap().count(), 512);
+    }
 
     #[test]
     fn batch_reuses_destination_and_continues_after_independent_failure() {
