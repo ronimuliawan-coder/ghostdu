@@ -1957,7 +1957,7 @@ fn render_confirm_modal(f: &mut Frame, app: &App, screen: Rect) {
 
                 (title, border_color, prompt, infos)
             }
-            ConfirmAction::KillProcess { pid, name } => {
+            ConfirmAction::KillProcess { pid, name, .. } => {
                 let title = " ☠️  TERMINATE PROCESS (GHOST FILE) ";
                 let border_color = Color::Red;
 

@@ -223,12 +223,38 @@ pub fn classify_path(path: &Path) -> GhostKind {
         return GhostKind::BuildCache;
     }
 
-    // 15. Fallback for general ~/.cache folders
-    if path_str.contains("/.cache/") || file_name == ".cache" {
+    // 15. Recognised cache units inside generic containers. An ancestor `.cache`
+    // alone must not mark arbitrary contents as cache: only well-known units
+    // (plus the specific rules above) classify, so personal files under an
+    // innocent-looking cache path stay UserData.
+    if is_recognized_cache_unit(path) {
         return GhostKind::BuildCache;
     }
 
     GhostKind::None
+}
+
+/// Well-known cache directory names. Compared per path segment (byte-exact, so
+/// non-UTF-8 segments never match) rather than by substring.
+const RECOGNIZED_CACHE_UNITS: [&str; 10] = [
+    "thumbnails",
+    "fontconfig",
+    "mesa_shader_cache",
+    "pip",
+    "uv",
+    "npm",
+    "yarn",
+    "pnpm",
+    "cargo",
+    "mozilla",
+];
+
+fn is_recognized_cache_unit(path: &Path) -> bool {
+    path.components().any(|comp| {
+        RECOGNIZED_CACHE_UNITS
+            .iter()
+            .any(|unit| comp.as_os_str().as_encoded_bytes() == unit.as_bytes())
+    })
 }
 
 /// Classifies a path and its ghost kind into a Deletion Safety Tier:
@@ -546,6 +572,19 @@ mod tests {
         assert_eq!(
             classify_path(&PathBuf::from("/home/ron/.cache/thumbnails")),
             GhostKind::BuildCache
+        );
+        // An ancestor `.cache` alone must not bless arbitrary contents.
+        assert_eq!(
+            classify_path(&PathBuf::from("/home/alice/.cache/personal")),
+            GhostKind::None
+        );
+        assert_eq!(
+            classify_path(&PathBuf::from("/home/alice/.cache/personal/notes.txt")),
+            GhostKind::None
+        );
+        assert_eq!(
+            classify_path(&PathBuf::from("/home/ron/.cache")),
+            GhostKind::None
         );
         assert_eq!(
             classify_path(&PathBuf::from("/home/ron/documents/photo.jpg")),
