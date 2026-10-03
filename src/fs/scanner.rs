@@ -94,21 +94,23 @@ pub fn scan_directory_with_options(
     let bytes_counter = Arc::new(AtomicU64::new(0));
     let last_progress = Arc::new(Mutex::new(Instant::now()));
 
-    scan_dir_recursive(
-        &canonical,
-        &mut root_entry,
-        root_dev,
-        &options,
-        0,
-        &mount_points,
-        &mut seen_inodes,
-        &progress_tx,
-        &stop_signal,
-        &files_counter,
-        &bytes_counter,
-        &last_progress,
-    );
-
+    // A zero depth budget lists the root alone; children would exceed it.
+    if options.max_depth != Some(0) {
+        scan_dir_recursive(
+            &canonical,
+            &mut root_entry,
+            root_dev,
+            &options,
+            0,
+            &mount_points,
+            &mut seen_inodes,
+            &progress_tx,
+            &stop_signal,
+            &files_counter,
+            &bytes_counter,
+            &last_progress,
+        );
+    }
     // Sort root children descending by disk usage
     root_entry
         .children
@@ -361,10 +363,14 @@ fn file_entry(
 
 /// Refresh one failed target without reading sibling subtrees. Preserve the original
 /// scan's mount boundary and seed hard-link accounting from the retained tree.
+/// `base_depth` is the target's level below the original scan root, so the shared
+/// depth budget keeps applying; exclusions filter rediscoved descendants.
 pub(crate) fn rescan_entry(
     path: &Path,
     root_dev: u64,
     seen_inodes: &mut HashSet<(u64, u64)>,
+    options: &ScannerOptions,
+    base_depth: usize,
 ) -> std::io::Result<FileEntry> {
     let meta = fs::symlink_metadata(path)?;
     if !meta.is_dir() {
@@ -385,15 +391,17 @@ pub(crate) fn rescan_entry(
     let mounts = parse_mount_points(&fs::read("/proc/self/mountinfo")?);
     if meta.dev() == root_dev
         && !mounts.contains(path)
+        && options.max_depth.is_none_or(|max| base_depth < max)
         && seen_inodes.insert((meta.dev(), meta.ino()))
     {
         scan_dir_recursive(
             path,
             &mut entry,
             root_dev,
-            // Targeted refresh of an already-scanned path: excludes cannot match it.
-            &ScannerOptions::default(),
-            0,
+            // Targeted refresh of an already-scanned path: the target itself
+            // was scanned, so only its rediscoved descendants are filtered.
+            options,
+            base_depth,
             &mounts,
             seen_inodes,
             &None,

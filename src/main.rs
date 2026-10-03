@@ -57,7 +57,7 @@ struct Cli {
     #[arg(long, value_name = "PATTERN")]
     exclude: Vec<String>,
 
-    /// Limit scan descent to N levels (1 = top level only)
+    /// Limit scan descent to N levels (1 = top level only, 0 = root only)
     #[arg(long, value_name = "N")]
     depth: Option<usize>,
 
@@ -366,11 +366,30 @@ fn export_scan(
     scan_options: &ScannerOptions,
     export_file: &PathBuf,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    use std::io::{BufWriter, Write};
+    use std::os::unix::fs::OpenOptionsExt;
+
     let stop_signal = Arc::new(AtomicBool::new(false));
     let root_entry =
         scan_directory_with_options(&target_path, None, stop_signal, scan_options.clone())?;
-    let json = serde_json::to_string_pretty(&root_entry)?;
-    std::fs::write(export_file, json)?;
+    // Stage through a private temp file and rename: a failed export never leaves
+    // a truncated destination, and the listing is never world-readable mid-write.
+    let mut temp = export_file.clone().into_os_string();
+    temp.push(format!(".tmp-{}", std::process::id()));
+    let temp_path = PathBuf::from(temp);
+    {
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&temp_path)?;
+        let mut writer = BufWriter::new(file);
+        // Stream serialization instead of buffering the whole JSON string.
+        serde_json::to_writer_pretty(&mut writer, &root_entry)?;
+        writer.flush()?;
+    }
+    std::fs::rename(&temp_path, export_file)?;
     println!(
         "Exported {} ({} apparent) to {}",
         format_count(root_entry.items_count),
