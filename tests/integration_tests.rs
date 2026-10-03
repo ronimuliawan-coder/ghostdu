@@ -746,6 +746,37 @@ fn test_scan_excludes_and_depth_cap() {
     .unwrap();
     let deep_entry = shallow.children.iter().find(|e| e.name == "deep").unwrap();
     assert!(deep_entry.children.is_empty());
+
+    let stop_signal = Arc::new(AtomicBool::new(false));
+    let root_only = ghostdu_scanner::scan_directory_with_options(
+        base,
+        None,
+        stop_signal,
+        ghostdu_scanner::ScannerOptions {
+            max_depth: Some(0),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert!(root_only.children.is_empty());
+}
+
+#[test]
+#[cfg(unix)]
+fn test_export_supports_non_utf8_names() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+
+    let temp_dir = tempfile::tempdir().expect("create temp dir");
+    let raw = [b'n', b'a', 0xFF, b'm', b'e'];
+    let name = OsStr::from_bytes(&raw);
+    fs::write(temp_dir.path().join(name), "x").unwrap();
+
+    let stop_signal = Arc::new(AtomicBool::new(false));
+    let root = ghostdu_scanner::scan_directory(temp_dir.path(), None, stop_signal).unwrap();
+    // Serde's PathBuf serializer rejects non-UTF-8; the export path must not.
+    let json = serde_json::to_string_pretty(&root).unwrap();
+    assert!(json.contains("name"));
 }
 
 #[test]

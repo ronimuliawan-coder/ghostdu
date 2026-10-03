@@ -971,7 +971,19 @@ impl App {
         let mut reconciled = true;
         let mut updates = HashMap::new();
         for path in roots {
-            match crate::fs::scanner::rescan_entry(&path, self.root_entry.dev, &mut seen) {
+            // Depth relative to the scan root keeps the original budget;
+            // unknown layouts fall back to full depth (previous behavior).
+            let base_depth = path
+                .strip_prefix(&self.root_entry.path)
+                .map(|p| p.components().count())
+                .unwrap_or(0);
+            match crate::fs::scanner::rescan_entry(
+                &path,
+                self.root_entry.dev,
+                &mut seen,
+                &self.scan_options,
+                base_depth,
+            ) {
                 Ok(entry) => {
                     reconciled &= !has_errors(&entry);
                     updates.insert(path, Some(entry));
@@ -1113,11 +1125,22 @@ impl App {
                 self.root_entry = new_root;
             }
         } else {
+            // A subtree refresh restarts traversal at the current directory, so
+            // shrink the depth budget by its level below the scan root. A zero
+            // remainder rescans the directory alone (see ScannerOptions).
+            let mut options = self.scan_options.clone();
+            if let Some(max) = options.max_depth {
+                let depth = current_path
+                    .strip_prefix(&self.root_entry.path)
+                    .map(|p| p.components().count())
+                    .unwrap_or(0);
+                options.max_depth = Some(max.saturating_sub(depth));
+            }
             if let Ok(new_subtree) = crate::fs::scanner::scan_directory_with_options(
                 &current_path,
                 None,
                 stop_signal,
-                self.scan_options.clone(),
+                options,
             ) {
                 self.replace_subtree(&current_path, new_subtree);
             }
