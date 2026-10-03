@@ -9,7 +9,7 @@ use crate::ops::delete::permanently_delete_confirmed;
 use crate::ops::trash::move_to_trash_confirmed;
 use crate::ops::{TargetIdentities, TargetIdentity};
 use std::cell::Cell;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -22,6 +22,9 @@ pub enum ActiveView {
     ConfirmModal,
     ItemInfoModal,
 }
+
+/// Leaderboard size; the ranking heap never holds more entries.
+const TOP_FILES_LIMIT: usize = 50;
 
 /// One ranked row of the Top-50 leaderboard. Snapshot data for display; the
 /// destructive actions re-verify the live target before touching disk.
@@ -115,7 +118,7 @@ impl SortMode {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug)]
 pub enum ConfirmAction {
     MoveToTrash,
     PermanentDelete,
@@ -124,6 +127,10 @@ pub enum ConfirmAction {
         pid: u32,
         name: String,
         start_time: u64,
+        /// Pinned handle to the confirmed instance. Signals go through it, so
+        /// PID reuse cannot redirect them. `None` where the kernel predates
+        /// pidfd (fallback: start-time recheck before `kill`).
+        pidfd: Option<rustix::fd::OwnedFd>,
     },
 }
 
@@ -834,9 +841,29 @@ impl App {
     }
 
     /// Rank the largest files across the scanned tree (files only, no symlinks).
+    /// Bounded heap keeps O(50) entries: keys only in pass one, full rows for
+    /// winners in pass two. No per-file allocation beyond the traversal itself.
     fn rank_top_files(root: &FileEntry) -> Vec<TopFile> {
-        fn collect(entry: &FileEntry, out: &mut Vec<TopFile>) {
+        fn collect_keys(
+            entry: &FileEntry,
+            heap: &mut BinaryHeap<std::cmp::Reverse<(u64, u64, u64)>>,
+        ) {
             if !entry.is_dir && !entry.is_symlink {
+                heap.push(std::cmp::Reverse((entry.disk_usage, entry.dev, entry.ino)));
+                if heap.len() > TOP_FILES_LIMIT {
+                    heap.pop();
+                }
+            }
+            for child in &entry.children {
+                collect_keys(child, heap);
+            }
+        }
+        fn collect_winners(
+            entry: &FileEntry,
+            winners: &HashSet<(u64, u64)>,
+            out: &mut Vec<TopFile>,
+        ) {
+            if !entry.is_dir && !entry.is_symlink && winners.contains(&(entry.dev, entry.ino)) {
                 out.push(TopFile {
                     path: entry.path.clone(),
                     name: entry.name.clone(),
@@ -846,13 +873,18 @@ impl App {
                 });
             }
             for child in &entry.children {
-                collect(child, out);
+                collect_winners(child, winners, out);
             }
         }
-        let mut files = Vec::new();
-        collect(root, &mut files);
+        let mut heap = BinaryHeap::new();
+        collect_keys(root, &mut heap);
+        let winners: HashSet<(u64, u64)> = heap
+            .into_iter()
+            .map(|std::cmp::Reverse((_, dev, ino))| (dev, ino))
+            .collect();
+        let mut files = Vec::with_capacity(winners.len().min(TOP_FILES_LIMIT));
+        collect_winners(root, &winners, &mut files);
         files.sort_by_key(|f| std::cmp::Reverse(f.disk_usage));
-        files.truncate(50);
         files
     }
 
@@ -908,22 +940,33 @@ impl App {
             .sum()
     }
 
-    /// Resolve a flat cursor position to (category, item). `None` = header row.
-    pub fn janitor_row_at(&self, cursor: usize) -> Option<(usize, Option<usize>)> {
+    /// Flat start index of each category header; O(categories).
+    pub(crate) fn janitor_offsets(&self) -> Vec<usize> {
+        let mut offsets = Vec::with_capacity(self.janitor_cats.len());
         let mut index = 0;
-        for (cat_idx, cat) in self.janitor_cats.iter().enumerate() {
-            if cursor == index {
-                return Some((cat_idx, None));
-            }
-            index += 1;
-            if cat.expanded {
-                for (item_idx, _) in cat.items.iter().enumerate() {
-                    if cursor == index {
-                        return Some((cat_idx, Some(item_idx)));
-                    }
-                    index += 1;
-                }
-            }
+        for cat in &self.janitor_cats {
+            offsets.push(index);
+            index += 1 + if cat.expanded { cat.items.len() } else { 0 };
+        }
+        offsets
+    }
+
+    /// Resolve a flat cursor position to (category, item). `None` = header row.
+    /// Indexed by category offsets; never scans item rows.
+    pub fn janitor_row_at(&self, cursor: usize) -> Option<(usize, Option<usize>)> {
+        let offsets = self.janitor_offsets();
+        let position = offsets.partition_point(|&start| start <= cursor);
+        if position == 0 {
+            return None;
+        }
+        let cat_idx = position - 1;
+        let cat = &self.janitor_cats[cat_idx];
+        if cursor == offsets[cat_idx] {
+            return Some((cat_idx, None));
+        }
+        let item_idx = cursor - offsets[cat_idx] - 1;
+        if cat.expanded && item_idx < cat.items.len() {
+            return Some((cat_idx, Some(item_idx)));
         }
         None
     }
@@ -1203,10 +1246,16 @@ impl App {
             self.set_status(format!("Process {pid} exited before confirmation"));
             return;
         };
+        // Pin the verified instance; a recycled PID names a different process,
+        // never this handle. Absent on pre-pidfd kernels (fallback below).
+        let pidfd = rustix::process::Pid::from_raw(pid as i32).and_then(|target| {
+            rustix::process::pidfd_open(target, rustix::process::PidfdFlags::empty()).ok()
+        });
         self.pending_action = Some(ConfirmAction::KillProcess {
             pid,
             name,
             start_time,
+            pidfd,
         });
         self.previous_view = self.active_view;
         self.active_view = ActiveView::ConfirmModal;
@@ -1223,25 +1272,43 @@ impl App {
             pid,
             name: _,
             start_time,
+            pidfd,
         }) = confirmed
         else {
             return;
         };
-        if proc_start_time(pid) != Some(start_time) {
-            self.set_status(format!(
-                "Process {pid} changed since confirmation; not signalled"
-            ));
-            return;
-        }
         let signal = if sigterm {
-            libc::SIGTERM
+            rustix::process::Signal::TERM
         } else {
-            libc::SIGKILL
+            rustix::process::Signal::KILL
         };
-        // kill has no preconditions beyond a live PID.
-        if unsafe { libc::kill(pid as i32, signal) } != 0 {
-            let error = std::io::Error::last_os_error();
-            self.set_status(format!("Cannot signal process {pid}: {error}"));
+        // Prefer the pinned handle (immune to PID reuse); without one,
+        // recheck the start time before falling back to `kill`.
+        let result = match pidfd {
+            Some(fd) => rustix::process::pidfd_send_signal(&fd, signal),
+            None => {
+                if proc_start_time(pid) != Some(start_time) {
+                    self.set_status(format!(
+                        "Process {pid} changed since confirmation; not signalled"
+                    ));
+                    return;
+                }
+                match rustix::process::Pid::from_raw(pid as i32) {
+                    Some(target) => rustix::process::kill_process(target, signal),
+                    None => {
+                        self.set_status(format!(
+                            "Process {pid} changed since confirmation; not signalled"
+                        ));
+                        return;
+                    }
+                }
+            }
+        };
+        if let Err(error) = result {
+            self.set_status(format!(
+                "Cannot signal process {pid}: {}",
+                std::io::Error::from(error)
+            ));
             return;
         }
         self.deleted_open_files = crate::ghost::scan_deleted_open_files();
@@ -1856,6 +1923,7 @@ mod reconciliation_tests {
             pid: 1,
             name: "init".to_string(),
             start_time: u64::MAX,
+            pidfd: None,
         });
         app.active_view = ActiveView::ConfirmModal;
         app.execute_kill(true);
@@ -1866,6 +1934,46 @@ mod reconciliation_tests {
             .contains("changed since confirmation"));
         // Sanity: the current process has a readable start time.
         assert!(super::proc_start_time(std::process::id()).is_some());
+    }
+
+    #[test]
+    fn kill_through_pidfd_terminates_only_the_pinned_child() {
+        use std::process::Command;
+        let fixture = tempfile::tempdir().unwrap();
+        let root = crate::fs::scanner::scan_directory(
+            fixture.path(),
+            None,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .unwrap();
+        let mut app = App::new(root);
+        let mut child = Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("sleep must exist for the kill test");
+        let pid = child.id();
+        let start_time = super::proc_start_time(pid).expect("child is alive");
+        let pidfd = rustix::process::Pid::from_raw(pid as i32)
+            .and_then(|target| {
+                rustix::process::pidfd_open(target, rustix::process::PidfdFlags::empty()).ok()
+            })
+            .expect("pidfd must open on this kernel");
+        app.pending_action = Some(ConfirmAction::KillProcess {
+            pid,
+            name: "sleep".to_string(),
+            start_time,
+            pidfd: Some(pidfd),
+        });
+        app.active_view = ActiveView::ConfirmModal;
+        app.execute_kill(true);
+        // SIGTERM ends the child; the confirmation is consumed either way.
+        let exited = child.wait().expect("child reaped");
+        assert!(app.pending_action.is_none());
+        assert!(!exited.success());
+        assert!(app
+            .current_status()
+            .unwrap_or("")
+            .contains("ghost table refreshed"));
     }
 
     #[test]

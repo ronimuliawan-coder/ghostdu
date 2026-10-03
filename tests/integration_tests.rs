@@ -192,20 +192,20 @@ fn test_app_state_and_navigation() {
     // Test confirm modals
     app.prompt_move_to_trash();
     assert_eq!(app.active_view, ghostdu::ui::ActiveView::ConfirmModal);
-    assert_eq!(
+    assert!(matches!(
         app.pending_action,
         Some(ghostdu::ui::ConfirmAction::MoveToTrash)
-    );
+    ));
     app.cancel_modal();
     assert_eq!(app.active_view, ghostdu::ui::ActiveView::Filesystem);
-    assert_eq!(app.pending_action, None);
+    assert!(app.pending_action.is_none());
 
     app.prompt_permanent_delete();
     assert_eq!(app.active_view, ghostdu::ui::ActiveView::ConfirmModal);
-    assert_eq!(
+    assert!(matches!(
         app.pending_action,
         Some(ghostdu::ui::ConfirmAction::PermanentDelete)
-    );
+    ));
     app.cancel_modal();
     assert_eq!(app.active_view, ghostdu::ui::ActiveView::Filesystem);
 
@@ -510,7 +510,7 @@ fn test_system_deletion_guardrail() {
 
     // Attempting execution must NOT delete anything and must disarm
     app.execute_pending_action();
-    assert_eq!(app.pending_action, None);
+    assert!(app.pending_action.is_none());
     assert!(app.status_message.as_ref().unwrap().0.contains("BLOCKED"));
 
     // Verify /etc is obviously still there

@@ -1661,7 +1661,12 @@ fn render_janitor(f: &mut Frame, app: &App, area: Rect) {
     let start = compute_scroll_window(app.janitor_cursor, app.janitor_offset.get(), page, total);
     app.janitor_offset.set(start);
     let mut rows: Vec<Row> = Vec::new();
-    let mut flat = 0usize;
+    // Start at the indexed category containing the window; stop once filled.
+    let offsets = app.janitor_offsets();
+    let first_cat = offsets
+        .partition_point(|&index| index <= start)
+        .saturating_sub(1);
+    let mut flat = offsets.get(first_cat).copied().unwrap_or(0);
     // Windowed push: only visible rows are constructed (O(page) per redraw).
     macro_rules! push_row {
         ($row:expr) => {
@@ -1671,7 +1676,10 @@ fn render_janitor(f: &mut Frame, app: &App, area: Rect) {
             flat += 1;
         };
     }
-    for cat in &app.janitor_cats {
+    for cat in app.janitor_cats.iter().skip(first_cat) {
+        if rows.len() >= page {
+            break;
+        }
         let marker = if cat.items.is_empty() {
             "  "
         } else if cat.expanded {
@@ -1690,6 +1698,9 @@ fn render_janitor(f: &mut Frame, app: &App, area: Rect) {
         ]));
         if cat.expanded {
             for item in &cat.items {
+                if rows.len() >= page {
+                    break;
+                }
                 let checkbox = if item.selected { "[x]" } else { "[ ]" };
                 push_row!(Row::new(vec![
                     checkbox.to_string(),

@@ -250,17 +250,22 @@ const RECOGNIZED_CACHE_UNITS: [&str; 10] = [
 ];
 
 fn is_recognized_cache_unit(path: &Path) -> bool {
+    // Units count only directly beneath `.cache`: deeper nesting such as
+    // `.cache/personal/pip` is a personal path that happens to contain a
+    // cache-like name, not a cache.
     let mut under_cache = false;
-    path.components().any(|comp| {
-        if comp.as_os_str().as_encoded_bytes() == b".cache" {
-            under_cache = true;
-            return false;
-        }
-        under_cache
-            && RECOGNIZED_CACHE_UNITS
+    for comp in path.components() {
+        let bytes = comp.as_os_str().as_encoded_bytes();
+        if under_cache {
+            return RECOGNIZED_CACHE_UNITS
                 .iter()
-                .any(|unit| comp.as_os_str().as_encoded_bytes() == unit.as_bytes())
-    })
+                .any(|unit| bytes == unit.as_bytes());
+        }
+        if bytes == b".cache" {
+            under_cache = true;
+        }
+    }
+    false
 }
 
 /// Classifies a path and its ghost kind into a Deletion Safety Tier:
@@ -600,6 +605,11 @@ mod tests {
         assert_eq!(
             classify_path(&PathBuf::from("/home/ron/.cache/pip/cache.dat")),
             GhostKind::BuildCache
+        );
+        // Units nested below an unrecognized directory are not caches.
+        assert_eq!(
+            classify_path(&PathBuf::from("/home/alice/.cache/personal/pip/notes.txt")),
+            GhostKind::None
         );
         assert_eq!(
             classify_path(&PathBuf::from("/home/ron/.cache")),
