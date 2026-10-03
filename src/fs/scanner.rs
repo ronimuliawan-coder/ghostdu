@@ -383,7 +383,7 @@ pub(crate) fn rescan_entry(
 }
 
 // Mountinfo escapes whitespace and backslashes as octal bytes. Preserve non-UTF-8 paths.
-fn parse_mount_points(mountinfo: &[u8]) -> HashSet<PathBuf> {
+pub(crate) fn parse_mount_points(mountinfo: &[u8]) -> HashSet<PathBuf> {
     mountinfo
         .split(|&b| b == b'\n')
         .filter_map(|line| line.split(|&b| b == b' ').nth(4))
