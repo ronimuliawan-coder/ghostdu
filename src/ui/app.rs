@@ -1,4 +1,4 @@
-use crate::fs::entry::{DeleteSafety, FileEntry};
+use crate::fs::entry::{DeleteSafety, FileEntry, GhostKind};
 use crate::fs::mount_info::{get_detailed_item_info, query_fs_info, DetailedItemInfo, FsMountInfo};
 use crate::fs::scanner::ScannerOptions;
 use crate::ghost::{
@@ -17,6 +17,7 @@ pub enum ActiveView {
     Filesystem,
     GhostInspector,
     TopFiles,
+    Janitor,
     HelpModal,
     ConfirmModal,
     ItemInfoModal,
@@ -31,6 +32,32 @@ pub struct TopFile {
     pub size: u64,
     pub disk_usage: u64,
     pub safety: DeleteSafety,
+}
+
+/// Scope of the Janitor view: the current directory or the whole scan tree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JanitorScope {
+    Current,
+    Global,
+}
+
+/// One toggleable janitor row. A directory unit covers its whole subtree;
+/// grouped loose files share their parent row but only trash the listed files.
+#[derive(Debug, Clone)]
+pub struct JanitorItem {
+    pub display: String,
+    pub targets: Vec<PathBuf>,
+    pub size: u64,
+    /// Trash contents cannot be trashed again; only permanent delete applies.
+    pub trash_only_delete: bool,
+    pub selected: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct JanitorCategory {
+    pub title: &'static str,
+    pub items: Vec<JanitorItem>,
+    pub expanded: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -127,6 +154,9 @@ pub struct App {
     pub ghost_cursor_index: usize,
     pub top_files: Vec<TopFile>,
     pub top_cursor: usize,
+    pub janitor_cats: Vec<JanitorCategory>,
+    pub janitor_cursor: usize,
+    pub janitor_scope: JanitorScope,
     pub ghost_docker_scroll_offset: Cell<usize>,
     pub ghost_deleted_scroll_offset: Cell<usize>,
 
@@ -171,6 +201,9 @@ impl App {
             ghost_cursor_index: 0,
             top_files: Vec::new(),
             top_cursor: 0,
+            janitor_cats: Vec::new(),
+            janitor_cursor: 0,
+            janitor_scope: JanitorScope::Global,
             ghost_docker_scroll_offset: Cell::new(0),
             ghost_deleted_scroll_offset: Cell::new(0),
             fs_info,
@@ -812,6 +845,147 @@ impl App {
         files
     }
 
+    /// Open the Janitor. Defaults to the current folder when navigating below
+    /// the scan root, otherwise the whole tree.
+    pub fn open_janitor(&mut self) {
+        self.janitor_scope = if self.path_stack.is_empty() {
+            JanitorScope::Global
+        } else {
+            JanitorScope::Current
+        };
+        self.rebuild_janitor();
+        self.janitor_cursor = 0;
+        self.previous_view = self.active_view;
+        self.active_view = ActiveView::Janitor;
+    }
+
+    fn janitor_scope_root(&self) -> &FileEntry {
+        match self.janitor_scope {
+            JanitorScope::Global => &self.root_entry,
+            JanitorScope::Current => self.current_dir_entry(),
+        }
+    }
+
+    fn rebuild_janitor(&mut self) {
+        // Clone the scope to end the borrow before storing the new rows.
+        let scope = self.janitor_scope_root().clone();
+        self.janitor_cats = Self::collect_janitor(&scope);
+        self.janitor_cursor = self.janitor_cursor.min(self.janitor_row_count().max(1) - 1);
+    }
+
+    /// Flat row count (category headers plus expanded items).
+    pub fn janitor_row_count(&self) -> usize {
+        self.janitor_cats
+            .iter()
+            .map(|cat| 1 + if cat.expanded { cat.items.len() } else { 0 })
+            .sum()
+    }
+
+    /// Resolve a flat cursor position to (category, item). `None` = header row.
+    pub fn janitor_row_at(&self, cursor: usize) -> Option<(usize, Option<usize>)> {
+        let mut index = 0;
+        for (cat_idx, cat) in self.janitor_cats.iter().enumerate() {
+            if cursor == index {
+                return Some((cat_idx, None));
+            }
+            index += 1;
+            if cat.expanded {
+                for (item_idx, _) in cat.items.iter().enumerate() {
+                    if cursor == index {
+                        return Some((cat_idx, Some(item_idx)));
+                    }
+                    index += 1;
+                }
+            }
+        }
+        None
+    }
+
+    /// Toggle scope between the current folder and the whole tree.
+    pub fn toggle_janitor_scope(&mut self) {
+        self.janitor_scope = match self.janitor_scope {
+            JanitorScope::Current => JanitorScope::Global,
+            JanitorScope::Global => JanitorScope::Current,
+        };
+        self.rebuild_janitor();
+        self.janitor_cursor = 0;
+        self.set_status(format!(
+            "Janitor scope: {}",
+            match self.janitor_scope {
+                JanitorScope::Current => "current folder",
+                JanitorScope::Global => "whole scan",
+            }
+        ));
+    }
+
+    /// Toggle the row under the janitor cursor: a whole category on headers.
+    pub fn toggle_janitor_row(&mut self) {
+        if let Some((cat_idx, item_idx)) = self.janitor_row_at(self.janitor_cursor) {
+            match item_idx {
+                None => {
+                    let all_on = self.janitor_cats[cat_idx]
+                        .items
+                        .iter()
+                        .all(|item| item.selected);
+                    for item in &mut self.janitor_cats[cat_idx].items {
+                        item.selected = !all_on;
+                    }
+                }
+                Some(item_idx) => {
+                    let selected = self.janitor_cats[cat_idx].items[item_idx].selected;
+                    self.janitor_cats[cat_idx].items[item_idx].selected = !selected;
+                }
+            }
+        }
+    }
+
+    /// Select all janitor rows, or clear when everything is already selected.
+    pub fn toggle_janitor_all(&mut self) {
+        let all_on = self
+            .janitor_cats
+            .iter()
+            .flat_map(|cat| &cat.items)
+            .all(|item| item.selected);
+        for cat in &mut self.janitor_cats {
+            for item in &mut cat.items {
+                item.selected = !all_on;
+            }
+        }
+    }
+
+    /// Trash or delete checked janitor rows through the standard confirmation
+    /// flow. Trash contents route to permanent delete with an explanation.
+    pub fn janitor_action(&mut self, to_trash: bool) {
+        let mut targets = Vec::new();
+        let mut total = 0u64;
+        let mut trash_only_hit = false;
+        for cat in &self.janitor_cats {
+            for item in &cat.items {
+                if item.selected {
+                    if item.trash_only_delete {
+                        trash_only_hit = true;
+                    }
+                    targets.extend(item.targets.iter().cloned());
+                    total = total.saturating_add(item.size);
+                }
+            }
+        }
+        if targets.is_empty() {
+            self.set_status("Nothing selected (Space toggles, a selects all)");
+            return;
+        }
+        if to_trash && trash_only_hit {
+            self.set_status("Trash contents can only be permanently deleted (D)");
+            return;
+        }
+        let action = if to_trash {
+            ConfirmAction::MoveToTrash
+        } else {
+            ConfirmAction::PermanentDelete
+        };
+        self.open_action_confirm(targets, total, action);
+    }
+
     /// Open the Top-50 leaderboard, ranked on demand from the live tree.
     pub fn open_top_files(&mut self) {
         let files = Self::rank_top_files(&self.root_entry);
@@ -863,6 +1037,105 @@ impl App {
             ConfirmAction::PermanentDelete
         };
         self.open_action_confirm(vec![top.path], total, action);
+    }
+
+    /// Janitor category of a cleanable entry, if it belongs in the view.
+    fn janitor_group(kind: GhostKind) -> Option<(&'static str, usize)> {
+        match kind {
+            GhostKind::BrowserCache => Some(("🌐 Browser Caches", 0)),
+            GhostKind::BuildCache | GhostKind::PackageCache => {
+                Some(("📦 Package & Build Caches", 1))
+            }
+            GhostKind::Trash => Some(("🗑️ FreeDesktop Trash", 2)),
+            GhostKind::LogFiles | GhostKind::CoreDump => Some(("📜 Logs & Crash Dumps", 3)),
+            _ => None,
+        }
+    }
+
+    /// Collect toggleable janitor rows under `scope`: cleanable Safe units become
+    /// single rows covering their subtree; loose cleanable files group by parent
+    /// so only the listed files are ever targeted.
+    fn collect_janitor(scope: &FileEntry) -> Vec<JanitorCategory> {
+        const TITLES: [&str; 4] = [
+            "🌐 Browser Caches",
+            "📦 Package & Build Caches",
+            "🗑️ FreeDesktop Trash",
+            "📜 Logs & Crash Dumps",
+        ];
+        let mut groups: [Vec<JanitorItem>; 4] = Default::default();
+        // (parent, category slot) -> (files, bytes, trash_only).
+        let mut loose: HashMap<(PathBuf, usize), (Vec<PathBuf>, u64, bool)> = HashMap::new();
+        fn walk(
+            node: &FileEntry,
+            scope_root: &Path,
+            groups: &mut [Vec<JanitorItem>; 4],
+            loose: &mut HashMap<(PathBuf, usize), (Vec<PathBuf>, u64, bool)>,
+        ) {
+            if node.path != scope_root && node.delete_safety == DeleteSafety::Safe {
+                if let Some((_, slot)) = App::janitor_group(node.ghost_kind) {
+                    let trash_only = node.ghost_kind == GhostKind::Trash;
+                    // Generic containers group distinct apps (per-app rows under
+                    // ~/.cache, files/ + info/ under Trash); everything else is
+                    // one unit covering its subtree.
+                    let is_container = node
+                        .path
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .is_some_and(|n| n == ".cache" || n == "Trash");
+                    if node.is_dir && !node.is_symlink && !is_container {
+                        groups[slot].push(JanitorItem {
+                            display: node.path.to_string_lossy().into_owned(),
+                            targets: vec![node.path.clone()],
+                            size: node.disk_usage,
+                            trash_only_delete: trash_only,
+                            selected: false,
+                        });
+                        return; // Unit covers its subtree; do not descend.
+                    }
+                    if !node.is_dir {
+                        let parent = node
+                            .path
+                            .parent()
+                            .map(|p| p.to_path_buf())
+                            .unwrap_or_else(|| node.path.clone());
+                        let entry = loose
+                            .entry((parent, slot))
+                            .or_insert((Vec::new(), 0, false));
+                        entry.0.push(node.path.clone());
+                        entry.1 += node.disk_usage;
+                        entry.2 |= trash_only;
+                        return;
+                    }
+                }
+            }
+            for child in &node.children {
+                walk(child, scope_root, groups, loose);
+            }
+        }
+        walk(scope, &scope.path.clone(), &mut groups, &mut loose);
+        for ((parent, slot), (mut files, bytes, trash_only)) in loose {
+            files.sort();
+            groups[slot].push(JanitorItem {
+                display: format!("{} ({} files)", parent.display(), files.len()),
+                targets: files,
+                size: bytes,
+                trash_only_delete: trash_only,
+                selected: false,
+            });
+        }
+        TITLES
+            .into_iter()
+            .enumerate()
+            .map(|(index, title)| {
+                let mut items = std::mem::take(&mut groups[index]);
+                items.sort_by_key(|item| std::cmp::Reverse(item.size));
+                JanitorCategory {
+                    title,
+                    items,
+                    expanded: true,
+                }
+            })
+            .collect()
     }
 
     /// Prepare Docker Prune confirmation
@@ -1045,6 +1318,9 @@ impl App {
         if self.active_view == ActiveView::TopFiles {
             self.top_files = Self::rank_top_files(&self.root_entry);
             self.top_cursor = self.top_cursor.min(self.top_files.len().saturating_sub(1));
+        }
+        if self.active_view == ActiveView::Janitor {
+            self.rebuild_janitor();
         }
     }
 
@@ -1389,6 +1665,62 @@ mod reconciliation_tests {
     use super::*;
     use std::fs;
     use std::sync::{atomic::AtomicBool, Arc};
+
+    #[test]
+    fn janitor_collects_toggleable_units_and_groups_loose_files() {
+        let fixture = tempfile::tempdir().unwrap();
+        // ~/.cache style: dir unit with a nested file (covered whole).
+        let chrome = fixture.path().join(".cache").join("google-chrome");
+        fs::create_dir_all(&chrome).unwrap();
+        fs::write(chrome.join("data"), vec![0u8; 10000]).unwrap();
+        // Loose cleanable files group under their parent.
+        fs::write(fixture.path().join("app.log"), vec![0u8; 1000]).unwrap();
+        fs::write(fixture.path().join("old.log.1"), vec![0u8; 1000]).unwrap();
+        // Non-cleanable file must never appear.
+        fs::write(fixture.path().join("notes.txt"), "x").unwrap();
+        let root = crate::fs::scanner::scan_directory(
+            fixture.path(),
+            None,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .unwrap();
+        let mut app = App::new(root);
+        app.open_janitor();
+        assert_eq!(app.active_view, ActiveView::Janitor);
+        // At scan root the default scope is global.
+        assert_eq!(app.janitor_scope, JanitorScope::Global);
+        let unit = app
+            .janitor_cats
+            .iter()
+            .flat_map(|cat| &cat.items)
+            .find(|item| item.display.contains("google-chrome"))
+            .expect("cache dir unit");
+        assert_eq!(unit.targets.len(), 1);
+        let grouped = app
+            .janitor_cats
+            .iter()
+            .flat_map(|cat| &cat.items)
+            .find(|item| item.display.contains("(2 files)"))
+            .expect("grouped logs");
+        assert_eq!(grouped.targets.len(), 2);
+        assert!(!app
+            .janitor_cats
+            .iter()
+            .flat_map(|cat| &cat.items)
+            .any(|item| item.display.contains("notes.txt")));
+        // Header toggle selects the whole category, cursor rows resolve.
+        assert!(app.janitor_row_count() > 0);
+        app.toggle_janitor_all();
+        assert!(app
+            .janitor_cats
+            .iter()
+            .flat_map(|cat| &cat.items)
+            .all(|item| item.selected));
+        // Action routes through the standard trash confirmation.
+        app.janitor_action(true);
+        assert_eq!(app.active_view, ActiveView::ConfirmModal);
+        assert!(!app.action_targets.is_empty());
+    }
 
     #[test]
     fn top_files_rank_jump_and_confirm() {
