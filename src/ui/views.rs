@@ -67,6 +67,7 @@ pub fn render_ui(f: &mut Frame, app: &App) {
         ActiveView::Filesystem => render_filesystem_view(f, app, chunks[1]),
         ActiveView::GhostInspector => render_ghost_inspector(f, app, chunks[1]),
         ActiveView::TopFiles => render_top_files(f, app, chunks[1]),
+        ActiveView::Janitor => render_janitor(f, app, chunks[1]),
         ActiveView::ConfirmModal => {
             // Render underlying view then overlay modal
             if app.previous_view == ActiveView::GhostInspector {
@@ -1643,6 +1644,85 @@ fn render_top_files(f: &mut Frame, app: &App, area: Rect) {
     f.render_stateful_widget(table, area, &mut state);
 }
 
+fn render_janitor(f: &mut Frame, app: &App, area: Rect) {
+    let scope_label = match app.janitor_scope {
+        crate::ui::app::JanitorScope::Current => "current folder",
+        crate::ui::app::JanitorScope::Global => "whole scan",
+    };
+    let selected_bytes: u64 = app
+        .janitor_cats
+        .iter()
+        .flat_map(|cat| &cat.items)
+        .filter(|item| item.selected)
+        .map(|item| item.size)
+        .sum();
+    let title = format!(
+        " 🧹 System Janitor — {} (Tab: scope │ Space: toggle │ Enter: trash │ d: delete) — selected {} ",
+        scope_label,
+        format_size(selected_bytes),
+    );
+    let mut rows: Vec<Row> = Vec::new();
+    for cat in &app.janitor_cats {
+        let cat_total: u64 = cat.items.iter().map(|item| item.size).sum();
+        let marker = if cat.items.is_empty() {
+            "  "
+        } else if cat.expanded {
+            "▾ "
+        } else {
+            "▸ "
+        };
+        rows.push(Row::new(vec![
+            "".to_string(),
+            format!("{marker}{}", cat.title),
+            if cat.items.is_empty() {
+                "—".to_string()
+            } else {
+                format_size(cat_total)
+            },
+        ]));
+        if cat.expanded {
+            for item in &cat.items {
+                let checkbox = if item.selected { "[x]" } else { "[ ]" };
+                rows.push(Row::new(vec![
+                    checkbox.to_string(),
+                    format!("    {}", item.display),
+                    format_size(item.size),
+                ]));
+            }
+        }
+    }
+    if rows.is_empty() {
+        rows.push(Row::new(vec![
+            "".to_string(),
+            "No cleanable items in scope".to_string(),
+            "".to_string(),
+        ]));
+    }
+    let widths = [
+        Constraint::Length(5),
+        Constraint::Min(10),
+        Constraint::Length(12),
+    ];
+    let table = Table::new(rows, widths)
+        .header(Row::new(vec!["Sel", "Category / Folder", "Size"]))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(Color::LightCyan))
+                .title(title),
+        )
+        .row_highlight_style(
+            Style::default()
+                .bg(Color::DarkGray)
+                .add_modifier(Modifier::BOLD),
+        )
+        .highlight_symbol("▶ ");
+    let mut state = ratatui::widgets::TableState::default();
+    state.select(Some(app.janitor_cursor));
+    f.render_stateful_widget(table, area, &mut state);
+}
+
 fn render_confirm_modal(f: &mut Frame, app: &App, screen: Rect) {
     let action = match &app.pending_action {
         Some(a) => a,
@@ -1999,7 +2079,7 @@ fn render_help_modal(f: &mut Frame, screen: Rect) {
             Line::from("  Home / End   Top / Bottom"),
             Line::from(""),
             Line::from("  i            Item & Disk info"),
-            Line::from("  T            Top 50 largest files"),
+            Line::from("  T / J        Top 50 files / Janitor"),
             Line::from("  ! / o / y    Shell here / Open / Copy path"),
             Line::from("  s            Cycle sort order"),
             Line::from("  A            Toggle Apparent size"),
@@ -2477,6 +2557,35 @@ fn render_footer(f: &mut Frame, app: &App, area: Rect) {
                 vec![
                     ("[Enter] Jump", Color::Black, Color::LightCyan),
                     ("[t/d] Act", Color::Black, Color::Yellow),
+                    ("[Esc] Back", Color::White, Color::DarkGray),
+                ]
+            };
+            let mut spans = Vec::new();
+            for (idx, (label, fg, bg)) in candidate_keys.into_iter().enumerate() {
+                if idx > 0 {
+                    spans.push(Span::raw(" "));
+                }
+                spans.push(Span::styled(
+                    format!(" {} ", label),
+                    Style::default().fg(fg).bg(bg),
+                ));
+            }
+            spans
+        }
+        ActiveView::Janitor => {
+            let candidate_keys: Vec<(&str, Color, Color)> = if area.width >= 90 {
+                vec![
+                    ("[Space] Toggle", Color::Black, Color::LightCyan),
+                    ("[Tab] Scope", Color::White, Color::DarkGray),
+                    ("[Enter] Trash", Color::Black, Color::Yellow),
+                    ("[d] Delete", Color::Black, Color::Red),
+                    ("[Esc] Back", Color::White, Color::DarkGray),
+                ]
+            } else {
+                vec![
+                    ("[Spc] Tog", Color::Black, Color::LightCyan),
+                    ("[Tab] Scope", Color::White, Color::DarkGray),
+                    ("[Enter] Trash", Color::Black, Color::Yellow),
                     ("[Esc] Back", Color::White, Color::DarkGray),
                 ]
             };
