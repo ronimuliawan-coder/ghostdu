@@ -8,7 +8,7 @@ use crate::ops::delete::permanently_delete_confirmed;
 use crate::ops::trash::move_to_trash_confirmed;
 use crate::ops::{TargetIdentities, TargetIdentity};
 use std::cell::Cell;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -695,8 +695,15 @@ impl App {
                 // Remove deleted paths from tree
                 for path in &result.succeeded {
                     self.selected_paths.remove(path);
-                    self.remove_path_from_tree(path);
                 }
+                self.apply_tree_updates(
+                    result
+                        .succeeded
+                        .iter()
+                        .cloned()
+                        .map(|path| (path, None))
+                        .collect(),
+                );
 
                 self.navigate_to_path(&current_path);
                 if count > 0 {
@@ -721,8 +728,15 @@ impl App {
                 // Remove deleted paths from tree
                 for path in &result.succeeded {
                     self.selected_paths.remove(path);
-                    self.remove_path_from_tree(path);
                 }
+                self.apply_tree_updates(
+                    result
+                        .succeeded
+                        .iter()
+                        .cloned()
+                        .map(|path| (path, None))
+                        .collect(),
+                );
 
                 // A failed recursive deletion may already have removed children.
                 let reconciled = if failed_count == 0 {
@@ -793,8 +807,13 @@ impl App {
                 roots.push(path);
             }
         }
-        fn retained_inodes(entry: &FileEntry, roots: &[PathBuf], seen: &mut HashSet<(u64, u64)>) {
-            if roots.iter().any(|root| entry.path.starts_with(root)) {
+        fn retained_inodes(
+            entry: &FileEntry,
+            roots: &HashSet<PathBuf>,
+            seen: &mut HashSet<(u64, u64)>,
+        ) {
+            // Stop at each failed root, so descendants need no prefix comparisons.
+            if roots.contains(&entry.path) {
                 return;
             }
             if entry.is_dir || entry.size > 0 || entry.disk_usage > 0 || entry.safe_items > 0 {
@@ -808,22 +827,28 @@ impl App {
             entry.has_err || entry.children.iter().any(has_errors)
         }
         let mut seen = HashSet::new();
-        retained_inodes(&self.root_entry, &roots, &mut seen);
+        retained_inodes(
+            &self.root_entry,
+            &roots.iter().cloned().collect(),
+            &mut seen,
+        );
         let mut reconciled = true;
+        let mut updates = HashMap::new();
         for path in roots {
             match crate::fs::scanner::rescan_entry(&path, self.root_entry.dev, &mut seen) {
                 Ok(entry) => {
                     reconciled &= !has_errors(&entry);
-                    self.replace_subtree(&path, entry);
+                    updates.insert(path, Some(entry));
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    self.remove_path_from_tree(&path)
+                    updates.insert(path, None);
                 }
                 Err(_) => {
                     reconciled = false;
                 }
             }
         }
+        self.apply_tree_updates(updates);
         if !reconciled {
             self.root_entry.has_err = true;
         }
@@ -844,30 +869,9 @@ impl App {
         self.active_view = self.previous_view;
     }
 
-    /// Remove deleted item from internal directory tree and recalculate sizes
-    fn remove_path_from_tree(&mut self, path: &Path) {
-        fn remove_rec(entry: &mut FileEntry, target: &Path) -> bool {
-            let initial_len = entry.children.len();
-            entry.children.retain(|c| c.path != target);
-            if entry.children.len() != initial_len {
-                // Item removed directly from this directory; recalculate
-                recalc(entry);
-                return true;
-            }
-
-            let mut found = false;
-            for child in &mut entry.children {
-                if child.is_dir && target.starts_with(&child.path) && remove_rec(child, target) {
-                    found = true;
-                    break;
-                }
-            }
-            if found {
-                recalc(entry);
-            }
-            found
-        }
-
+    /// Apply a whole batch in one walk and recalculate each changed ancestor once.
+    /// Returns visited nodes so regression tests can assert linear traversal work.
+    fn apply_tree_updates(&mut self, mut updates: HashMap<PathBuf, Option<FileEntry>>) -> usize {
         fn recalc(entry: &mut FileEntry) {
             let mut total_size = 0u64;
             let mut total_disk = 0u64;
@@ -897,72 +901,58 @@ impl App {
             }
         }
 
-        remove_rec(&mut self.root_entry, path);
-    }
-
-    /// Replace a subtree at target path with a newly scanned node and recalculate ancestor sizes
-    pub fn replace_subtree(&mut self, target: &Path, new_node: FileEntry) {
-        fn replace_rec(entry: &mut FileEntry, target: &Path, new_node: &FileEntry) -> bool {
-            for child in &mut entry.children {
-                if child.path == target {
-                    *child = new_node.clone();
-                    recalc(entry);
+        fn apply(
+            entry: &mut FileEntry,
+            updates: &mut HashMap<PathBuf, Option<FileEntry>>,
+            visited: &mut usize,
+        ) -> bool {
+            if updates.is_empty() {
+                return false;
+            }
+            *visited += 1;
+            let mut changed = false;
+            entry.children.retain_mut(|child| {
+                if updates.is_empty() {
                     return true;
                 }
-                if child.is_dir
-                    && target.starts_with(&child.path)
-                    && replace_rec(child, target, new_node)
-                {
-                    recalc(entry);
-                    return true;
+                if let Some(replacement) = updates.remove(&child.path) {
+                    *visited += 1;
+                    changed = true;
+                    if let Some(replacement) = replacement {
+                        *child = replacement;
+                    } else {
+                        return false;
+                    }
+                } else {
+                    changed |= apply(child, updates, visited);
                 }
+                true
+            });
+            if changed {
+                recalc(entry);
             }
-            false
+            changed
         }
-
-        fn recalc(entry: &mut FileEntry) {
-            let mut total_size = 0u64;
-            let mut total_disk = 0u64;
-            let mut total_reclaimable = 0u64;
-            let mut total_items = 0usize;
-            let mut total_safe_reclaimable = 0u64;
-            let mut total_safe_items = 0usize;
-            for child in &entry.children {
-                total_size = total_size.saturating_add(child.size);
-                total_disk = total_disk.saturating_add(child.disk_usage);
-                total_reclaimable = total_reclaimable.saturating_add(child.reclaimable);
-                total_items = total_items.saturating_add(child.items_count);
-                total_safe_reclaimable =
-                    total_safe_reclaimable.saturating_add(child.safe_reclaimable_bytes());
-                total_safe_items = total_safe_items.saturating_add(child.safe_items_count());
-            }
-            entry.size = total_size;
-            entry.disk_usage = total_disk;
-            entry.reclaimable = total_reclaimable;
-            entry.items_count = total_items + 1;
-            if entry.delete_safety == DeleteSafety::Safe {
-                entry.safe_reclaimable = total_reclaimable;
-                entry.safe_items = 1;
-            } else {
-                entry.safe_reclaimable = total_safe_reclaimable;
-                entry.safe_items = total_safe_items;
-            }
-        }
-
-        replace_rec(&mut self.root_entry, target, &new_node);
-
-        // Validate path_stack bounds
+        let mut visited = 0;
+        apply(&mut self.root_entry, &mut updates, &mut visited);
+        // Navigation is restored from its saved path by action callers.
         let mut curr = &self.root_entry;
         let mut valid_depth = 0;
         for &idx in &self.path_stack {
-            if idx < curr.children.len() {
-                curr = &curr.children[idx];
+            if let Some(child) = curr.children.get(idx) {
+                curr = child;
                 valid_depth += 1;
             } else {
                 break;
             }
         }
         self.path_stack.truncate(valid_depth);
+        visited
+    }
+
+    /// Replace a subtree and update its ancestors using the batch mutation path.
+    pub fn replace_subtree(&mut self, target: &Path, new_node: FileEntry) {
+        self.apply_tree_updates(HashMap::from([(target.to_path_buf(), Some(new_node))]));
     }
 
     /// Refresh filesystem stats, directory tree, Docker storage, and ghost files without restarting
@@ -1053,6 +1043,42 @@ mod reconciliation_tests {
     use super::*;
     use std::fs;
     use std::sync::{atomic::AtomicBool, Arc};
+
+    #[test]
+    fn bulk_tree_updates_visit_each_cached_node_at_most_once() {
+        let fixture = tempfile::tempdir().unwrap();
+        for index in 0..512 {
+            fs::write(fixture.path().join(format!("file-{index}")), "x").unwrap();
+        }
+        let root = crate::fs::scanner::scan_directory(
+            fixture.path(),
+            None,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .unwrap();
+        let mut app = App::new(root);
+        let updates = app
+            .root_entry
+            .children
+            .iter()
+            .enumerate()
+            .map(|(index, entry)| {
+                let replacement = if index % 2 == 0 {
+                    None
+                } else {
+                    let mut updated = entry.clone();
+                    updated.size = 2;
+                    Some(updated)
+                };
+                (entry.path.clone(), replacement)
+            })
+            .collect();
+        let visited = app.apply_tree_updates(updates);
+        assert_eq!(visited, 513);
+        assert_eq!(app.root_entry.children.len(), 256);
+        assert_eq!(app.root_entry.items_count, 257);
+        assert_eq!(app.root_entry.size, 512);
+    }
 
     #[test]
     fn partial_failure_updates_ancestors_and_coalesces_nested_targets() {

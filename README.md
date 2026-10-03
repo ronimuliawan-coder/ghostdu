@@ -26,7 +26,11 @@ Permanent deletion and trash moves use Linux directory handles and refuse to cro
 
 Trash moves write FreeDesktop `.trashinfo` metadata and use an atomic rename between pinned directories. Home and per-volume trash locations must be private and owned by the current user. Unsupported cross-filesystem moves fail without copying or removing the source.
 
-Selections and confirmation dialogs hold open handles to the selected objects. Before either destructive operation, the backend compares the prepared target with the confirmed object. Replacing a file, directory, or symlink at the same path requires a new selection and confirmation; refreshing discards changed selections. Failure to capture or verify an identity blocks that target. This binds the selected object, not a snapshot of its contents: files can still be edited and directory children can change while the dialog is open.
+Selections and confirmation dialogs hold open handles to the selected objects. Before either destructive operation, the backend compares the prepared target with the confirmed object. A replacement observed by these checks requires a new selection and confirmation; refreshing discards changed selections. Failure to capture or verify an identity blocks that target. This binds the selected object, not a snapshot of its contents: files can still be edited and directory children can change while the dialog is open.
+
+The identity guarantee applies at verification time. Linux name-based `unlinkat` and `renameat` are separate from the final identity check: a concurrent writer can replace the final entry in that interval, and the replacement may be removed or trashed. Pinned parents prevent ancestor redirection and final symlinks are not followed, but these controls do not serialize other writers. Deterministic tests replace the final entry after verification to record this boundary. Stronger guarantees require control of the directory namespace (exclusive write authority or coordination honored by every writer); another metadata check alone cannot provide them.
+
+Batch failure reconciliation uses indexed root lookups and a single tree-update walk. Batch trash moves retain validated destination handles per source mount; private ownership and permissions are rechecked for every target. Kernels without mount IDs use uncached destination resolution so bind mounts cannot share a destination by device ID alone.
 
 #### Trash interruption and recovery
 

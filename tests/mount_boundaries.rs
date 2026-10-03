@@ -226,6 +226,27 @@ fn bind_mount_boundaries_and_ancestor_cycles() {
         std::io::Error::from_raw_os_error(libc::ENOTDIR).to_string()
     );
     assert_eq!(fs::read_to_string(&trash_source).unwrap(), "must stay");
+    // One batch alternates source mounts: each uses its own cached destination.
+    let batch_data = fixture.path().join("batch-data");
+    std::env::set_var("XDG_DATA_HOME", &batch_data);
+    let mut batch = Vec::new();
+    for index in 0..3 {
+        for directory in [&root, &other_device] {
+            let path = directory.join(format!("batch-{index}"));
+            fs::write(&path, "batch payload").unwrap();
+            batch.push(path);
+        }
+    }
+    let result = ghostdu::ops::move_to_trash(&batch);
+    assert!(result.failed.is_empty(), "{:?}", result.failed);
+    assert_eq!(result.succeeded.len(), 6);
+    assert_eq!(
+        fs::read_dir(batch_data.join("Trash/files"))
+            .unwrap()
+            .count(),
+        3
+    );
+    assert_eq!(fs::read_dir(user_trash.join("files")).unwrap().count(), 4);
     // TempDir cleanup must happen after unmounting the synthetic filesystems.
     for mount in [&ancestor, &bind, &other_device] {
         assert!(Command::new("umount")
