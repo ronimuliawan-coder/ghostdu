@@ -12,20 +12,7 @@ use ratatui::{
 };
 
 fn truncate_path(path: &str, max_len: usize) -> String {
-    if path.len() <= max_len {
-        return path.to_string();
-    }
-    if max_len <= 3 {
-        return "…".to_string();
-    }
-    let keep_end = max_len.saturating_sub(1);
-    let start_idx = path
-        .char_indices()
-        .map(|(i, _)| i)
-        .rev()
-        .nth(keep_end)
-        .unwrap_or(path.len().saturating_sub(keep_end));
-    format!("…{}", &path[start_idx..])
+    crate::fs::entry::truncate_start_by_width(path, max_len)
 }
 
 fn append_if_fits<'a>(
@@ -2268,12 +2255,9 @@ fn render_footer(f: &mut Frame, app: &App, area: Rect) {
     }
 
     if let Some(status) = app.current_status() {
-        let max_status_len = (area.width as usize).saturating_sub(6);
-        let display_status = if status.len() > max_status_len && max_status_len > 3 {
-            format!("{}...", &status[..max_status_len - 3])
-        } else {
-            status.to_string()
-        };
+        // " 📢 " occupies 4 terminal cells (1 space + 2-wide emoji + 1 space)
+        let max_status_len = (area.width as usize).saturating_sub(4);
+        let display_status = crate::fs::entry::truncate_end_by_width(status, max_status_len);
         let status_line = Line::from(vec![
             Span::styled(" 📢 ", Style::default().fg(Color::Yellow)),
             Span::styled(

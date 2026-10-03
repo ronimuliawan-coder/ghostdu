@@ -2,7 +2,6 @@ use serde::Deserialize;
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
-use std::process::Command;
 use std::time::Duration;
 
 #[derive(Debug, Clone, Default)]
@@ -114,6 +113,14 @@ struct DockerBuildCacheItem {
 const DOCKER_SOCKET_PATH: &str = "/var/run/docker.sock";
 
 fn send_docker_http_request(method: &str, endpoint: &str) -> Result<String, String> {
+    send_docker_http_request_with_timeout(method, endpoint, Duration::from_secs(4))
+}
+
+fn send_docker_http_request_with_timeout(
+    method: &str,
+    endpoint: &str,
+    read_timeout: Duration,
+) -> Result<String, String> {
     if !Path::new(DOCKER_SOCKET_PATH).exists() {
         return Err("Docker socket /var/run/docker.sock does not exist".to_string());
     }
@@ -122,7 +129,7 @@ fn send_docker_http_request(method: &str, endpoint: &str) -> Result<String, Stri
         .map_err(|e| format!("Cannot connect to docker socket: {}", e))?;
 
     stream
-        .set_read_timeout(Some(Duration::from_secs(4)))
+        .set_read_timeout(Some(read_timeout))
         .map_err(|e| e.to_string())?;
     stream
         .set_write_timeout(Some(Duration::from_secs(4)))
@@ -142,209 +149,328 @@ fn send_docker_http_request(method: &str, endpoint: &str) -> Result<String, Stri
         .read_to_end(&mut response_bytes)
         .map_err(|e| format!("Failed to read from docker socket: {}", e))?;
 
-    let response = String::from_utf8_lossy(&response_bytes);
-    if let Some(pos) = response.find("\r\n\r\n") {
-        let body = &response[pos + 4..];
-        // Handle chunked transfer encoding if present
-        if response.contains("Transfer-Encoding: chunked") {
-            let mut dechunked = String::new();
-            let mut remaining = body;
-            while let Some(line_end) = remaining.find("\r\n") {
-                let hex_len_str = &remaining[..line_end].trim();
-                if let Ok(chunk_len) = usize::from_str_radix(hex_len_str, 16) {
-                    if chunk_len == 0 {
-                        break;
-                    }
-                    let data_start = line_end + 2;
-                    let data_end = data_start + chunk_len;
-                    if data_end <= remaining.len() {
-                        dechunked.push_str(&remaining[data_start..data_end]);
-                        remaining = &remaining[data_end + 2..];
-                    } else {
-                        break;
-                    }
-                } else {
-                    break;
-                }
-            }
-            Ok(dechunked)
-        } else {
-            Ok(body.to_string())
-        }
-    } else {
-        Ok(response.to_string())
+    parse_docker_http_response(&response_bytes)
+}
+
+fn parse_docker_http_response(response_bytes: &[u8]) -> Result<String, String> {
+    let sep = response_bytes
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .ok_or_else(|| "Invalid HTTP response from docker socket".to_string())?;
+
+    let header_str = String::from_utf8_lossy(&response_bytes[..sep]);
+    let raw_body = &response_bytes[sep + 4..];
+
+    let status_line = header_str.lines().next().unwrap_or("");
+    let status_code: u16 = status_line
+        .split_whitespace()
+        .nth(1)
+        .and_then(|c| c.parse().ok())
+        .unwrap_or(0);
+
+    if !(200..300).contains(&status_code) {
+        return Err(format!(
+            "Docker API error (HTTP {}): {}",
+            status_code,
+            String::from_utf8_lossy(raw_body).trim()
+        ));
     }
+
+    let is_chunked = header_str.lines().any(|l| {
+        let l = l.to_ascii_lowercase();
+        l.starts_with("transfer-encoding:") && l.contains("chunked")
+    });
+
+    let body = if is_chunked {
+        let mut dechunked: Vec<u8> = Vec::new();
+        let mut remaining = raw_body;
+        loop {
+            let line_end = remaining
+                .windows(2)
+                .position(|w| w == b"\r\n")
+                .ok_or_else(|| "Missing Docker chunk header".to_string())?;
+            let hex_str = String::from_utf8_lossy(&remaining[..line_end]);
+            let hex_clean = hex_str.split(';').next().unwrap_or("").trim();
+            let chunk_len = usize::from_str_radix(hex_clean, 16)
+                .map_err(|_| "Invalid Docker chunk size".to_string())?;
+            if chunk_len == 0 {
+                break;
+            }
+            let data_start = line_end + 2;
+            let data_end = data_start
+                .checked_add(chunk_len)
+                .ok_or_else(|| "Docker chunk size overflow".to_string())?;
+            let chunk_end = data_end
+                .checked_add(2)
+                .ok_or_else(|| "Docker chunk size overflow".to_string())?;
+            if remaining.get(data_end..chunk_end) != Some(b"\r\n") {
+                return Err("Truncated Docker chunk or missing CRLF".to_string());
+            }
+            dechunked.extend_from_slice(&remaining[data_start..data_end]);
+            remaining = &remaining[chunk_end..];
+        }
+        String::from_utf8_lossy(&dechunked).into_owned()
+    } else {
+        String::from_utf8_lossy(raw_body).into_owned()
+    };
+
+    Ok(body)
+}
+
+pub fn parse_docker_df_json(json_body: &str) -> Result<DockerDiskInfo, String> {
+    let mut info = DockerDiskInfo::default();
+    let parsed: DockerDfResponse = serde_json::from_str(json_body)
+        .map_err(|e| format!("Failed to parse Docker response: {}", e))?;
+
+    info.is_available = true;
+    info.images_count = parsed.images.len();
+    for img in parsed.images {
+        let size = img.size.max(0) as u64;
+        info.images_total_size += size;
+        let is_untagged = img.repo_tags.as_ref().is_none_or(|tags| {
+            tags.is_empty() || tags.iter().all(|t| t == "<none>:<none>" || t == "<none>")
+        });
+        let is_dangling = is_untagged && img.containers == 0;
+        if is_dangling {
+            info.images_reclaimable_size += size;
+        }
+        let tag = img
+            .repo_tags
+            .as_ref()
+            .and_then(|t| t.first().cloned())
+            .unwrap_or_else(|| "<none>".to_string());
+        info.items.push(DockerItemSummary {
+            category: "Image",
+            id_or_name: if tag != "<none>" {
+                tag
+            } else {
+                img.id.chars().take(12).collect()
+            },
+            size,
+            is_reclaimable: is_dangling,
+            details: if is_dangling {
+                "Dangling / Unused".to_string()
+            } else {
+                format!("Used by {} containers", img.containers)
+            },
+        });
+    }
+
+    info.containers_count = parsed.containers.len();
+    for c in parsed.containers {
+        let rw_size = c.size_rw.unwrap_or(0).max(0) as u64;
+        info.containers_total_size += rw_size;
+        let is_stopped = matches!(
+            c.state.as_deref(),
+            Some("exited") | Some("dead") | Some("created")
+        ) || c.status.as_deref().is_some_and(|s| s.starts_with("Exited"));
+        if is_stopped {
+            info.containers_reclaimable_size += rw_size;
+        }
+        let name = c
+            .names
+            .as_ref()
+            .and_then(|n| n.first().cloned())
+            .unwrap_or_else(|| c.id.chars().take(12).collect());
+        info.items.push(DockerItemSummary {
+            category: "Container",
+            id_or_name: name.trim_start_matches('/').to_string(),
+            size: rw_size,
+            is_reclaimable: is_stopped,
+            details: format!(
+                "Status: {}",
+                c.status.unwrap_or_else(|| "Unknown".to_string())
+            ),
+        });
+    }
+
+    info.volumes_count = parsed.volumes.len();
+    for v in parsed.volumes {
+        let (vol_size, is_reclaimable) = match v.usage_data {
+            Some(ud) => (ud.size.max(0) as u64, ud.ref_count <= 0),
+            None => (0, true),
+        };
+        info.volumes_total_size += vol_size;
+        if is_reclaimable {
+            info.volumes_reclaimable_size += vol_size;
+        }
+        info.items.push(DockerItemSummary {
+            category: "Volume",
+            id_or_name: v.name.chars().take(24).collect(),
+            size: vol_size,
+            is_reclaimable,
+            details: if is_reclaimable {
+                "Dangling / Unattached".to_string()
+            } else {
+                "Active".to_string()
+            },
+        });
+    }
+
+    for bc in parsed.build_cache {
+        let size = bc.size.max(0) as u64;
+        info.build_cache_total_size += size;
+        if bc.reclaimable {
+            info.build_cache_reclaimable_size += size;
+        }
+        info.items.push(DockerItemSummary {
+            category: "BuildCache",
+            id_or_name: bc.id.chars().take(12).collect(),
+            size,
+            is_reclaimable: bc.reclaimable,
+            details: bc
+                .description
+                .unwrap_or_else(|| "Build cache entry".to_string()),
+        });
+    }
+
+    Ok(info)
 }
 
 pub fn fetch_docker_disk_info() -> DockerDiskInfo {
-    let mut info = DockerDiskInfo::default();
-
-    let json_body = match send_docker_http_request("GET", "/system/df") {
-        Ok(body) => body,
-        Err(e) => {
-            // Socket direct query failed; try fallback to `docker system df --format json`
-            match Command::new("docker")
-                .args(["system", "df", "--format", "{{json .}}"])
-                .output()
-            {
-                Ok(output) if output.status.success() => {
-                    // Docker CLI output fallback
-                    String::from_utf8_lossy(&output.stdout).to_string()
-                }
-                _ => {
-                    info.is_available = false;
-                    info.error_message = Some(e);
-                    return info;
-                }
-            }
-        }
-    };
-
-    let df_res: Result<DockerDfResponse, _> = serde_json::from_str(&json_body);
-    match df_res {
-        Ok(parsed) => {
-            info.is_available = true;
-            info.images_count = parsed.images.len();
-            for img in parsed.images {
-                let size = img.size.max(0) as u64;
-                info.images_total_size += size;
-                let is_dangling = img.containers == 0;
-                if is_dangling {
-                    info.images_reclaimable_size += size;
-                }
-                let tag = img
-                    .repo_tags
-                    .as_ref()
-                    .and_then(|t| t.first().cloned())
-                    .unwrap_or_else(|| "<none>".to_string());
-                info.items.push(DockerItemSummary {
-                    category: "Image",
-                    id_or_name: if tag != "<none>" {
-                        tag
-                    } else {
-                        img.id.chars().take(12).collect()
-                    },
-                    size,
-                    is_reclaimable: is_dangling,
-                    details: if is_dangling {
-                        "Dangling / Unused".to_string()
-                    } else {
-                        format!("Used by {} containers", img.containers)
-                    },
-                });
-            }
-
-            info.containers_count = parsed.containers.len();
-            for c in parsed.containers {
-                let rw_size = c.size_rw.unwrap_or(0).max(0) as u64;
-                info.containers_total_size += rw_size;
-                let is_stopped = c.state.as_deref() == Some("exited")
-                    || c.status.as_deref().is_some_and(|s| s.starts_with("Exited"));
-                if is_stopped {
-                    info.containers_reclaimable_size += rw_size;
-                }
-                let name = c
-                    .names
-                    .as_ref()
-                    .and_then(|n| n.first().cloned())
-                    .unwrap_or_else(|| c.id.chars().take(12).collect());
-                info.items.push(DockerItemSummary {
-                    category: "Container",
-                    id_or_name: name.trim_start_matches('/').to_string(),
-                    size: rw_size,
-                    is_reclaimable: is_stopped,
-                    details: format!(
-                        "Status: {}",
-                        c.status.unwrap_or_else(|| "Unknown".to_string())
-                    ),
-                });
-            }
-
-            info.volumes_count = parsed.volumes.len();
-            for v in parsed.volumes {
-                let (vol_size, is_reclaimable) = match v.usage_data {
-                    Some(ud) => (ud.size.max(0) as u64, ud.ref_count <= 0),
-                    None => (0, true),
-                };
-                info.volumes_total_size += vol_size;
-                if is_reclaimable {
-                    info.volumes_reclaimable_size += vol_size;
-                }
-                info.items.push(DockerItemSummary {
-                    category: "Volume",
-                    id_or_name: v.name.chars().take(24).collect(),
-                    size: vol_size,
-                    is_reclaimable,
-                    details: if is_reclaimable {
-                        "Dangling / Unattached".to_string()
-                    } else {
-                        "Active".to_string()
-                    },
-                });
-            }
-
-            for bc in parsed.build_cache {
-                let size = bc.size.max(0) as u64;
-                info.build_cache_total_size += size;
-                if bc.reclaimable {
-                    info.build_cache_reclaimable_size += size;
-                }
-                info.items.push(DockerItemSummary {
-                    category: "BuildCache",
-                    id_or_name: bc.id.chars().take(12).collect(),
-                    size,
-                    is_reclaimable: bc.reclaimable,
-                    details: bc
-                        .description
-                        .unwrap_or_else(|| "Build cache entry".to_string()),
-                });
-            }
-        }
-        Err(err) => {
-            info.is_available = false;
-            info.error_message = Some(format!("Failed to parse Docker response: {}", err));
-        }
+    match send_docker_http_request("GET", "/system/df") {
+        Ok(body) => parse_docker_df_json(&body).unwrap_or_else(|err| DockerDiskInfo {
+            is_available: false,
+            error_message: Some(err),
+            ..Default::default()
+        }),
+        Err(e) => DockerDiskInfo {
+            is_available: false,
+            error_message: Some(e),
+            ..Default::default()
+        },
     }
+}
 
-    info
+#[derive(Debug, Deserialize, Default)]
+#[serde(rename_all = "PascalCase")]
+struct DockerPruneResponse {
+    #[serde(default)]
+    space_reclaimed: u64,
 }
 
 pub fn prune_docker_dangling() -> Result<String, String> {
-    // Attempt via docker socket
-    let mut messages = Vec::new();
+    // Reporting and mutation must use the same socket, regardless of CLI context/DOCKER_HOST.
+    // Prune operations can take significantly longer than basic inspection, so grant them an extended read timeout.
+    prune_with_request(|method, endpoint| {
+        send_docker_http_request_with_timeout(method, endpoint, Duration::from_secs(60))
+    })
+}
 
-    // 1. Prune dangling images
-    if let Ok(_res) = send_docker_http_request(
-        "POST",
-        "/images/prune?filters=%7B%22dangling%22%3A%7B%22true%22%3Atrue%7D%7D",
-    ) {
-        messages.push("Pruned unused images".to_string());
-    }
-    // 2. Prune stopped containers
-    if let Ok(_res) = send_docker_http_request("POST", "/containers/prune") {
-        messages.push("Pruned stopped containers".to_string());
-    }
-    // 3. Prune dangling volumes
-    if let Ok(_res) = send_docker_http_request("POST", "/volumes/prune") {
-        messages.push("Pruned dangling volumes".to_string());
-    }
-    // 4. Prune build cache
-    if let Ok(_res) = send_docker_http_request("POST", "/build/prune") {
-        messages.push("Pruned build cache".to_string());
-    }
-
-    if messages.is_empty() {
-        // Fallback to docker CLI
-        let output = Command::new("docker")
-            .args(["system", "prune", "-f", "--volumes"])
-            .output()
-            .map_err(|e| format!("Failed to run docker CLI prune: {}", e))?;
-        if output.status.success() {
-            Ok("Successfully ran docker system prune".to_string())
-        } else {
-            Err(String::from_utf8_lossy(&output.stderr).to_string())
+fn prune_with_request(
+    mut request: impl FnMut(&str, &str) -> Result<String, String>,
+) -> Result<String, String> {
+    let mut completed = Vec::new();
+    let mut failed = Vec::new();
+    let mut total_reclaimed = 0u64;
+    for (category, endpoint) in [
+        (
+            "images",
+            "/images/prune?filters=%7B%22dangling%22%3A%7B%22true%22%3Atrue%7D%7D",
+        ),
+        ("containers", "/containers/prune"),
+        ("volumes", "/volumes/prune"),
+        ("build cache", "/build/prune"),
+    ] {
+        match request("POST", endpoint).and_then(|body| {
+            serde_json::from_str::<DockerPruneResponse>(&body)
+                .map_err(|e| format!("Invalid prune response: {}", e))
+        }) {
+            Ok(result) => {
+                total_reclaimed = total_reclaimed.saturating_add(result.space_reclaimed);
+                completed.push(category);
+            }
+            Err(error) => failed.push(format!("{}: {}", category, error)),
         }
+    }
+    let summary = format!(
+        "Pruned {} (freed {})",
+        if completed.is_empty() {
+            "none".to_string()
+        } else {
+            completed.join(", ")
+        },
+        crate::fs::entry::format_size(total_reclaimed)
+    );
+    if failed.is_empty() {
+        Ok(summary)
     } else {
-        Ok(messages.join(", "))
+        Err(format!("{}; failed: {}", summary, failed.join("; ")))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn chunked_response_preserves_split_utf8() {
+        let mut response =
+            b"HTTP/1.1 200 OK\r\ntRaNsFeR-EnCoDiNg: Chunked\r\n\r\n1;ext=yes\r\n".to_vec();
+        response.push(0xc3);
+        response.extend_from_slice(b"\r\n1\r\n\xa9\r\n0\r\n\r\n");
+        assert_eq!(parse_docker_http_response(&response).unwrap(), "é");
+    }
+
+    #[test]
+    fn malformed_chunks_and_http_errors_are_rejected() {
+        for body in [
+            "1\r\na",
+            "4\r\na\r\n",
+            "1\r\naXX",
+            "xyz\r\n",
+            "1\r\na\r\n",
+            "ffffffffffffffff\r\n",
+        ] {
+            let response = format!("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n{body}");
+            assert!(
+                parse_docker_http_response(response.as_bytes()).is_err(),
+                "{body:?}"
+            );
+        }
+        let response = b"HTTP/1.1 403 Forbidden\r\n\r\naccess denied";
+        let error = parse_docker_http_response(response).unwrap_err();
+        assert!(error.contains("403"));
+        assert!(error.contains("access denied"));
+    }
+
+    #[test]
+    fn prune_failure_does_not_switch_execution_paths() {
+        let mut calls = Vec::new();
+        let error = prune_with_request(|method, endpoint| {
+            assert_eq!(method, "POST");
+            calls.push(endpoint.to_string());
+            Err("Docker API error (HTTP 403): access denied".to_string())
+        })
+        .unwrap_err();
+        assert_eq!(calls.len(), 4);
+        assert!(calls[0].starts_with("/images/prune?filters="));
+        assert_eq!(
+            &calls[1..],
+            ["/containers/prune", "/volumes/prune", "/build/prune"]
+        );
+        assert!(error.contains("Pruned none"));
+        assert!(error.contains("403"));
+    }
+
+    #[test]
+    fn prune_reports_success_partial_failure_and_invalid_responses() {
+        let success =
+            prune_with_request(|_, _| Ok(r#"{"SpaceReclaimed":10}"#.to_string())).unwrap();
+        assert!(success.contains("images, containers, volumes, build cache"));
+        assert!(success.contains("40 B"));
+        let partial = prune_with_request(|_, endpoint| {
+            if endpoint == "/containers/prune" {
+                Err("connection closed".to_string())
+            } else {
+                Ok(r#"{"SpaceReclaimed":10}"#.to_string())
+            }
+        })
+        .unwrap_err();
+        assert!(partial.contains("Pruned images, volumes, build cache (freed 30 B)"));
+        assert!(partial.contains("failed: containers: connection closed"));
+        let invalid = prune_with_request(|_, _| Ok("invalid JSON".to_string())).unwrap_err();
+        assert!(invalid.contains("Pruned none"));
+        assert!(invalid.contains("Invalid prune response"));
     }
 }

@@ -22,6 +22,36 @@
 - **Safe-to-Clean Quick Filter (`c`)**: Press `c` anytime to instantly filter the view to show only 🟢 **`SAFE`** cleanable items.
 - **Active Deletion Guardrails**: Any attempt to delete critical system directories triggers an active safeguard lock—the confirmation key `y` is disarmed to prevent catastrophic system damage.
 
+Permanent deletion and trash moves use Linux directory handles and refuse to cross mount points, including bind mounts. They require Linux 5.6+ (`openat2`) and fail closed if the kernel or sandbox cannot provide these safeguards. Existing mounted descendants are checked before removal. Filesystem changes or I/O errors can still cause partial deletion; failed permanent deletions rescan only the affected targets, update ancestor totals, and show an error. Unrelated subtrees remain cached until explicitly refreshed. Reconciliation still runs synchronously within each affected subtree, so a very large failed target can take time. This is not a rollback mechanism.
+
+Trash preflight checks mount topology for nested mounts without opening ordinary descendants; like the identity checks, this is a point-in-time check and does not serialize concurrent mount changes. Trash moves write FreeDesktop `.trashinfo` metadata and use an atomic rename between pinned directories. Home and per-volume trash locations must be private and owned by the current user. Unsupported cross-filesystem moves fail without copying or removing the source.
+
+Selections and confirmation dialogs hold open handles to the selected objects. Selections are capped at 256 and further limited by the live file-descriptor budget, reserving headroom for operations. Select-all reports how many items were selected when it reaches that limit. Before either destructive operation, the backend compares the prepared target with the confirmed object. A replacement observed by these checks requires a new selection and confirmation; refreshing discards changed selections. Failure to capture or verify an identity blocks that target. This binds the selected object, not a snapshot of its contents: files can still be edited and directory children can change while the dialog is open.
+
+The identity guarantee applies at verification time. Linux name-based `unlinkat` and `renameat` are separate from the final identity check: a concurrent writer can replace the final entry in that interval, and the replacement may be removed or trashed. Pinned parents prevent ancestor redirection and final symlinks are not followed, but these controls do not serialize other writers. Deterministic tests replace the final entry after verification to record this boundary. Stronger guarantees require control of the directory namespace (exclusive write authority or coordination honored by every writer); another metadata check alone cannot provide them. Deployments needing that stronger guarantee must limit destructive actions to namespaces without untrusted writers.
+
+Batch failure reconciliation uses indexed root lookups and a tree-update walk pruned to ancestors of changed paths. Batch trash moves retain validated destination handles per source mount; private ownership and permissions are rechecked for every target. Kernels without mount IDs use uncached destination resolution so bind mounts cannot share a destination by device ID alone.
+
+#### Trash interruption and recovery
+
+The restore metadata is written and synced before the source is renamed into `Trash/files`. For process termination (with the filesystem still running), the recoverable states are:
+
+| Interruption point | Source | Trash state / recovery |
+| --- | --- | --- |
+| Before metadata is complete | Still at its original path | An empty or partial orphan `.trashinfo` may remain. |
+| After metadata sync, before rename | Still at its original path | Complete orphan metadata may remain, with no matching payload. |
+| After successful rename | In `Trash/files` | Complete `.trashinfo` and payload share the same stored name; restore with a FreeDesktop consumer such as `trash-restore`. |
+
+On a reported failure before rename, ghostdu attempts to remove the reserved metadata. If cleanup also fails, the error includes the original failure and the orphan metadata location. Inspect an orphan and confirm there is no matching `Trash/files` payload before removing it manually. Ghostdu does not automatically sweep orphans or overwrite an existing restore destination. A successful rename retains its metadata, even if the process exits before the UI reports success.
+
+This contract covers process interruption, not power loss or storage failure: the operation does not sync directory entries or the source contents and cannot promise crash-durable transactions across a reboot. The regression tests exit subprocesses at each boundary and check recovery states. External restoration of files, directories, symlinks, and escaped names is verified with `trash-cli` 0.24.5.26. To run that optional interoperability test with an installed consumer:
+
+```sh
+GHOSTDU_TRASH_RESTORE=/path/to/trash-restore cargo test --lib external_consumer_restores -- --ignored
+```
+
+Reclaimable-space estimates conservatively exclude files with multiple hard links, even if all links appear in the scan. Disk-usage totals still count their blocks once.
+
 ### 🏷️ 16 Linux Disk Category Badges
 High-impact disk consumers across modern Linux desktop and developer environments are automatically recognized and badged:
 - `🗑️ TRASH` — Wastebin & FreeDesktop trash
@@ -43,6 +73,7 @@ High-impact disk consumers across modern Linux desktop and developer environment
 
 ### 🐳 Docker & Unlinked Open Ghost Files
 - **Docker Engine Direct Inspection**: Communicates directly with `/var/run/docker.sock` to report active vs reclaimable images, stopped containers, dangling volumes, and BuildKit caches.
+- **Docker authority**: Reporting and pruning use only `/var/run/docker.sock` under the invoking user's existing socket permissions. Pruning affects eligible resources across that daemon. Ghostdu does not change socket permissions, elevate privileges, or switch to the Docker CLI's configured context.
 - **Open Unlinked Ghost File Discovery**: Scans `/proc/*/fd` to expose deleted files that are still held open by active processes and silently consuming disk space.
 - **Dedicated Ghost Inspector (`Tab` / `g`)**: Dedicated panel showing Docker storage breakdown and open deleted files with one-touch pruning (`p`).
 - **Live Filter Toggles (`G`)**: In the explorer tree, press `G` to cycle between *Show All*, *Hide Ghost Files*, or *Ghost Files ONLY*.
