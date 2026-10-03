@@ -66,10 +66,14 @@ pub fn render_ui(f: &mut Frame, app: &App) {
     match app.active_view {
         ActiveView::Filesystem => render_filesystem_view(f, app, chunks[1]),
         ActiveView::GhostInspector => render_ghost_inspector(f, app, chunks[1]),
+        ActiveView::TopFiles => render_top_files(f, app, chunks[1]),
+        ActiveView::Janitor => render_janitor(f, app, chunks[1]),
         ActiveView::ConfirmModal => {
             // Render underlying view then overlay modal
             if app.previous_view == ActiveView::GhostInspector {
                 render_ghost_inspector(f, app, chunks[1]);
+            } else if app.previous_view == ActiveView::TopFiles {
+                render_top_files(f, app, chunks[1]);
             } else {
                 render_filesystem_view(f, app, chunks[1]);
             }
@@ -1591,8 +1595,165 @@ fn render_deleted_open_summary(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(Paragraph::new(line).block(block), area);
 }
 
+fn render_top_files(f: &mut Frame, app: &App, area: Rect) {
+    let header = Row::new(vec!["Rank", "Size", "Safety", "Path"]);
+    let path_budget = area.width.saturating_sub(28) as usize;
+    let rows: Vec<Row> = app
+        .top_files
+        .iter()
+        .enumerate()
+        .map(|(index, top)| {
+            let size = if app.apparent_size {
+                format_size(top.size)
+            } else {
+                format_size(top.disk_usage)
+            };
+            Row::new(vec![
+                format!("{:>4}", index + 1),
+                size,
+                top.safety.badge().to_string(),
+                truncate_path(&top.path.to_string_lossy(), path_budget.max(8)),
+            ])
+        })
+        .collect();
+    let widths = [
+        Constraint::Length(6),
+        Constraint::Length(12),
+        Constraint::Length(9),
+        Constraint::Min(10),
+    ];
+    let table = Table::new(rows, widths)
+        .header(header)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(Color::LightCyan))
+                .title(
+                    " 🏆 Top 50 Largest Files (Enter: jump │ t: trash │ d: delete │ Esc: back) ",
+                ),
+        )
+        .row_highlight_style(
+            Style::default()
+                .bg(Color::DarkGray)
+                .add_modifier(Modifier::BOLD),
+        )
+        .highlight_symbol("▶ ");
+    let mut state = ratatui::widgets::TableState::default();
+    state.select(Some(app.top_cursor));
+    f.render_stateful_widget(table, area, &mut state);
+}
+
+fn render_janitor(f: &mut Frame, app: &App, area: Rect) {
+    let scope_label = match app.janitor_scope {
+        crate::ui::app::JanitorScope::Current => "current folder",
+        crate::ui::app::JanitorScope::Global => "whole scan",
+    };
+    let title = format!(
+        " 🧹 System Janitor — {} (Tab: scope │ Space: toggle │ Enter: trash │ d: delete) — selected {} ",
+        scope_label,
+        format_size(app.janitor_selected_bytes),
+    );
+    // Viewport window around the cursor; only visible rows are constructed,
+    // so large scans cost O(page) per redraw instead of O(tree).
+    let page = area.height.saturating_sub(5).max(1) as usize;
+    let total = app.janitor_row_count();
+    let start = compute_scroll_window(app.janitor_cursor, app.janitor_offset.get(), page, total);
+    app.janitor_offset.set(start);
+    let mut rows: Vec<Row> = Vec::new();
+    // Start at the indexed category containing the window; stop once filled.
+    let offsets = app.janitor_offsets();
+    let first_cat = offsets
+        .partition_point(|&index| index <= start)
+        .saturating_sub(1);
+    // Rows before the window are skipped by index, never constructed. `flat`
+    // resumes at `start` so the push macro stays correct.
+    let mut flat = start;
+    let mut skip_items = start - offsets.get(first_cat).copied().unwrap_or(0);
+    let show_first_header = skip_items == 0;
+    skip_items = skip_items.saturating_sub(1); // The hidden header row.
+                                               // Windowed push: only visible rows are constructed (O(page) per redraw).
+    macro_rules! push_row {
+        ($row:expr) => {
+            if flat >= start && rows.len() < page {
+                rows.push($row);
+            }
+            flat += 1;
+        };
+    }
+    for (cat_idx, cat) in app.janitor_cats.iter().enumerate().skip(first_cat) {
+        if rows.len() >= page {
+            break;
+        }
+        let marker = if cat.items.is_empty() {
+            "  "
+        } else if cat.expanded {
+            "▾ "
+        } else {
+            "▸ "
+        };
+        // The first category may start mid-items; its header is already above.
+        let header_visible = cat_idx > first_cat || show_first_header;
+        if header_visible {
+            push_row!(Row::new(vec![
+                "".to_string(),
+                format!("{marker}{}", cat.title),
+                if cat.items.is_empty() {
+                    "—".to_string()
+                } else {
+                    format_size(cat.total)
+                },
+            ]));
+        }
+        if cat.expanded {
+            let skip = if cat_idx == first_cat { skip_items } else { 0 };
+            for item in cat.items.iter().skip(skip) {
+                if rows.len() >= page {
+                    break;
+                }
+                let checkbox = if item.selected { "[x]" } else { "[ ]" };
+                push_row!(Row::new(vec![
+                    checkbox.to_string(),
+                    format!("    {}", item.display),
+                    format_size(item.size),
+                ]));
+            }
+        }
+    }
+    if total == 0 {
+        rows.push(Row::new(vec![
+            "".to_string(),
+            "No cleanable items in scope".to_string(),
+            "".to_string(),
+        ]));
+    }
+    let widths = [
+        Constraint::Length(5),
+        Constraint::Min(10),
+        Constraint::Length(12),
+    ];
+    let table = Table::new(rows, widths)
+        .header(Row::new(vec!["Sel", "Category / Folder", "Size"]))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(Color::LightCyan))
+                .title(title),
+        )
+        .row_highlight_style(
+            Style::default()
+                .bg(Color::DarkGray)
+                .add_modifier(Modifier::BOLD),
+        )
+        .highlight_symbol("▶ ");
+    let mut state = ratatui::widgets::TableState::default();
+    state.select(Some(app.janitor_cursor.saturating_sub(start)));
+    f.render_stateful_widget(table, area, &mut state);
+}
+
 fn render_confirm_modal(f: &mut Frame, app: &App, screen: Rect) {
-    let action = match app.pending_action {
+    let action = match &app.pending_action {
         Some(a) => a,
         None => return,
     };
@@ -1825,6 +1986,54 @@ fn render_confirm_modal(f: &mut Frame, app: &App, screen: Rect) {
 
                 (title, border_color, prompt, infos)
             }
+            ConfirmAction::KillProcess { pid, name, .. } => {
+                let title = " ☠️  TERMINATE PROCESS (GHOST FILE) ";
+                let border_color = Color::Red;
+
+                let prompt = Line::from(vec![
+                    Span::styled(
+                        " [1] SIGTERM ",
+                        Style::default()
+                            .bg(Color::Yellow)
+                            .fg(Color::Black)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::raw("    "),
+                    Span::styled(
+                        " [2] SIGKILL ",
+                        Style::default()
+                            .bg(Color::Red)
+                            .fg(Color::White)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::raw("    "),
+                    Span::styled(
+                        " [n / Esc] Cancel ",
+                        Style::default().bg(Color::DarkGray).fg(Color::White),
+                    ),
+                ]);
+
+                let infos = vec![
+                    Line::from(Span::styled(
+                        format!("Terminate '{name}' (PID {pid})?"),
+                        Style::default()
+                            .fg(Color::White)
+                            .add_modifier(Modifier::BOLD),
+                    )),
+                    Line::from(""),
+                    Line::from(Span::styled(
+                        "Freed ghost space returns to disk once it exits.",
+                        Style::default().fg(Color::LightGreen),
+                    )),
+                    Line::from(Span::styled(
+                        "Prefer SIGTERM: SIGKILL on databases risks corruption.",
+                        Style::default().fg(Color::Yellow),
+                    )),
+                    Line::from(""),
+                ];
+
+                (title, border_color, prompt, infos)
+            }
         }
     };
 
@@ -1856,7 +2065,7 @@ fn render_help_modal(f: &mut Frame, screen: Rect) {
         screen.width.saturating_sub(2)
     };
     let popup_height = if is_wide {
-        16.min(screen.height.saturating_sub(2))
+        18.min(screen.height.saturating_sub(2))
     } else {
         22.min(screen.height.saturating_sub(2))
     };
@@ -1899,6 +2108,8 @@ fn render_help_modal(f: &mut Frame, screen: Rect) {
             Line::from("  Home / End   Top / Bottom"),
             Line::from(""),
             Line::from("  i            Item & Disk info"),
+            Line::from("  T / J        Top 50 files / Janitor"),
+            Line::from("  ! / o / y    Shell here / Open / Copy path"),
             Line::from("  s            Cycle sort order"),
             Line::from("  A            Toggle Apparent size"),
             Line::from("  c            Toggle Safe-only filter (🟢)"),
@@ -1953,6 +2164,7 @@ fn render_help_modal(f: &mut Frame, screen: Rect) {
                     .add_modifier(Modifier::BOLD),
             )),
             Line::from("  Space: Sel │ t/w: Trash │ d/D: Delete │ i: Info"),
+            Line::from("  !: Shell │ o: Open │ y: Copy │ K: Kill (ghost)"),
             Line::from(""),
             Line::from(Span::styled(
                 "SAFETY & MODES: ",
@@ -2337,6 +2549,7 @@ fn render_footer(f: &mut Frame, app: &App, area: Rect) {
                     ("[Tab] Explorer", Color::Black, Color::LightCyan),
                     ("[1/2] Tab", Color::White, Color::DarkGray),
                     ("[p] Prune Docker", Color::Black, Color::Yellow),
+                    ("[K] Kill proc", Color::Black, Color::Red),
                     ("[r] Refresh", Color::Black, Color::Green),
                     ("[q] Back", Color::White, Color::DarkGray),
                 ]
@@ -2344,6 +2557,7 @@ fn render_footer(f: &mut Frame, app: &App, area: Rect) {
                 vec![
                     ("[Tab] Explorer", Color::Black, Color::LightCyan),
                     ("[p] Prune", Color::Black, Color::Yellow),
+                    ("[K] Kill", Color::Black, Color::Red),
                     ("[r] Ref", Color::Black, Color::Green),
                     ("[q] Back", Color::White, Color::DarkGray),
                 ]
@@ -2360,17 +2574,95 @@ fn render_footer(f: &mut Frame, app: &App, area: Rect) {
             }
             spans
         }
-        ActiveView::ConfirmModal => vec![
-            Span::styled(
-                " [y] Confirm Action ",
-                Style::default().fg(Color::Black).bg(Color::Yellow),
-            ),
-            Span::raw(" "),
-            Span::styled(
-                " [n / Esc] Cancel ",
-                Style::default().fg(Color::White).bg(Color::DarkGray),
-            ),
-        ],
+        ActiveView::TopFiles => {
+            let candidate_keys: Vec<(&str, Color, Color)> = if area.width >= 80 {
+                vec![
+                    ("[Enter] Jump to file", Color::Black, Color::LightCyan),
+                    ("[t] Trash", Color::Black, Color::Yellow),
+                    ("[d] Delete", Color::Black, Color::Red),
+                    ("[Esc] Back", Color::White, Color::DarkGray),
+                ]
+            } else {
+                vec![
+                    ("[Enter] Jump", Color::Black, Color::LightCyan),
+                    ("[t/d] Act", Color::Black, Color::Yellow),
+                    ("[Esc] Back", Color::White, Color::DarkGray),
+                ]
+            };
+            let mut spans = Vec::new();
+            for (idx, (label, fg, bg)) in candidate_keys.into_iter().enumerate() {
+                if idx > 0 {
+                    spans.push(Span::raw(" "));
+                }
+                spans.push(Span::styled(
+                    format!(" {} ", label),
+                    Style::default().fg(fg).bg(bg),
+                ));
+            }
+            spans
+        }
+        ActiveView::Janitor => {
+            let candidate_keys: Vec<(&str, Color, Color)> = if area.width >= 90 {
+                vec![
+                    ("[Space] Toggle", Color::Black, Color::LightCyan),
+                    ("[Tab] Scope", Color::White, Color::DarkGray),
+                    ("[Enter] Trash", Color::Black, Color::Yellow),
+                    ("[d] Delete", Color::Black, Color::Red),
+                    ("[Esc] Back", Color::White, Color::DarkGray),
+                ]
+            } else {
+                vec![
+                    ("[Spc] Tog", Color::Black, Color::LightCyan),
+                    ("[Tab] Scope", Color::White, Color::DarkGray),
+                    ("[Enter] Trash", Color::Black, Color::Yellow),
+                    ("[Esc] Back", Color::White, Color::DarkGray),
+                ]
+            };
+            let mut spans = Vec::new();
+            for (idx, (label, fg, bg)) in candidate_keys.into_iter().enumerate() {
+                if idx > 0 {
+                    spans.push(Span::raw(" "));
+                }
+                spans.push(Span::styled(
+                    format!(" {} ", label),
+                    Style::default().fg(fg).bg(bg),
+                ));
+            }
+            spans
+        }
+        ActiveView::ConfirmModal => {
+            // The kill confirmation answers 1/2, not y.
+            if matches!(&app.pending_action, Some(ConfirmAction::KillProcess { .. })) {
+                vec![
+                    Span::styled(
+                        " [1] SIGTERM ",
+                        Style::default().fg(Color::Black).bg(Color::Yellow),
+                    ),
+                    Span::raw(" "),
+                    Span::styled(
+                        " [2] SIGKILL ",
+                        Style::default().fg(Color::White).bg(Color::Red),
+                    ),
+                    Span::raw(" "),
+                    Span::styled(
+                        " [n / Esc] Cancel ",
+                        Style::default().fg(Color::White).bg(Color::DarkGray),
+                    ),
+                ]
+            } else {
+                vec![
+                    Span::styled(
+                        " [y] Confirm Action ",
+                        Style::default().fg(Color::Black).bg(Color::Yellow),
+                    ),
+                    Span::raw(" "),
+                    Span::styled(
+                        " [n / Esc] Cancel ",
+                        Style::default().fg(Color::White).bg(Color::DarkGray),
+                    ),
+                ]
+            }
+        }
         ActiveView::HelpModal => vec![Span::styled(
             " [? / Esc] Close Help ",
             Style::default().fg(Color::White).bg(Color::DarkGray),
