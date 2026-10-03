@@ -786,6 +786,21 @@ fn test_export_supports_non_utf8_names() {
 }
 
 #[test]
+fn test_export_envelope_carries_version() {
+    let temp_dir = tempfile::tempdir().expect("create temp dir");
+    fs::write(temp_dir.path().join("a.txt"), "x").unwrap();
+    let stop_signal = Arc::new(AtomicBool::new(false));
+    let root = ghostdu_scanner::scan_directory(temp_dir.path(), None, stop_signal).unwrap();
+    let envelope = ghostdu::fs::ExportEnvelope::wrap(root);
+    assert_eq!(envelope.format_version, ghostdu::fs::EXPORT_FORMAT_VERSION);
+    let json = serde_json::to_string(&envelope).unwrap();
+    // Round-trips through the future --import path.
+    let back: ghostdu::fs::ExportEnvelope = serde_json::from_str(&json).unwrap();
+    assert_eq!(back.format_version, ghostdu::fs::EXPORT_FORMAT_VERSION);
+    assert_eq!(back.root.children.len(), 1);
+}
+
+#[test]
 fn test_reclaimable_precomputed_aggregates_o1() {
     let temp_dir = tempfile::tempdir().expect("create temp dir");
     let base = temp_dir.path();
