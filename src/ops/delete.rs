@@ -139,17 +139,28 @@ pub(super) fn verify_identity(parent: &File, name: &CStr, target: &File) -> io::
 }
 
 fn remove_at(parent: &File, name: &CStr, target: &File) -> io::Result<()> {
+    remove_at_with_hook(parent, name, target, &|_, _| {})
+}
+
+fn remove_at_with_hook(
+    parent: &File,
+    name: &CStr,
+    target: &File,
+    after_verification: &impl Fn(&File, &CStr),
+) -> io::Result<()> {
     verify_identity(parent, name, target)?;
     let is_dir = target.metadata()?.is_dir();
     if is_dir {
         let (directory, names) = directory_entries(target)?;
         for child_name in names {
             let child = open_child(&directory, &child_name)?;
-            remove_at(&directory, &child_name, &child)?;
+            remove_at_with_hook(&directory, &child_name, &child, after_verification)?;
         }
     }
     verify_identity(parent, name, target)?;
-    // unlinkat never follows the final symlink; recursive work used pinned handles only.
+    after_verification(parent, name);
+    // The final name can still change after verification; this is not an atomic
+    // compare-and-unlink. unlinkat never follows a replacement final symlink.
     unlinkat(
         parent,
         name,
@@ -166,6 +177,23 @@ fn remove_at(parent: &File, name: &CStr, target: &File) -> io::Result<()> {
 mod tests {
     use super::*;
     use std::os::unix::fs::symlink;
+
+    #[test]
+    fn replacement_after_final_verification_demonstrates_namespace_limit() {
+        let fixture = tempfile::tempdir().unwrap();
+        let source = fixture.path().join("source");
+        let saved = fixture.path().join("saved");
+        fs::write(&source, "confirmed").unwrap();
+        let (parent, name, target) = prepare_target(&source).unwrap();
+        remove_at_with_hook(&parent, &name, &target, &|_, _| {
+            fs::rename(&source, &saved).unwrap();
+            fs::write(&source, "replacement").unwrap();
+        })
+        .unwrap();
+        assert_eq!(fs::read_to_string(saved).unwrap(), "confirmed");
+        // Records the limitation, rather than claiming checks serialize writers.
+        assert!(!source.exists());
+    }
 
     #[test]
     fn replacing_parent_cannot_redirect_checked_deletion() {

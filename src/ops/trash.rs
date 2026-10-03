@@ -3,6 +3,7 @@ use rustix::fs::{
     mkdirat, openat2, renameat_with, unlinkat, AtFlags, Mode, OFlags, RenameFlags, ResolveFlags,
     CWD,
 };
+use std::collections::HashMap;
 use std::ffi::{CStr, OsStr};
 use std::fs::{self, File};
 use std::io::{self, Write};
@@ -35,7 +36,16 @@ fn trash_with_verification<P: AsRef<Path>>(
     paths: &[P],
     verify: impl Fn(&Path, &File) -> io::Result<()>,
 ) -> TrashResult {
+    trash_with_destination(paths, verify, trash_directory)
+}
+
+fn trash_with_destination<P: AsRef<Path>>(
+    paths: &[P],
+    verify: impl Fn(&Path, &File) -> io::Result<()>,
+    mut resolve: impl FnMut(&File) -> io::Result<(File, Option<PathBuf>)>,
+) -> TrashResult {
     let mut result = TrashResult::default();
+    let mut destinations = HashMap::new();
     for path in paths {
         let path = path.as_ref();
         let moved: io::Result<()> = (|| {
@@ -43,15 +53,33 @@ fn trash_with_verification<P: AsRef<Path>>(
             verify(path, &target)?;
             inspect_tree(&target)?;
             let original = fd_path(&parent)?.join(OsStr::from_bytes(name.to_bytes()));
-            let (trash, topdir) = trash_directory(&parent)?;
-            let restore_path = match topdir {
-                Some(topdir) => original
-                    .strip_prefix(topdir)
-                    .map_err(io::Error::other)?
-                    .to_path_buf(),
-                None => original,
+            let uncached;
+            let destination = if let Some(mount) = mount_id(&parent)? {
+                match destinations.entry(mount) {
+                    std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+                    std::collections::hash_map::Entry::Vacant(entry) => {
+                        let (trash, topdir) = resolve(&parent)?;
+                        entry.insert(TrashDestination::open(&parent, trash, topdir)?)
+                    }
+                }
+            } else {
+                // Device IDs cannot distinguish bind mounts on older kernels.
+                let (trash, topdir) = resolve(&parent)?;
+                uncached = TrashDestination::open(&parent, trash, topdir)?;
+                &uncached
             };
-            move_verified(&parent, &name, &target, &trash, &restore_path)
+            let restore_path = match &destination.topdir {
+                Some(topdir) => original.strip_prefix(topdir).map_err(io::Error::other)?,
+                None => &original,
+            };
+            move_prepared_with_hook(
+                &parent,
+                &name,
+                &target,
+                destination,
+                restore_path,
+                |_, _, _| {},
+            )
         })();
         match moved {
             Ok(()) => result.succeeded.push(path.to_path_buf()),
@@ -59,6 +87,43 @@ fn trash_with_verification<P: AsRef<Path>>(
         }
     }
     result
+}
+
+struct TrashDestination {
+    // Keep the source mount alive for the lifetime of its cached mount ID.
+    _source: File,
+    trash: File,
+    files: File,
+    info: File,
+    topdir: Option<PathBuf>,
+}
+
+impl TrashDestination {
+    fn open(source: &File, trash: File, topdir: Option<PathBuf>) -> io::Result<Self> {
+        let files = private_directory(&trash, Path::new("files"))?;
+        let info = private_directory(&trash, Path::new("info"))?;
+        Ok(Self {
+            _source: source.try_clone()?,
+            trash,
+            files,
+            info,
+            topdir,
+        })
+    }
+
+    fn validate(&self) -> io::Result<()> {
+        // Recheck mutable permissions without repeating pathname setup/discovery.
+        for directory in [&self.trash, &self.files, &self.info] {
+            validate_private(directory)?;
+        }
+        Ok(())
+    }
+}
+
+fn mount_id(directory: &File) -> io::Result<Option<u64>> {
+    use rustix::fs::{statx, StatxFlags};
+    let stat = statx(directory, "", AtFlags::EMPTY_PATH, StatxFlags::MNT_ID)?;
+    Ok((stat.stx_mask & StatxFlags::MNT_ID.bits() != 0).then_some(stat.stx_mnt_id))
 }
 
 fn fd_path(directory: &File) -> io::Result<PathBuf> {
@@ -90,13 +155,18 @@ fn private_directory(parent: &File, name: &Path) -> io::Result<File> {
         Err(error) => return Err(error.into()),
     }
     let directory = open_directory(parent, name, true)?;
+    validate_private(&directory)?;
+    Ok(directory)
+}
+
+fn validate_private(directory: &File) -> io::Result<()> {
     let meta = directory.metadata()?;
     if meta.uid() != effective_uid() || meta.mode() & 0o077 != 0 {
         return Err(io::Error::other(
             "Trash directory must be owned by the current user and private (0700)",
         ));
     }
-    Ok(directory)
+    Ok(())
 }
 
 fn data_home_path() -> io::Result<PathBuf> {
@@ -233,6 +303,7 @@ fn encode_path(path: &Path) -> String {
     encoded
 }
 
+#[cfg(test)]
 fn move_verified(
     parent: &File,
     name: &CStr,
@@ -247,10 +318,11 @@ fn move_verified(
 enum MovePhase {
     Reserved,
     MetadataSynced,
+    Verified,
     Renamed,
 }
 
-// The hook permits subprocess interruption tests at actual transaction boundaries.
+#[cfg(test)]
 fn move_verified_with_hook(
     parent: &File,
     name: &CStr,
@@ -259,15 +331,29 @@ fn move_verified_with_hook(
     original: &Path,
     hook: impl Fn(MovePhase, &File, &str),
 ) -> io::Result<()> {
-    let files = private_directory(trash, Path::new("files"))?;
-    let info = private_directory(trash, Path::new("info"))?;
+    let destination = TrashDestination::open(parent, trash.try_clone()?, None)?;
+    move_prepared_with_hook(parent, name, target, &destination, original, hook)
+}
+
+// The hook permits interruption and namespace-replacement probes at actual boundaries.
+fn move_prepared_with_hook(
+    parent: &File,
+    name: &CStr,
+    target: &File,
+    destination: &TrashDestination,
+    original: &Path,
+    hook: impl Fn(MovePhase, &File, &str),
+) -> io::Result<()> {
+    destination.validate()?;
+    let files = &destination.files;
+    let info = &destination.info;
     static NEXT_NAME: AtomicU64 = AtomicU64::new(0);
     for _ in 0..1000 {
         let sequence = NEXT_NAME.fetch_add(1, Ordering::Relaxed);
         let stored_name = format!("ghostdu-{}-{sequence}", std::process::id());
         let info_name = format!("{stored_name}.trashinfo");
         let metadata_fd = match openat2(
-            &info,
+            info,
             &info_name,
             OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
             Mode::RUSR | Mode::WUSR,
@@ -277,7 +363,7 @@ fn move_verified_with_hook(
             Err(rustix::io::Errno::EXIST) => continue,
             Err(error) => return Err(error.into()),
         };
-        hook(MovePhase::Reserved, &info, &info_name);
+        hook(MovePhase::Reserved, info, &info_name);
         let moved: io::Result<()> = (|| {
             let mut metadata = File::from(metadata_fd);
             writeln!(
@@ -287,16 +373,17 @@ fn move_verified_with_hook(
                 chrono::Local::now().format("%Y-%m-%dT%H:%M:%S")
             )?;
             metadata.sync_all()?;
-            hook(MovePhase::MetadataSynced, &info, &info_name);
+            hook(MovePhase::MetadataSynced, info, &info_name);
             verify_identity(parent, name, target)?;
+            hook(MovePhase::Verified, info, &info_name);
             // Both directories stay pinned. Never re-resolve the user's source path or copy/delete.
-            renameat_with(parent, name, &files, &stored_name, RenameFlags::NOREPLACE)?;
-            hook(MovePhase::Renamed, &info, &info_name);
+            renameat_with(parent, name, files, &stored_name, RenameFlags::NOREPLACE)?;
+            hook(MovePhase::Renamed, info, &info_name);
             Ok(())
         })();
         if let Err(error) = &moved {
-            if let Err(cleanup) = unlinkat(&info, &info_name, AtFlags::empty()) {
-                let location = fd_path(&info)
+            if let Err(cleanup) = unlinkat(info, &info_name, AtFlags::empty()) {
+                let location = fd_path(info)
                     .map(|path| path.join(&info_name))
                     .unwrap_or_else(|_| PathBuf::from(&info_name));
                 return Err(io::Error::other(format!(
@@ -317,6 +404,112 @@ fn move_verified_with_hook(
 mod tests {
     use super::*;
     use std::os::unix::fs::symlink;
+
+    #[test]
+    fn batch_reuses_destination_and_continues_after_independent_failure() {
+        let fixture = tempfile::tempdir().unwrap();
+        let paths: Vec<_> = (0..64)
+            .map(|index| {
+                let path = fixture.path().join(format!("source-{index}"));
+                fs::write(&path, "payload").unwrap();
+                path
+            })
+            .collect();
+        let mut resolutions = 0;
+        let result = trash_with_destination(
+            &paths,
+            |path, _| {
+                if path == paths[17] {
+                    Err(io::Error::other("injected target failure"))
+                } else {
+                    Ok(())
+                }
+            },
+            |parent| {
+                resolutions += 1;
+                Ok((private_directory(parent, Path::new("Trash"))?, None))
+            },
+        );
+        assert_eq!(resolutions, 1);
+        assert_eq!(result.succeeded.len(), 63);
+        assert_eq!(result.failed.len(), 1);
+        assert_eq!(result.failed[0].0, paths[17]);
+        assert!(paths[17].exists());
+        for directory in ["files", "info"] {
+            assert_eq!(
+                fs::read_dir(fixture.path().join("Trash").join(directory))
+                    .unwrap()
+                    .count(),
+                63
+            );
+        }
+    }
+
+    #[test]
+    fn cached_destination_rechecks_privacy_before_each_move() {
+        use std::os::unix::fs::PermissionsExt;
+        let fixture = tempfile::tempdir().unwrap();
+        let paths: Vec<_> = ["first", "second", "third"]
+            .into_iter()
+            .map(|name| {
+                let path = fixture.path().join(name);
+                fs::write(&path, "payload").unwrap();
+                path
+            })
+            .collect();
+        let mut resolutions = 0;
+        let result = trash_with_destination(
+            &paths,
+            |path, _| {
+                if path == paths[1] {
+                    fs::set_permissions(
+                        fixture.path().join("Trash/files"),
+                        fs::Permissions::from_mode(0o755),
+                    )?;
+                }
+                Ok(())
+            },
+            |parent| {
+                resolutions += 1;
+                Ok((private_directory(parent, Path::new("Trash"))?, None))
+            },
+        );
+        assert_eq!(resolutions, 1);
+        assert_eq!(result.succeeded, vec![paths[0].clone()]);
+        assert_eq!(result.failed.len(), 2);
+        assert!(result
+            .failed
+            .iter()
+            .all(|(_, error)| error.contains("private")));
+        assert!(paths[1].exists() && paths[2].exists());
+    }
+
+    #[test]
+    fn replacement_after_final_verification_demonstrates_namespace_limit() {
+        let fixture = tempfile::tempdir().unwrap();
+        let source = fixture.path().join("source");
+        let saved = fixture.path().join("saved");
+        fs::write(&source, "confirmed").unwrap();
+        let trash =
+            private_directory(&File::open(fixture.path()).unwrap(), Path::new("Trash")).unwrap();
+        let (parent, name, target) = prepare_target(&source).unwrap();
+        move_verified_with_hook(&parent, &name, &target, &trash, &source, |phase, _, _| {
+            if phase == MovePhase::Verified {
+                fs::rename(&source, &saved).unwrap();
+                fs::write(&source, "replacement").unwrap();
+            }
+        })
+        .unwrap();
+        assert_eq!(fs::read_to_string(saved).unwrap(), "confirmed");
+        assert!(!source.exists());
+        let stored = fs::read_dir(fixture.path().join("Trash/files"))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        assert_eq!(fs::read_to_string(stored).unwrap(), "replacement");
+    }
 
     #[test]
     fn trash_move_stays_with_checked_parent_and_writes_restore_metadata() {
