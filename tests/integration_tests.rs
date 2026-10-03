@@ -1183,8 +1183,8 @@ fn replacement_between_scan_and_confirmation_or_selection_is_rejected() {
         ghostdu_scanner::scan_directory(fixture.path(), None, Arc::new(AtomicBool::new(false)))
             .unwrap();
 
-    // Replace the scanned target before selection or confirmation
-    fs::remove_file(&file_path).unwrap();
+    // Rename original file away so its inode remains allocated and cannot be recycled
+    fs::rename(&file_path, fixture.path().join("original.txt")).unwrap();
     fs::write(&file_path, "replaced with different ino").unwrap();
 
     // 1. Attempting to select the replaced item must fail closed
@@ -1214,7 +1214,7 @@ fn replacement_between_scan_and_confirmation_or_selection_is_rejected() {
         ghostdu_scanner::scan_directory(fixture.path(), None, Arc::new(AtomicBool::new(false)))
             .unwrap();
 
-    fs::remove_file(&nested_file).unwrap();
+    fs::rename(&nested_file, nested_dir.join("inner_original.txt")).unwrap();
     fs::write(&nested_file, "nested replaced").unwrap();
 
     let mut app3 = ghostdu::ui::App::new(root_nested);
