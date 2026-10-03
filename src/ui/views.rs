@@ -1899,6 +1899,7 @@ fn render_help_modal(f: &mut Frame, screen: Rect) {
             Line::from("  Home / End   Top / Bottom"),
             Line::from(""),
             Line::from("  i            Item & Disk info"),
+            Line::from("  ! / o / y    Shell here / Open / Copy path"),
             Line::from("  s            Cycle sort order"),
             Line::from("  A            Toggle Apparent size"),
             Line::from("  c            Toggle Safe-only filter (🟢)"),
@@ -1953,6 +1954,7 @@ fn render_help_modal(f: &mut Frame, screen: Rect) {
                     .add_modifier(Modifier::BOLD),
             )),
             Line::from("  Space: Sel │ t/w: Trash │ d/D: Delete │ i: Info"),
+            Line::from("  !: Shell │ o: Open │ y: Copy path"),
             Line::from(""),
             Line::from(Span::styled(
                 "SAFETY & MODES: ",

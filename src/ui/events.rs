@@ -2,11 +2,43 @@ use crate::ui::app::{ActiveView, App};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use std::path::PathBuf;
 
+/// Copy text via Wayland then X11 clipboard tools. Reports the first tool
+/// that accepts the input; errors only when none exists.
+fn copy_to_clipboard(text: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::process::Stdio;
+    let attempts = [
+        ("wl-copy", Vec::<&str>::new()),
+        ("xclip", vec!["-selection", "clipboard"]),
+        ("xsel", vec!["--clipboard", "--input"]),
+    ];
+    for (tool, args) in attempts {
+        if let Ok(mut child) = std::process::Command::new(tool)
+            .args(&args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+        {
+            if child
+                .stdin
+                .take()
+                .is_some_and(|mut stdin| stdin.write_all(text.as_bytes()).is_ok())
+                && child.wait().is_ok_and(|status| status.success())
+            {
+                return Ok(());
+            }
+        }
+    }
+    Err(std::io::Error::other("no clipboard tool available"))
+}
+
 pub enum EventResult {
     Continue,
     Exit,
     RescanRequested,
     RescanPath(PathBuf),
+    Subshell(PathBuf),
 }
 
 pub fn handle_key_event(app: &mut App, key: KeyEvent) -> EventResult {
@@ -268,6 +300,50 @@ fn handle_filesystem_keys(app: &mut App, key: KeyEvent) -> EventResult {
         // Utilities
         KeyCode::Char('i') | KeyCode::Char('I') => {
             app.open_item_info();
+            EventResult::Continue
+        }
+        // Shell & desktop integration: suspend for a subshell, or fire-and-forget.
+        KeyCode::Char('!') => {
+            let dir = app
+                .visible_children()
+                .get(app.cursor_index)
+                .map(|e| {
+                    if e.is_dir && !e.is_symlink {
+                        e.path.clone()
+                    } else {
+                        e.path
+                            .parent()
+                            .map(|p| p.to_path_buf())
+                            .unwrap_or_else(|| e.path.clone())
+                    }
+                })
+                .unwrap_or_else(|| app.current_dir_entry().path.clone());
+            EventResult::Subshell(dir)
+        }
+        KeyCode::Char('o') | KeyCode::Char('O') => {
+            if let Some(target) = app
+                .visible_children()
+                .get(app.cursor_index)
+                .map(|e| e.path.clone())
+            {
+                match std::process::Command::new("xdg-open").arg(&target).spawn() {
+                    Ok(_) => app.set_status(format!("Opened {}", target.display())),
+                    Err(error) => app.set_status(format!("Cannot open: {error}")),
+                }
+            }
+            EventResult::Continue
+        }
+        KeyCode::Char('y') | KeyCode::Char('Y') => {
+            if let Some(target) = app
+                .visible_children()
+                .get(app.cursor_index)
+                .map(|e| e.path.clone())
+            {
+                match copy_to_clipboard(&target.to_string_lossy()) {
+                    Ok(_) => app.set_status(format!("Copied: {}", target.display())),
+                    Err(_) => app.set_status("No clipboard tool (wl-copy/xclip/xsel)"),
+                }
+            }
             EventResult::Continue
         }
         KeyCode::Char('r') => {
