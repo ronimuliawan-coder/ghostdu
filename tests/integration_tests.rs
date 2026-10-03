@@ -701,10 +701,88 @@ fn test_scanner_cross_mount_option() {
     let stop_signal = Arc::new(AtomicBool::new(false));
     let options = ghostdu_scanner::ScannerOptions {
         cross_mounts: false,
+        ..Default::default()
     };
     let root =
         ghostdu_scanner::scan_directory_with_options(base, None, stop_signal, options).unwrap();
     assert_eq!(root.children.len(), 1);
+}
+
+#[test]
+fn test_scan_excludes_and_depth_cap() {
+    let temp_dir = tempfile::tempdir().expect("create temp dir");
+    let base = temp_dir.path();
+    let excluded = base.join("node_modules");
+    let deep = base.join("deep").join("deeper");
+    fs::create_dir_all(&excluded).unwrap();
+    fs::create_dir_all(&deep).unwrap();
+    fs::write(excluded.join("dep.js"), "x").unwrap();
+    fs::write(base.join("top.txt"), "x").unwrap();
+    fs::write(deep.join("nested.txt"), "x").unwrap();
+
+    let stop_signal = Arc::new(AtomicBool::new(false));
+    let root = ghostdu_scanner::scan_directory_with_options(
+        base,
+        None,
+        stop_signal,
+        ghostdu_scanner::ScannerOptions {
+            excludes: vec!["node_modules".to_string()],
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert!(root.children.iter().all(|e| e.name != "node_modules"));
+
+    let stop_signal = Arc::new(AtomicBool::new(false));
+    let shallow = ghostdu_scanner::scan_directory_with_options(
+        base,
+        None,
+        stop_signal,
+        ghostdu_scanner::ScannerOptions {
+            max_depth: Some(1),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let deep_entry = shallow.children.iter().find(|e| e.name == "deep").unwrap();
+    assert!(deep_entry.children.is_empty());
+
+    let stop_signal = Arc::new(AtomicBool::new(false));
+    let root_only = ghostdu_scanner::scan_directory_with_options(
+        base,
+        None,
+        stop_signal,
+        ghostdu_scanner::ScannerOptions {
+            max_depth: Some(0),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert!(root_only.children.is_empty());
+}
+
+#[test]
+#[cfg(unix)]
+fn test_export_supports_non_utf8_names() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+
+    let temp_dir = tempfile::tempdir().expect("create temp dir");
+    let raw = [b'n', b'a', 0xFF, b'm', b'e'];
+    let name = OsStr::from_bytes(&raw);
+    fs::write(temp_dir.path().join(name), "x").unwrap();
+
+    let stop_signal = Arc::new(AtomicBool::new(false));
+    let root = ghostdu_scanner::scan_directory(temp_dir.path(), None, stop_signal).unwrap();
+    // Serde's PathBuf serializer rejects non-UTF-8; the export path must not.
+    let json = serde_json::to_string_pretty(&root).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+    let entry = &parsed["children"][0];
+    assert_eq!(entry["name"], "na\u{FFFD}me".to_string());
+    assert_eq!(
+        entry["path"],
+        root.children[0].path.to_string_lossy().into_owned()
+    );
 }
 
 #[test]

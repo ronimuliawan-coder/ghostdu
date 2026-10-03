@@ -1,5 +1,6 @@
 use crate::fs::entry::{DeleteSafety, FileEntry};
 use crate::fs::mount_info::{get_detailed_item_info, query_fs_info, DetailedItemInfo, FsMountInfo};
+use crate::fs::scanner::ScannerOptions;
 use crate::ghost::{
     classify_path, classify_safety, fetch_docker_disk_info, prune_docker_dangling,
     scan_deleted_open_files, DeletedOpenFile, DockerDiskInfo,
@@ -82,6 +83,8 @@ pub enum ConfirmAction {
 
 pub struct App {
     pub root_entry: FileEntry,
+    /// Scan flags in effect; refreshes reuse them so CLI options persist.
+    pub scan_options: ScannerOptions,
     pub path_stack: Vec<usize>, // Index stack navigating into child directories
     pub selected_paths: HashSet<PathBuf>,
     selected_identities: TargetIdentities,
@@ -125,6 +128,7 @@ impl App {
 
         Self {
             root_entry,
+            scan_options: ScannerOptions::default(),
             path_stack: Vec::new(),
             selected_paths: HashSet::new(),
             selected_identities: TargetIdentities::new(),
@@ -967,7 +971,19 @@ impl App {
         let mut reconciled = true;
         let mut updates = HashMap::new();
         for path in roots {
-            match crate::fs::scanner::rescan_entry(&path, self.root_entry.dev, &mut seen) {
+            // Depth relative to the scan root keeps the original budget;
+            // unknown layouts fall back to full depth (previous behavior).
+            let base_depth = path
+                .strip_prefix(&self.root_entry.path)
+                .map(|p| p.components().count())
+                .unwrap_or(0);
+            match crate::fs::scanner::rescan_entry(
+                &path,
+                self.root_entry.dev,
+                &mut seen,
+                &self.scan_options,
+                base_depth,
+            ) {
                 Ok(entry) => {
                     reconciled &= !has_errors(&entry);
                     updates.insert(path, Some(entry));
@@ -1100,15 +1116,32 @@ impl App {
 
         let stop_signal = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         if is_at_root {
-            if let Ok(new_root) =
-                crate::fs::scanner::scan_directory(&self.root_entry.path, None, stop_signal)
-            {
+            if let Ok(new_root) = crate::fs::scanner::scan_directory_with_options(
+                &self.root_entry.path,
+                None,
+                stop_signal,
+                self.scan_options.clone(),
+            ) {
                 self.root_entry = new_root;
             }
         } else {
-            if let Ok(new_subtree) =
-                crate::fs::scanner::scan_directory(&current_path, None, stop_signal)
-            {
+            // A subtree refresh restarts traversal at the current directory, so
+            // shrink the depth budget by its level below the scan root. A zero
+            // remainder rescans the directory alone (see ScannerOptions).
+            let mut options = self.scan_options.clone();
+            if let Some(max) = options.max_depth {
+                let depth = current_path
+                    .strip_prefix(&self.root_entry.path)
+                    .map(|p| p.components().count())
+                    .unwrap_or(0);
+                options.max_depth = Some(max.saturating_sub(depth));
+            }
+            if let Ok(new_subtree) = crate::fs::scanner::scan_directory_with_options(
+                &current_path,
+                None,
+                stop_signal,
+                options,
+            ) {
                 self.replace_subtree(&current_path, new_subtree);
             }
         }
