@@ -8,8 +8,8 @@ use crossterm::{
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use fs::{
-    format_count, format_size, scan_directory, truncate_end_by_width, truncate_start_by_width,
-    ScanProgress,
+    format_count, format_size, scan_directory_with_options, truncate_end_by_width,
+    truncate_start_by_width, ScanProgress, ScannerOptions,
 };
 use ratatui::{
     backend::CrosstermBackend,
@@ -29,7 +29,7 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
-use ui::{handle_key_event, render_ui, App, EventResult};
+use ui::{handle_key_event, render_ui, App, EventResult, GhostFilterMode, SortMode};
 use unicode_width::UnicodeWidthStr;
 
 use std::io::IsTerminal;
@@ -48,22 +48,81 @@ struct Cli {
     /// Non-interactive summary report (auto-enabled if not running in an interactive terminal)
     #[arg(short, long)]
     summary: bool,
+
+    /// Scan across mount boundaries instead of stopping at them
+    #[arg(long, visible_alias = "cm")]
+    cross_mounts: bool,
+
+    /// Skip any path containing this substring (repeatable)
+    #[arg(long, value_name = "PATTERN")]
+    exclude: Vec<String>,
+
+    /// Limit scan descent to N levels (1 = top level only, 0 = root only)
+    #[arg(long, value_name = "N")]
+    depth: Option<usize>,
+
+    /// Start with only safe-to-clean items shown
+    #[arg(long)]
+    safe_only: bool,
+
+    /// Start showing ghost files only
+    #[arg(long, conflicts_with = "hide_ghost")]
+    ghost_only: bool,
+
+    /// Start with ghost files hidden
+    #[arg(long, conflicts_with = "ghost_only")]
+    hide_ghost: bool,
+
+    /// Show apparent file sizes instead of disk usage
+    #[arg(long)]
+    apparent_size: bool,
+
+    /// Initial sort order
+    #[arg(long, value_enum, value_name = "MODE")]
+    sort: Option<SortArg>,
+
+    /// Write the scan tree as JSON to FILE and exit
+    #[arg(long, value_name = "FILE")]
+    export: Option<PathBuf>,
+}
+
+#[derive(Copy, Clone, Debug, clap::ValueEnum)]
+enum SortArg {
+    /// Largest first
+    Size,
+    /// Smallest first
+    #[value(name = "size-asc")]
+    SizeAsc,
+    /// Alphabetical
+    Name,
+    /// Most items first
+    Items,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
-    let target_path = cli.path;
+    let target_path = cli.path.clone();
 
     if !target_path.exists() {
         eprintln!("Error: Path {:?} does not exist", target_path);
         std::process::exit(1);
     }
 
+    let scan_options = ScannerOptions {
+        cross_mounts: cli.cross_mounts,
+        excludes: cli.exclude.clone(),
+        max_depth: cli.depth,
+    };
+
+    if let Some(ref export_file) = cli.export {
+        return export_scan(target_path, &scan_options, export_file);
+    }
+
     // Auto-detect non-interactive terminal (e.g. piped or redirected)
     let is_interactive = io::stdout().is_terminal() && io::stdin().is_terminal() && !cli.summary;
 
     if !is_interactive {
-        run_headless_summary(target_path)?;
+        run_headless_summary(target_path, &scan_options)?;
         return Ok(());
     }
 
@@ -82,7 +141,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let app_result = run_app(&mut terminal, target_path);
+    let app_result = run_app(&mut terminal, target_path, &cli, &scan_options);
 
     // Cleanly restore terminal
     disable_raw_mode()?;
@@ -100,6 +159,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 fn run_app<B: ratatui::backend::Backend>(
     terminal: &mut Terminal<B>,
     mut target_path: PathBuf,
+    cli: &Cli,
+    scan_options: &ScannerOptions,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut saved_current_path: Option<PathBuf> = None;
 
@@ -110,8 +171,10 @@ fn run_app<B: ratatui::backend::Backend>(
         let stop_clone = stop_signal.clone();
 
         let scan_path = target_path.clone();
-        let scan_handle =
-            thread::spawn(move || scan_directory(&scan_path, Some(progress_tx), stop_clone));
+        let thread_options = scan_options.clone();
+        let scan_handle = thread::spawn(move || {
+            scan_directory_with_options(&scan_path, Some(progress_tx), stop_clone, thread_options)
+        });
 
         let mut last_progress = ScanProgress {
             files_scanned: 0,
@@ -231,6 +294,26 @@ fn run_app<B: ratatui::backend::Backend>(
 
         // Step 2: Main interactive loop
         let mut app = App::new(root_entry);
+        app.scan_options = scan_options.clone();
+        if cli.safe_only {
+            app.safe_only_filter = true;
+        }
+        if cli.ghost_only {
+            app.ghost_filter = GhostFilterMode::GhostOnly;
+        } else if cli.hide_ghost {
+            app.ghost_filter = GhostFilterMode::HideGhost;
+        }
+        if cli.apparent_size {
+            app.apparent_size = true;
+        }
+        if let Some(sort) = cli.sort {
+            app.sort_mode = match sort {
+                SortArg::Size => SortMode::BySizeDesc,
+                SortArg::SizeAsc => SortMode::BySizeAsc,
+                SortArg::Name => SortMode::ByName,
+                SortArg::Items => SortMode::ByItems,
+            };
+        }
         if let Some(ref saved) = saved_current_path.take() {
             app.navigate_to_path(saved);
             app.set_status("⚡ Rescanned entire tree from root");
@@ -278,14 +361,65 @@ fn centered_rect(width: u16, height: u16, r: Rect) -> Rect {
     }
 }
 
-fn run_headless_summary(target_path: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
+fn export_scan(
+    target_path: PathBuf,
+    scan_options: &ScannerOptions,
+    export_file: &PathBuf,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use std::io::{BufWriter, Write};
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let stop_signal = Arc::new(AtomicBool::new(false));
+    let root_entry =
+        scan_directory_with_options(&target_path, None, stop_signal, scan_options.clone())?;
+    // Stage through a private temp file and rename: a failed export never leaves
+    // a truncated destination, and the listing is never world-readable mid-write.
+    // Exclusive creation fails closed if the staging name already exists (even as
+    // a planted symlink) instead of following it and truncating its target.
+    let mut temp = export_file.clone().into_os_string();
+    temp.push(format!(".tmp-{}", std::process::id()));
+    let temp_path = PathBuf::from(temp);
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&temp_path)?;
+    let result = (|| -> Result<(), Box<dyn std::error::Error>> {
+        let mut writer = BufWriter::new(file);
+        // Stream serialization instead of buffering the whole JSON string.
+        serde_json::to_writer_pretty(&mut writer, &root_entry)?;
+        writer.flush()?;
+        drop(writer);
+        std::fs::rename(&temp_path, export_file)?;
+        Ok(())
+    })();
+    // Remove only the staging file this invocation created; the final
+    // destination is untouched unless the rename succeeded.
+    if let Err(err) = result {
+        let _ = std::fs::remove_file(&temp_path);
+        return Err(err);
+    }
+    println!(
+        "Exported {} ({} apparent) to {}",
+        format_count(root_entry.items_count),
+        format_size(root_entry.size),
+        export_file.display()
+    );
+    Ok(())
+}
+
+fn run_headless_summary(
+    target_path: PathBuf,
+    scan_options: &ScannerOptions,
+) -> Result<(), Box<dyn std::error::Error>> {
     println!(
         "👻 ghostdu: Analyzing disk usage & ghost files for {:?}...",
         target_path
     );
 
     let stop_signal = Arc::new(AtomicBool::new(false));
-    let root_entry = scan_directory(&target_path, None, stop_signal)?;
+    let root_entry =
+        scan_directory_with_options(&target_path, None, stop_signal, scan_options.clone())?;
 
     let docker_info = ghostdu::ghost::fetch_docker_disk_info();
     let deleted_open = ghostdu::ghost::scan_deleted_open_files();
