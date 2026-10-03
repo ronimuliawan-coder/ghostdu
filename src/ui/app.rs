@@ -437,26 +437,37 @@ impl App {
 
     /// Invert / select all in current visible directory
     pub fn select_all_visible(&mut self) {
-        let paths: Vec<PathBuf> = self
+        // Snapshot scanned identities once so the batch avoids a per-item
+        // `find_entry` tree walk (O(n²) for large directories).
+        let entries: Vec<(PathBuf, u64, u64, bool, bool)> = self
             .visible_children()
             .into_iter()
-            .map(|e| e.path.clone())
+            .map(|e| (e.path.clone(), e.dev, e.ino, e.is_dir, e.is_symlink))
             .collect();
-        let all_selected = paths.iter().all(|p| self.selected_paths.contains(p));
+        let all_selected = entries
+            .iter()
+            .all(|(p, _, _, _, _)| self.selected_paths.contains(p));
         if all_selected {
-            for p in &paths {
+            for (p, _, _, _, _) in &entries {
                 self.selected_paths.remove(p);
                 self.selected_identities.remove(p);
             }
         } else {
-            let requested = paths
+            let requested = entries
                 .iter()
-                .filter(|path| !self.selected_paths.contains(*path))
+                .filter(|(path, _, _, _, _)| !self.selected_paths.contains(path))
                 .count();
             let before = self.selected_paths.len();
             let limit = self.selection_limit();
-            for p in paths {
-                if !self.select_path_with_limit(p, limit.as_ref()) {
+            for (p, dev, ino, is_dir, is_symlink) in entries {
+                if !self.select_scanned_entry_with_limit(
+                    p,
+                    dev,
+                    ino,
+                    is_dir,
+                    is_symlink,
+                    limit.as_ref(),
+                ) {
                     let reason = self
                         .current_status()
                         .unwrap_or("Selection stopped")
@@ -522,6 +533,47 @@ impl App {
             }
             Err(error) => {
                 self.set_status(format!("Cannot select item: {error}"));
+                false
+            }
+        }
+    }
+
+    fn select_scanned_entry_with_limit(
+        &mut self,
+        path: PathBuf,
+        dev: u64,
+        ino: u64,
+        is_dir: bool,
+        is_symlink: bool,
+        limit_res: Result<&usize, &std::io::Error>,
+    ) -> bool {
+        if self.selected_paths.contains(&path) {
+            return true;
+        }
+        match limit_res {
+            Ok(&limit) if self.selected_identities.len() >= limit => {
+                self.set_status(format!(
+                    "Selection limit reached ({limit} items); deselect items to leave file handles available"
+                ));
+                return false;
+            }
+            Err(error) => {
+                self.set_status(format!("Cannot determine safe selection limit: {error}"));
+                return false;
+            }
+            Ok(_) => {}
+        }
+        // ponytail: fail closed on zero ids (error entries); caller passes scanned ids directly
+        match TargetIdentity::capture(&path) {
+            Ok(identity) if identity.matches_ids(dev, ino, is_dir, is_symlink) => {
+                self.selected_identities.insert(path.clone(), identity);
+                self.selected_paths.insert(path);
+                true
+            }
+            Ok(_) | Err(_) => {
+                self.set_status(
+                    "Cannot select item: Target changed since scan; refresh and select it again",
+                );
                 false
             }
         }
