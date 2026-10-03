@@ -1,4 +1,4 @@
-use crate::ui::app::{ActiveView, App};
+use crate::ui::app::{ActiveView, App, ConfirmAction};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use std::path::PathBuf;
 
@@ -57,6 +57,20 @@ pub fn handle_key_event(app: &mut App, key: KeyEvent) -> EventResult {
 }
 
 fn handle_confirm_keys(app: &mut App, key: KeyEvent) -> EventResult {
+    // Process termination answers 1/2 instead of y/n.
+    let kill_pid = match &app.pending_action {
+        Some(ConfirmAction::KillProcess { pid, .. }) => Some(*pid),
+        _ => None,
+    };
+    if let Some(pid) = kill_pid {
+        match key.code {
+            KeyCode::Char('1') => app.execute_kill(pid, true),
+            KeyCode::Char('2') => app.execute_kill(pid, false),
+            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => app.cancel_modal(),
+            _ => {}
+        }
+        return EventResult::Continue;
+    }
     match key.code {
         KeyCode::Char('y') | KeyCode::Char('Y') => {
             if app.action_safety_blocked {
@@ -137,6 +151,14 @@ fn handle_ghost_keys(app: &mut App, key: KeyEvent) -> EventResult {
         KeyCode::Char('p') | KeyCode::Char('P') => {
             if app.ghost_tab_index == 0 && app.docker_info.is_available {
                 app.prompt_docker_prune();
+            }
+        }
+        // Terminate the highlighted ghost-table process (table PIDs only).
+        KeyCode::Char('K') => {
+            if app.ghost_tab_index == 1 {
+                if let Some(entry) = app.deleted_open_files.get(app.ghost_cursor_index) {
+                    app.prompt_kill_process(entry.pid, entry.process_name.clone());
+                }
             }
         }
         KeyCode::Char('r') | KeyCode::F(5) => {
