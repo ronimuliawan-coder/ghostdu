@@ -928,6 +928,51 @@ impl App {
         self.active_view = self.previous_view;
     }
 
+    /// Refresh one subtree after external changes (e.g. subshell exit) using the
+    /// active scan policy. Returns false when the rescan itself failed.
+    pub fn refresh_path(&mut self, path: &Path) -> bool {
+        let roots: HashSet<PathBuf> = HashSet::from([path.to_path_buf()]);
+        let mut seen = HashSet::new();
+        Self::seed_retained_inodes(&self.root_entry, &roots, &mut seen);
+        let base_depth = path
+            .strip_prefix(&self.root_entry.path)
+            .map(|p| p.components().count())
+            .unwrap_or(0);
+        match crate::fs::scanner::rescan_entry(
+            path,
+            self.root_entry.dev,
+            &mut seen,
+            &self.scan_options,
+            base_depth,
+        ) {
+            Ok(entry) => {
+                self.replace_subtree(path, entry);
+                self.discard_changed_selections();
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
+    /// Seed hard-link accounting from the retained tree, stopping at rescan roots
+    /// so their descendants are not double-counted.
+    fn seed_retained_inodes(
+        entry: &FileEntry,
+        roots: &HashSet<PathBuf>,
+        seen: &mut HashSet<(u64, u64)>,
+    ) {
+        // Stop at each rescan root, so descendants need no prefix comparisons.
+        if roots.contains(&entry.path) {
+            return;
+        }
+        if entry.is_dir || entry.size > 0 || entry.disk_usage > 0 || entry.safe_items > 0 {
+            seen.insert((entry.dev, entry.ino));
+        }
+        for child in &entry.children {
+            Self::seed_retained_inodes(child, roots, seen);
+        }
+    }
+
     fn reconcile_after_delete_failure(
         &mut self,
         current_path: &Path,
@@ -943,27 +988,11 @@ impl App {
                 roots.push(path);
             }
         }
-        fn retained_inodes(
-            entry: &FileEntry,
-            roots: &HashSet<PathBuf>,
-            seen: &mut HashSet<(u64, u64)>,
-        ) {
-            // Stop at each failed root, so descendants need no prefix comparisons.
-            if roots.contains(&entry.path) {
-                return;
-            }
-            if entry.is_dir || entry.size > 0 || entry.disk_usage > 0 || entry.safe_items > 0 {
-                seen.insert((entry.dev, entry.ino));
-            }
-            for child in &entry.children {
-                retained_inodes(child, roots, seen);
-            }
-        }
         fn has_errors(entry: &FileEntry) -> bool {
             entry.has_err || entry.children.iter().any(has_errors)
         }
         let mut seen = HashSet::new();
-        retained_inodes(
+        Self::seed_retained_inodes(
             &self.root_entry,
             &roots.iter().cloned().collect(),
             &mut seen,

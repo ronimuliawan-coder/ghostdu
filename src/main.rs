@@ -336,6 +336,14 @@ fn run_app<B: ratatui::backend::Backend>(
                             target_path = new_path;
                             break true;
                         }
+                        EventResult::Subshell(dir) => {
+                            run_subshell(terminal, &dir)?;
+                            if app.refresh_path(&dir) {
+                                app.set_status("Subshell exited; directory refreshed");
+                            } else {
+                                app.set_status("Subshell exited; refresh failed");
+                            }
+                        }
                     }
                 }
             }
@@ -346,6 +354,27 @@ fn run_app<B: ratatui::backend::Backend>(
         }
     }
 
+    Ok(())
+}
+
+/// Suspend the TUI, run an interactive shell in `dir`, then restore the TUI.
+/// Restoration runs even when the shell cannot start.
+fn run_subshell<B: ratatui::backend::Backend>(
+    terminal: &mut Terminal<B>,
+    dir: &std::path::Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
+
+    disable_raw_mode()?;
+    execute!(stdout(), LeaveAlternateScreen)?;
+    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
+    let result = std::process::Command::new(shell).current_dir(dir).status();
+    execute!(stdout(), EnterAlternateScreen)?;
+    enable_raw_mode()?;
+    terminal.clear()?;
+    if let Err(error) = result {
+        return Err(format!("Cannot start shell: {error}").into());
+    }
     Ok(())
 }
 
