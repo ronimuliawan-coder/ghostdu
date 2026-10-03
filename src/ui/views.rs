@@ -1649,21 +1649,29 @@ fn render_janitor(f: &mut Frame, app: &App, area: Rect) {
         crate::ui::app::JanitorScope::Current => "current folder",
         crate::ui::app::JanitorScope::Global => "whole scan",
     };
-    let selected_bytes: u64 = app
-        .janitor_cats
-        .iter()
-        .flat_map(|cat| &cat.items)
-        .filter(|item| item.selected)
-        .map(|item| item.size)
-        .sum();
     let title = format!(
         " 🧹 System Janitor — {} (Tab: scope │ Space: toggle │ Enter: trash │ d: delete) — selected {} ",
         scope_label,
-        format_size(selected_bytes),
+        format_size(app.janitor_selected_bytes),
     );
+    // Viewport window around the cursor; only visible rows are constructed,
+    // so large scans cost O(page) per redraw instead of O(tree).
+    let page = area.height.saturating_sub(5).max(1) as usize;
+    let total = app.janitor_row_count();
+    let start = compute_scroll_window(app.janitor_cursor, app.janitor_offset.get(), page, total);
+    app.janitor_offset.set(start);
     let mut rows: Vec<Row> = Vec::new();
+    let mut flat = 0usize;
+    // Windowed push: only visible rows are constructed (O(page) per redraw).
+    macro_rules! push_row {
+        ($row:expr) => {
+            if flat >= start && rows.len() < page {
+                rows.push($row);
+            }
+            flat += 1;
+        };
+    }
     for cat in &app.janitor_cats {
-        let cat_total: u64 = cat.items.iter().map(|item| item.size).sum();
         let marker = if cat.items.is_empty() {
             "  "
         } else if cat.expanded {
@@ -1671,19 +1679,19 @@ fn render_janitor(f: &mut Frame, app: &App, area: Rect) {
         } else {
             "▸ "
         };
-        rows.push(Row::new(vec![
+        push_row!(Row::new(vec![
             "".to_string(),
             format!("{marker}{}", cat.title),
             if cat.items.is_empty() {
                 "—".to_string()
             } else {
-                format_size(cat_total)
+                format_size(cat.total)
             },
         ]));
         if cat.expanded {
             for item in &cat.items {
                 let checkbox = if item.selected { "[x]" } else { "[ ]" };
-                rows.push(Row::new(vec![
+                push_row!(Row::new(vec![
                     checkbox.to_string(),
                     format!("    {}", item.display),
                     format_size(item.size),
@@ -1691,7 +1699,7 @@ fn render_janitor(f: &mut Frame, app: &App, area: Rect) {
             }
         }
     }
-    if rows.is_empty() {
+    if total == 0 {
         rows.push(Row::new(vec![
             "".to_string(),
             "No cleanable items in scope".to_string(),
@@ -1719,7 +1727,7 @@ fn render_janitor(f: &mut Frame, app: &App, area: Rect) {
         )
         .highlight_symbol("▶ ");
     let mut state = ratatui::widgets::TableState::default();
-    state.select(Some(app.janitor_cursor));
+    state.select(Some(app.janitor_cursor.saturating_sub(start)));
     f.render_stateful_widget(table, area, &mut state);
 }
 

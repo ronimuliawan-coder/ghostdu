@@ -250,10 +250,16 @@ const RECOGNIZED_CACHE_UNITS: [&str; 10] = [
 ];
 
 fn is_recognized_cache_unit(path: &Path) -> bool {
+    let mut under_cache = false;
     path.components().any(|comp| {
-        RECOGNIZED_CACHE_UNITS
-            .iter()
-            .any(|unit| comp.as_os_str().as_encoded_bytes() == unit.as_bytes())
+        if comp.as_os_str().as_encoded_bytes() == b".cache" {
+            under_cache = true;
+            return false;
+        }
+        under_cache
+            && RECOGNIZED_CACHE_UNITS
+                .iter()
+                .any(|unit| comp.as_os_str().as_encoded_bytes() == unit.as_bytes())
     })
 }
 
@@ -581,6 +587,19 @@ mod tests {
         assert_eq!(
             classify_path(&PathBuf::from("/home/alice/.cache/personal/notes.txt")),
             GhostKind::None
+        );
+        // Recognised units outside `.cache` are personal paths, not caches.
+        assert_eq!(
+            classify_path(&PathBuf::from("/home/alice/pip/notes.txt")),
+            GhostKind::None
+        );
+        assert_eq!(
+            classify_path(&PathBuf::from("/home/alice/projects/cargo/report.txt")),
+            GhostKind::None
+        );
+        assert_eq!(
+            classify_path(&PathBuf::from("/home/ron/.cache/pip/cache.dat")),
+            GhostKind::BuildCache
         );
         assert_eq!(
             classify_path(&PathBuf::from("/home/ron/.cache")),
