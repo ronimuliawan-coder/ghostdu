@@ -20,9 +20,21 @@ pub struct ScanProgress {
     pub is_finished: bool,
 }
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct ScannerOptions {
     pub cross_mounts: bool,
+    /// Skip any scanned path containing one of these substrings.
+    pub excludes: Vec<String>,
+    /// Stop descending after N levels (1 = top level only). Totals cover scanned entries.
+    pub max_depth: Option<usize>,
+}
+
+fn is_excluded(path: &Path, excludes: &[String]) -> bool {
+    if excludes.is_empty() {
+        return false;
+    }
+    let path_str = path.to_string_lossy();
+    excludes.iter().any(|p| path_str.contains(p))
 }
 
 pub fn scan_directory(
@@ -78,7 +90,6 @@ pub fn scan_directory_with_options(
 
     let mut seen_inodes: HashSet<(u64, u64)> = HashSet::new();
     seen_inodes.insert((root_dev, root_ino));
-
     let files_counter = Arc::new(AtomicU64::new(0));
     let bytes_counter = Arc::new(AtomicU64::new(0));
     let last_progress = Arc::new(Mutex::new(Instant::now()));
@@ -87,7 +98,8 @@ pub fn scan_directory_with_options(
         &canonical,
         &mut root_entry,
         root_dev,
-        options.cross_mounts,
+        &options,
+        0,
         &mount_points,
         &mut seen_inodes,
         &progress_tx,
@@ -119,7 +131,8 @@ fn scan_dir_recursive(
     dir_path: &Path,
     parent_entry: &mut FileEntry,
     root_dev: u64,
-    cross_mounts: bool,
+    options: &ScannerOptions,
+    depth: usize,
     mount_points: &HashSet<PathBuf>,
     seen_inodes: &mut HashSet<(u64, u64)>,
     progress_tx: &Option<Sender<ScanProgress>>,
@@ -160,6 +173,11 @@ fn scan_dir_recursive(
 
         // 1. Zero-flag smart filtering: automatically skip virtual/kernel filesystems
         if is_virtual_fs_path(&path) {
+            continue;
+        }
+
+        // 2. User exclusions (--exclude): skip the entry and its whole subtree
+        if is_excluded(&path, &options.excludes) {
             continue;
         }
 
@@ -222,12 +240,19 @@ fn scan_dir_recursive(
             // mountinfo also identifies bind mounts whose device matches the root.
             let is_cross_mount = dev != root_dev || mount_points.contains(&path);
             // Directory identities prevent cycles and repeated traversal via bind aliases.
-            if (cross_mounts || !is_cross_mount) && seen_inodes.insert((dev, ino)) {
+            // Depth cap keeps large trees explorable; totals cover scanned entries only.
+            // max_depth counts listed levels below the root (1 = top level only).
+            let within_depth = options.max_depth.is_none_or(|max| depth + 1 < max);
+            if (options.cross_mounts || !is_cross_mount)
+                && within_depth
+                && seen_inodes.insert((dev, ino))
+            {
                 scan_dir_recursive(
                     &path,
                     &mut dir_node,
                     root_dev,
-                    cross_mounts,
+                    options,
+                    depth + 1,
                     mount_points,
                     seen_inodes,
                     progress_tx,
@@ -366,7 +391,9 @@ pub(crate) fn rescan_entry(
             path,
             &mut entry,
             root_dev,
-            false,
+            // Targeted refresh of an already-scanned path: excludes cannot match it.
+            &ScannerOptions::default(),
+            0,
             &mounts,
             seen_inodes,
             &None,
