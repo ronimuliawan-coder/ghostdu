@@ -113,6 +113,14 @@ struct DockerBuildCacheItem {
 const DOCKER_SOCKET_PATH: &str = "/var/run/docker.sock";
 
 fn send_docker_http_request(method: &str, endpoint: &str) -> Result<String, String> {
+    send_docker_http_request_with_timeout(method, endpoint, Duration::from_secs(4))
+}
+
+fn send_docker_http_request_with_timeout(
+    method: &str,
+    endpoint: &str,
+    read_timeout: Duration,
+) -> Result<String, String> {
     if !Path::new(DOCKER_SOCKET_PATH).exists() {
         return Err("Docker socket /var/run/docker.sock does not exist".to_string());
     }
@@ -121,7 +129,7 @@ fn send_docker_http_request(method: &str, endpoint: &str) -> Result<String, Stri
         .map_err(|e| format!("Cannot connect to docker socket: {}", e))?;
 
     stream
-        .set_read_timeout(Some(Duration::from_secs(4)))
+        .set_read_timeout(Some(read_timeout))
         .map_err(|e| e.to_string())?;
     stream
         .set_write_timeout(Some(Duration::from_secs(4)))
@@ -343,7 +351,10 @@ struct DockerPruneResponse {
 
 pub fn prune_docker_dangling() -> Result<String, String> {
     // Reporting and mutation must use the same socket, regardless of CLI context/DOCKER_HOST.
-    prune_with_request(send_docker_http_request)
+    // Prune operations can take significantly longer than basic inspection, so grant them an extended read timeout.
+    prune_with_request(|method, endpoint| {
+        send_docker_http_request_with_timeout(method, endpoint, Duration::from_secs(60))
+    })
 }
 
 fn prune_with_request(
