@@ -58,6 +58,8 @@ pub struct JanitorCategory {
     pub title: &'static str,
     pub items: Vec<JanitorItem>,
     pub expanded: bool,
+    /// Sum of item sizes, computed at build so rendering never re-sums.
+    pub total: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -161,6 +163,9 @@ pub struct App {
     pub janitor_cats: Vec<JanitorCategory>,
     pub janitor_cursor: usize,
     pub janitor_scope: JanitorScope,
+    /// Selected-byte total, refreshed on rebuild/toggle so rendering is O(page).
+    pub janitor_selected_bytes: u64,
+    pub janitor_offset: Cell<usize>,
     pub ghost_docker_scroll_offset: Cell<usize>,
     pub ghost_deleted_scroll_offset: Cell<usize>,
 
@@ -208,6 +213,8 @@ impl App {
             janitor_cats: Vec::new(),
             janitor_cursor: 0,
             janitor_scope: JanitorScope::Global,
+            janitor_selected_bytes: 0,
+            janitor_offset: Cell::new(0),
             ghost_docker_scroll_offset: Cell::new(0),
             ghost_deleted_scroll_offset: Cell::new(0),
             fs_info,
@@ -878,6 +885,19 @@ impl App {
         };
         self.janitor_cats = cats;
         self.janitor_cursor = self.janitor_cursor.min(self.janitor_row_count().max(1) - 1);
+        self.refresh_janitor_selected();
+    }
+
+    /// Recompute the selected-byte total. Called on rebuild/toggle (keypress
+    /// rate), never during rendering (frame rate).
+    fn refresh_janitor_selected(&mut self) {
+        self.janitor_selected_bytes = self
+            .janitor_cats
+            .iter()
+            .flat_map(|cat| &cat.items)
+            .filter(|item| item.selected)
+            .map(|item| item.size)
+            .sum();
     }
 
     /// Flat row count (category headers plus expanded items).
@@ -943,6 +963,7 @@ impl App {
                     self.janitor_cats[cat_idx].items[item_idx].selected = !selected;
                 }
             }
+            self.refresh_janitor_selected();
         }
     }
 
@@ -958,6 +979,7 @@ impl App {
                 item.selected = !all_on;
             }
         }
+        self.refresh_janitor_selected();
     }
 
     /// Trash or delete checked janitor rows through the standard confirmation
@@ -1136,10 +1158,12 @@ impl App {
             .map(|(index, title)| {
                 let mut items = std::mem::take(&mut groups[index]);
                 items.sort_by_key(|item| std::cmp::Reverse(item.size));
+                let total = items.iter().map(|item| item.size).sum();
                 JanitorCategory {
                     title,
                     items,
                     expanded: true,
+                    total,
                 }
             })
             .collect()
