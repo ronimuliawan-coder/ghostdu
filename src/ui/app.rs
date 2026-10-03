@@ -118,7 +118,11 @@ pub enum ConfirmAction {
     MoveToTrash,
     PermanentDelete,
     DockerPrune,
-    KillProcess { pid: u32, name: String },
+    KillProcess {
+        pid: u32,
+        name: String,
+        start_time: u64,
+    },
 }
 
 pub struct App {
@@ -867,9 +871,12 @@ impl App {
     }
 
     fn rebuild_janitor(&mut self) {
-        // Clone the scope to end the borrow before storing the new rows.
-        let scope = self.janitor_scope_root().clone();
-        self.janitor_cats = Self::collect_janitor(&scope);
+        // Borrow the scope for collection; store the owned rows after it ends.
+        let cats = {
+            let scope = self.janitor_scope_root();
+            Self::collect_janitor(scope)
+        };
+        self.janitor_cats = cats;
         self.janitor_cursor = self.janitor_cursor.min(self.janitor_row_count().max(1) - 1);
     }
 
@@ -1157,27 +1164,58 @@ impl App {
     }
 
     /// Open the process-termination confirmation. Callers must pass PIDs taken
-    /// from the ghost table, never free-form input.
+    /// from the ghost table, never free-form input. Captures the process start
+    /// time so a recycled PID cannot be signalled after the table goes stale.
     pub fn prompt_kill_process(&mut self, pid: u32, name: String) {
-        self.pending_action = Some(ConfirmAction::KillProcess { pid, name });
+        // The ghost table is a snapshot; re-confirm the PID still holds one.
+        self.deleted_open_files = crate::ghost::scan_deleted_open_files();
+        if !self.deleted_open_files.iter().any(|f| f.pid == pid) {
+            self.set_status(format!(
+                "Process {pid} no longer holds ghost files; table refreshed"
+            ));
+            return;
+        }
+        let Some(start_time) = proc_start_time(pid) else {
+            self.set_status(format!("Process {pid} exited before confirmation"));
+            return;
+        };
+        self.pending_action = Some(ConfirmAction::KillProcess {
+            pid,
+            name,
+            start_time,
+        });
         self.previous_view = self.active_view;
         self.active_view = ActiveView::ConfirmModal;
     }
 
-    /// Send a signal to a ghost-table process, then refresh the ghost table.
+    /// Signal the stored confirmed kill target. Consumes the confirmation and
+    /// refuses when the process instance changed since confirmation.
     /// `sigterm` selects SIGTERM (graceful) over SIGKILL. Kernel ESRCH/EPERM
     /// surface as status messages.
-    pub fn execute_kill(&mut self, pid: u32, sigterm: bool) {
+    pub fn execute_kill(&mut self, sigterm: bool) {
+        let confirmed = self.pending_action.take();
+        self.active_view = self.previous_view;
+        let Some(ConfirmAction::KillProcess {
+            pid,
+            name: _,
+            start_time,
+        }) = confirmed
+        else {
+            return;
+        };
+        if proc_start_time(pid) != Some(start_time) {
+            self.set_status(format!(
+                "Process {pid} changed since confirmation; not signalled"
+            ));
+            return;
+        }
         let signal = if sigterm {
             libc::SIGTERM
         } else {
             libc::SIGKILL
         };
         // kill has no preconditions beyond a live PID.
-        let result = unsafe { libc::kill(pid as i32, signal) };
-        self.pending_action = None;
-        self.active_view = self.previous_view;
-        if result != 0 {
+        if unsafe { libc::kill(pid as i32, signal) } != 0 {
             let error = std::io::Error::last_os_error();
             self.set_status(format!("Cannot signal process {pid}: {error}"));
             return;
@@ -1342,7 +1380,13 @@ impl App {
             base_depth,
         ) {
             Ok(entry) => {
-                self.replace_subtree(path, entry);
+                if path == self.root_entry.path {
+                    let current = self.current_dir_entry().path.clone();
+                    self.root_entry = entry;
+                    self.navigate_to_path(&current);
+                } else {
+                    self.replace_subtree(path, entry);
+                }
                 self.discard_changed_selections();
                 true
             }
@@ -1660,6 +1704,19 @@ impl App {
     }
 }
 
+/// Process start time (field 22 of /proc/<pid>/stat) as a stable instance
+/// identity. `None` when the process is gone or unreadable.
+fn proc_start_time(pid: u32) -> Option<u64> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // comm may contain spaces or ')'; fields after the last ')' start at field 3.
+    stat.rsplit_once(')')?
+        .1
+        .split_whitespace()
+        .nth(19)?
+        .parse()
+        .ok()
+}
+
 #[cfg(test)]
 mod reconciliation_tests {
     use super::*;
@@ -1755,7 +1812,7 @@ mod reconciliation_tests {
     }
 
     #[test]
-    fn kill_flow_confirms_then_reports_missing_process() {
+    fn kill_flow_confirms_stale_table_then_refuses_recycled_pid() {
         let fixture = tempfile::tempdir().unwrap();
         let root = crate::fs::scanner::scan_directory(
             fixture.path(),
@@ -1764,20 +1821,27 @@ mod reconciliation_tests {
         )
         .unwrap();
         let mut app = App::new(root);
-        app.prompt_kill_process(42, "test-proc".to_string());
-        assert_eq!(app.active_view, ActiveView::ConfirmModal);
-        assert!(matches!(
-            app.pending_action,
-            Some(ConfirmAction::KillProcess { pid: 42, .. })
-        ));
+        // Unknown PID: confirmation never opens, table refresh reported.
+        app.prompt_kill_process(2_147_000_000, "test-proc".to_string());
+        assert!(app.pending_action.is_none());
+        assert_ne!(app.active_view, ActiveView::ConfirmModal);
+        // Recycled PID: stored start time mismatches the live process.
         // Positive PID below i32::MAX that cannot exist (default pid_max is
         // far lower); kill(-1) would signal everything, so never test that.
-        app.execute_kill(2_147_000_000, true);
+        app.pending_action = Some(ConfirmAction::KillProcess {
+            pid: 1,
+            name: "init".to_string(),
+            start_time: u64::MAX,
+        });
+        app.active_view = ActiveView::ConfirmModal;
+        app.execute_kill(true);
         assert!(app.pending_action.is_none());
         assert!(app
             .current_status()
             .unwrap_or("")
-            .contains("Cannot signal process"));
+            .contains("changed since confirmation"));
+        // Sanity: the current process has a readable start time.
+        assert!(super::proc_start_time(std::process::id()).is_some());
     }
 
     #[test]

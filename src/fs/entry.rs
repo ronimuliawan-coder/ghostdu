@@ -280,7 +280,7 @@ impl FileEntry {
 }
 
 /// Versioned `--export` envelope (Phase 0). Bump on breaking tree-shape changes;
-/// `--import`/`diff` reject unknown major versions with a clear error.
+/// planned `--import`/`diff` consumers will reject unknown versions.
 pub const EXPORT_FORMAT_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

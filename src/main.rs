@@ -359,8 +359,9 @@ fn run_app<B: ratatui::backend::Backend>(
                             break true;
                         }
                         EventResult::Subshell(dir) => {
-                            run_subshell(terminal, &dir)?;
-                            if app.refresh_path(&dir) {
+                            if let Err(error) = run_subshell(terminal, &dir) {
+                                app.set_status(error.to_string());
+                            } else if app.refresh_path(&dir) {
                                 app.set_status("Subshell exited; directory refreshed");
                             } else {
                                 app.set_status("Subshell exited; refresh failed");

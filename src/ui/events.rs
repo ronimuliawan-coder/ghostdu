@@ -59,15 +59,13 @@ pub fn handle_key_event(app: &mut App, key: KeyEvent) -> EventResult {
 }
 
 fn handle_confirm_keys(app: &mut App, key: KeyEvent) -> EventResult {
-    // Process termination answers 1/2 instead of y/n.
-    let kill_pid = match &app.pending_action {
-        Some(ConfirmAction::KillProcess { pid, .. }) => Some(*pid),
-        _ => None,
-    };
-    if let Some(pid) = kill_pid {
+    // Process termination answers 1/2 instead of y/n. Execution consumes the
+    // stored confirmation, so no fresh PID crosses this boundary.
+    let killing = matches!(&app.pending_action, Some(ConfirmAction::KillProcess { .. }));
+    if killing {
         match key.code {
-            KeyCode::Char('1') => app.execute_kill(pid, true),
-            KeyCode::Char('2') => app.execute_kill(pid, false),
+            KeyCode::Char('1') => app.execute_kill(true),
+            KeyCode::Char('2') => app.execute_kill(false),
             KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => app.cancel_modal(),
             _ => {}
         }
@@ -429,8 +427,22 @@ fn handle_filesystem_keys(app: &mut App, key: KeyEvent) -> EventResult {
                 .get(app.cursor_index)
                 .map(|e| e.path.clone())
             {
-                match std::process::Command::new("xdg-open").arg(&target).spawn() {
-                    Ok(_) => app.set_status(format!("Opened {}", target.display())),
+                use std::process::Stdio;
+                match std::process::Command::new("xdg-open")
+                    .arg(&target)
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .spawn()
+                {
+                    // Detach output so child warnings cannot corrupt the TUI;
+                    // reap on a thread so no zombie is left behind.
+                    Ok(mut child) => {
+                        std::thread::spawn(move || {
+                            let _ = child.wait();
+                        });
+                        app.set_status(format!("Opened {}", target.display()))
+                    }
                     Err(error) => app.set_status(format!("Cannot open: {error}")),
                 }
             }
