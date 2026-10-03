@@ -167,9 +167,10 @@ fn remove_at_with_hook(
     // (e.g. world-writable /tmp), a concurrent local writer with write permissions in `parent`
     // could replace the directory entry between verification and `unlinkat`.
     // Note that `unlinkat` with `AtFlags::empty()` / `AtFlags::REMOVEDIR` operates strictly
-    // on the directory entry itself and never follows symlinks. Users operating in multi-tenant
-    // shared writable environments should ensure appropriate directory permissions (sticky bit)
-    // or namespace isolation.
+    // on the directory entry itself and never follows symlinks. Identity checks establish
+    // continuity, not serialization against concurrent writers. Users operating in
+    // multi-tenant shared writable environments, especially with elevated authority,
+    // should ensure appropriate directory permissions (sticky bit) or namespace isolation.
     unlinkat(
         parent,
         name,

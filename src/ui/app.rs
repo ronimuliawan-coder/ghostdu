@@ -570,10 +570,14 @@ impl App {
                 self.selected_paths.insert(path);
                 true
             }
-            Ok(_) | Err(_) => {
+            Ok(_) => {
                 self.set_status(
                     "Cannot select item: Target changed since scan; refresh and select it again",
                 );
+                false
+            }
+            Err(error) => {
+                self.set_status(format!("Cannot select item: {error}"));
                 false
             }
         }
