@@ -30,17 +30,15 @@ pub(crate) fn proc_start_time(pid: u32) -> Option<u64> {
         .ok()
 }
 
-/// Whether one /proc/<pid>/fd entry counts as a ghost file. Mirrors the table
-/// row filters exactly (deleted suffix, pseudo-object exclusions, nonzero size).
-fn deleted_fd_holds_ghost(fd_path: &Path) -> bool {
-    let target_link = match fs::read_link(fd_path) {
-        Ok(link) => link,
-        Err(_) => return false,
-    };
+/// The validated cleaned path and allocated size for one ghost-file FD.
+/// Returns `None` unless the FD passes every table-row filter, so callers
+/// reuse this single read instead of rereading the FD to build the row.
+/// Only the final ` (deleted)` marker is stripped: filenames that themselves
+/// end in that text keep it.
+fn deleted_fd_ghost(fd_path: &Path) -> Option<(String, u64)> {
+    let target_link = fs::read_link(fd_path).ok()?;
     let target_str = target_link.to_string_lossy();
-    let Some(clean_path) = target_str.strip_suffix(" (deleted)") else {
-        return false;
-    };
+    let clean_path = target_str.strip_suffix(" (deleted)")?;
     // Skip in-memory or pseudo objects
     if clean_path.starts_with("/memfd:")
         || clean_path.starts_with("/dev/")
@@ -48,7 +46,7 @@ fn deleted_fd_holds_ghost(fd_path: &Path) -> bool {
         || clean_path.starts_with("socket:[")
         || clean_path.starts_with("anon_inode:[")
     {
-        return false;
+        return None;
     }
     // Query actual size held on disk via stat on the /proc/<pid>/fd/<fd> link
     let size = match fs::metadata(fd_path) {
@@ -59,10 +57,10 @@ fn deleted_fd_holds_ghost(fd_path: &Path) -> bool {
         // If blocks is 0, check file apparent size
         let apparent = fs::metadata(fd_path).map(|m| m.len()).unwrap_or(0);
         if apparent == 0 {
-            return false;
+            return None;
         }
     }
-    true
+    Some((clean_path.to_string(), size))
 }
 
 /// Targeted liveness check for one PID: its name and start time iff it
@@ -73,7 +71,7 @@ pub(crate) fn describe_pid_ghost(pid: u32) -> Option<(String, u64)> {
     let fd_entries = fs::read_dir(&fd_dir_path).ok()?;
     if !fd_entries
         .flatten()
-        .any(|fd_entry| deleted_fd_holds_ghost(&fd_entry.path()))
+        .any(|fd_entry| deleted_fd_ghost(&fd_entry.path()).is_some())
     {
         return None;
     }
@@ -111,27 +109,11 @@ pub fn scan_deleted_open_files() -> Vec<DeletedOpenFile> {
 
         for fd_entry in fd_entries.flatten() {
             let fd_path = fd_entry.path();
-            if !deleted_fd_holds_ghost(&fd_path) {
+            // Single validated read per FD: path and size come from the same
+            // check that applied the row filters.
+            let Some((clean_path, size)) = deleted_fd_ghost(&fd_path) else {
                 continue;
-            }
-            let target_str = fs::read_link(&fd_path)
-                .map(|link| link.to_string_lossy().into_owned())
-                .unwrap_or_default();
-            let clean_path = target_str.trim_end_matches(" (deleted)").to_string();
-
-            // Query actual size held on disk via stat on the /proc/<pid>/fd/<fd> link
-            let size = match fs::metadata(&fd_path) {
-                Ok(meta) => meta.blocks() * 512,
-                Err(_) => 0,
             };
-
-            if size == 0 {
-                // If blocks is 0, check file apparent size
-                let apparent = fs::metadata(&fd_path).map(|m| m.len()).unwrap_or(0);
-                if apparent == 0 {
-                    continue;
-                }
-            }
 
             if comm_name.is_none() {
                 let comm_path = format!("/proc/{}/comm", pid);
@@ -176,5 +158,26 @@ mod tests {
         assert_eq!(Some(start), proc_start_time(own));
         drop(held);
         assert!(describe_pid_ghost(2_147_000_000).is_none());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn deleted_suffix_strips_once_from_row_paths() {
+        // A deleted file whose own name ends in " (deleted)" keeps it: only
+        // the kernel's final marker is stripped.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("note (deleted)");
+        std::fs::write(&path, vec![0u8; 100]).unwrap();
+        let held = std::fs::File::open(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        let own = std::process::id();
+        let rows = scan_deleted_open_files();
+        let row = rows
+            .iter()
+            .find(|r| r.pid == own && r.original_path.ends_with("note (deleted)"))
+            .expect("row keeps the filename suffix");
+        assert!(row.original_path.ends_with("note (deleted)"));
+        assert!(!row.original_path.ends_with("note"));
+        drop(held);
     }
 }
