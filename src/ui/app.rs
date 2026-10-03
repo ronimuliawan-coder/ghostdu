@@ -815,9 +815,18 @@ impl App {
         total_size: u64,
         action: ConfirmAction,
     ) {
+        let (has_system, has_recheck) = Self::action_safety_flags(&targets);
+        if !has_system && !self.capture_confirmation(&targets) {
+            return;
+        }
+        self.finish_action_confirm(targets, total_size, has_system, has_recheck, action);
+    }
+
+    /// System/Recheck classification shared by every confirmation entry point.
+    fn action_safety_flags(targets: &[PathBuf]) -> (bool, bool) {
         let mut has_system = false;
         let mut has_recheck = false;
-        for path in &targets {
+        for path in targets {
             let ghost = classify_path(path);
             let safety = classify_safety(path, ghost);
             if safety == DeleteSafety::System {
@@ -826,10 +835,18 @@ impl App {
                 has_recheck = true;
             }
         }
+        (has_system, has_recheck)
+    }
 
-        if !has_system && !self.capture_confirmation(&targets) {
-            return;
-        }
+    /// Store targets and open the confirmation modal.
+    fn finish_action_confirm(
+        &mut self,
+        targets: Vec<PathBuf>,
+        total_size: u64,
+        has_system: bool,
+        has_recheck: bool,
+        action: ConfirmAction,
+    ) {
         self.action_targets = targets;
         self.action_total_size = total_size;
         self.action_has_system = has_system;
@@ -840,16 +857,93 @@ impl App {
         self.active_view = ActiveView::ConfirmModal;
     }
 
+    /// Resolve scanned identities for many targets in one tree walk, avoiding
+    /// a linear `find_entry` scan per target.
+    fn resolve_scan_identities(
+        &self,
+        targets: &[PathBuf],
+    ) -> HashMap<PathBuf, (u64, u64, bool, bool)> {
+        let wanted: HashSet<&Path> = targets.iter().map(PathBuf::as_path).collect();
+        fn walk(
+            entry: &FileEntry,
+            wanted: &HashSet<&Path>,
+            map: &mut HashMap<PathBuf, (u64, u64, bool, bool)>,
+        ) {
+            if wanted.contains(entry.path.as_path()) {
+                map.insert(
+                    entry.path.clone(),
+                    (entry.dev, entry.ino, entry.is_dir, entry.is_symlink),
+                );
+            }
+            for child in &entry.children {
+                walk(child, wanted, map);
+            }
+        }
+        let mut map = HashMap::new();
+        walk(&self.root_entry, &wanted, &mut map);
+        map
+    }
+
+    /// Capture confirmation identities for a pre-resolved batch, honouring the
+    /// same descriptor-aware limit as interactive selection. All-or-nothing,
+    /// like `capture_confirmation`.
+    fn capture_confirmed_batch(
+        &mut self,
+        targets: &[PathBuf],
+        resolved: &HashMap<PathBuf, (u64, u64, bool, bool)>,
+    ) -> bool {
+        self.action_identities.clear();
+        let limit = match self.selection_limit() {
+            Ok(limit) => limit,
+            Err(error) => {
+                self.set_status(format!("Cannot determine safe selection limit: {error}"));
+                return false;
+            }
+        };
+        for path in targets {
+            if self.selected_identities.len() + self.action_identities.len() >= limit {
+                self.action_identities.clear();
+                self.set_status(format!(
+                    "Selection limit reached ({limit} items); confirm a smaller batch"
+                ));
+                return false;
+            }
+            let identity = match (TargetIdentity::capture(path), resolved.get(path)) {
+                (Ok(identity), Some(&(dev, ino, is_dir, is_symlink)))
+                    if identity.matches_ids(dev, ino, is_dir, is_symlink) =>
+                {
+                    identity
+                }
+                _ => {
+                    self.selected_paths.remove(path);
+                    self.selected_identities.remove(path);
+                    self.action_identities.clear();
+                    self.set_status(
+                        "Cannot confirm action: Target changed since scan; refresh and select it again",
+                    );
+                    return false;
+                }
+            };
+            self.action_identities.insert(path.clone(), identity);
+        }
+        true
+    }
+
     /// Rank the largest files across the scanned tree (files only, no symlinks).
     /// Bounded heap keeps O(50) entries: keys only in pass one, full rows for
     /// winners in pass two. No per-file allocation beyond the traversal itself.
     fn rank_top_files(root: &FileEntry) -> Vec<TopFile> {
-        fn collect_keys(
-            entry: &FileEntry,
-            heap: &mut BinaryHeap<std::cmp::Reverse<(u64, u64, u64)>>,
+        fn collect_keys<'a>(
+            entry: &'a FileEntry,
+            heap: &mut BinaryHeap<std::cmp::Reverse<(u64, u64, u64, &'a Path)>>,
         ) {
             if !entry.is_dir && !entry.is_symlink {
-                heap.push(std::cmp::Reverse((entry.disk_usage, entry.dev, entry.ino)));
+                heap.push(std::cmp::Reverse((
+                    entry.disk_usage,
+                    entry.dev,
+                    entry.ino,
+                    entry.path.as_path(),
+                )));
                 if heap.len() > TOP_FILES_LIMIT {
                     heap.pop();
                 }
@@ -858,12 +952,8 @@ impl App {
                 collect_keys(child, heap);
             }
         }
-        fn collect_winners(
-            entry: &FileEntry,
-            winners: &HashSet<(u64, u64)>,
-            out: &mut Vec<TopFile>,
-        ) {
-            if !entry.is_dir && !entry.is_symlink && winners.contains(&(entry.dev, entry.ino)) {
+        fn collect_winners(entry: &FileEntry, winners: &HashSet<&Path>, out: &mut Vec<TopFile>) {
+            if !entry.is_dir && !entry.is_symlink && winners.contains(entry.path.as_path()) {
                 out.push(TopFile {
                     path: entry.path.clone(),
                     name: entry.name.clone(),
@@ -878,9 +968,11 @@ impl App {
         }
         let mut heap = BinaryHeap::new();
         collect_keys(root, &mut heap);
-        let winners: HashSet<(u64, u64)> = heap
+        // Winners keyed by path: one inode with many hard links cannot
+        // multiply into more rows than the limit.
+        let winners: HashSet<&Path> = heap
             .into_iter()
-            .map(|std::cmp::Reverse((_, dev, ino))| (dev, ino))
+            .map(|std::cmp::Reverse((_, _, _, path))| path)
             .collect();
         let mut files = Vec::with_capacity(winners.len().min(TOP_FILES_LIMIT));
         collect_winners(root, &winners, &mut files);
@@ -1055,7 +1147,14 @@ impl App {
         } else {
             ConfirmAction::PermanentDelete
         };
-        self.open_action_confirm(targets, total, action);
+        let (has_system, has_recheck) = Self::action_safety_flags(&targets);
+        if !has_system {
+            let resolved = self.resolve_scan_identities(&targets);
+            if !self.capture_confirmed_batch(&targets, &resolved) {
+                return;
+            }
+        }
+        self.finish_action_confirm(targets, total, has_system, has_recheck, action);
     }
 
     /// Open the Top-50 leaderboard, ranked on demand from the live tree.
@@ -1251,6 +1350,14 @@ impl App {
         let pidfd = rustix::process::Pid::from_raw(pid as i32).and_then(|target| {
             rustix::process::pidfd_open(target, rustix::process::PidfdFlags::empty()).ok()
         });
+        // The handle pins whoever holds the PID now; refuse if that is already
+        // a different instance than the verified one.
+        if pidfd.is_some() && proc_start_time(pid) != Some(start_time) {
+            self.set_status(format!(
+                "Process {pid} changed during confirmation setup; not opened"
+            ));
+            return;
+        }
         self.pending_action = Some(ConfirmAction::KillProcess {
             pid,
             name,
@@ -1283,9 +1390,19 @@ impl App {
             rustix::process::Signal::KILL
         };
         // Prefer the pinned handle (immune to PID reuse); without one,
-        // recheck the start time before falling back to `kill`.
+        // recheck the start time before falling back to `kill`. The handle
+        // branch rechecks too: signalling a holder that changed since
+        // confirmation deserves refusal, not ESRCH.
         let result = match pidfd {
-            Some(fd) => rustix::process::pidfd_send_signal(&fd, signal),
+            Some(fd) => {
+                if proc_start_time(pid) != Some(start_time) {
+                    self.set_status(format!(
+                        "Process {pid} changed since confirmation; not signalled"
+                    ));
+                    return;
+                }
+                rustix::process::pidfd_send_signal(&fd, signal)
+            }
             None => {
                 if proc_start_time(pid) != Some(start_time) {
                     self.set_status(format!(

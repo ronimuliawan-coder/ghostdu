@@ -1666,8 +1666,13 @@ fn render_janitor(f: &mut Frame, app: &App, area: Rect) {
     let first_cat = offsets
         .partition_point(|&index| index <= start)
         .saturating_sub(1);
-    let mut flat = offsets.get(first_cat).copied().unwrap_or(0);
-    // Windowed push: only visible rows are constructed (O(page) per redraw).
+    // Rows before the window are skipped by index, never constructed. `flat`
+    // resumes at `start` so the push macro stays correct.
+    let mut flat = start;
+    let mut skip_items = start - offsets.get(first_cat).copied().unwrap_or(0);
+    let show_first_header = skip_items == 0;
+    skip_items = skip_items.saturating_sub(1); // The hidden header row.
+                                               // Windowed push: only visible rows are constructed (O(page) per redraw).
     macro_rules! push_row {
         ($row:expr) => {
             if flat >= start && rows.len() < page {
@@ -1676,7 +1681,7 @@ fn render_janitor(f: &mut Frame, app: &App, area: Rect) {
             flat += 1;
         };
     }
-    for cat in app.janitor_cats.iter().skip(first_cat) {
+    for (cat_idx, cat) in app.janitor_cats.iter().enumerate().skip(first_cat) {
         if rows.len() >= page {
             break;
         }
@@ -1687,17 +1692,22 @@ fn render_janitor(f: &mut Frame, app: &App, area: Rect) {
         } else {
             "▸ "
         };
-        push_row!(Row::new(vec![
-            "".to_string(),
-            format!("{marker}{}", cat.title),
-            if cat.items.is_empty() {
-                "—".to_string()
-            } else {
-                format_size(cat.total)
-            },
-        ]));
+        // The first category may start mid-items; its header is already above.
+        let header_visible = cat_idx > first_cat || show_first_header;
+        if header_visible {
+            push_row!(Row::new(vec![
+                "".to_string(),
+                format!("{marker}{}", cat.title),
+                if cat.items.is_empty() {
+                    "—".to_string()
+                } else {
+                    format_size(cat.total)
+                },
+            ]));
+        }
         if cat.expanded {
-            for item in &cat.items {
+            let skip = if cat_idx == first_cat { skip_items } else { 0 };
+            for item in cat.items.iter().skip(skip) {
                 if rows.len() >= page {
                     break;
                 }
