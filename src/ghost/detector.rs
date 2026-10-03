@@ -1,6 +1,15 @@
 use crate::fs::entry::{DeleteSafety, GhostKind};
 use std::path::Path;
 
+/// Case-insensitive ASCII suffix match without allocating a lowercased copy.
+/// `classify_path` runs per scanned entry, so a `to_lowercase()` here adds one
+/// heap allocation per file. Byte comparison is safe (no char-boundary panic).
+// ponytail: ASCII-only folding; these ASCII suffixes can't match non-ASCII names either way
+fn has_suffix_ignore_ascii_case(name: &str, suffix: &str) -> bool {
+    name.len() >= suffix.len()
+        && name.as_bytes()[name.len() - suffix.len()..].eq_ignore_ascii_case(suffix.as_bytes())
+}
+
 pub fn classify_path(path: &Path) -> GhostKind {
     let path_str = path.to_string_lossy();
     let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
@@ -84,12 +93,12 @@ pub fn classify_path(path: &Path) -> GhostKind {
     {
         return GhostKind::VmOrIso;
     }
-    if file_name.ends_with(".iso")
-        || file_name.ends_with(".qcow2")
-        || file_name.ends_with(".vdi")
-        || file_name.ends_with(".vmdk")
-        || file_name.ends_with(".ova")
-        || file_name.ends_with(".qcow")
+    if has_suffix_ignore_ascii_case(file_name, ".iso")
+        || has_suffix_ignore_ascii_case(file_name, ".qcow2")
+        || has_suffix_ignore_ascii_case(file_name, ".vdi")
+        || has_suffix_ignore_ascii_case(file_name, ".vmdk")
+        || has_suffix_ignore_ascii_case(file_name, ".ova")
+        || has_suffix_ignore_ascii_case(file_name, ".qcow")
     {
         return GhostKind::VmOrIso;
     }
@@ -103,7 +112,9 @@ pub fn classify_path(path: &Path) -> GhostKind {
     {
         return GhostKind::AiModel;
     }
-    if file_name.ends_with(".gguf") || file_name.ends_with(".safetensors") {
+    if has_suffix_ignore_ascii_case(file_name, ".gguf")
+        || has_suffix_ignore_ascii_case(file_name, ".safetensors")
+    {
         return GhostKind::AiModel;
     }
 
@@ -140,26 +151,33 @@ pub fn classify_path(path: &Path) -> GhostKind {
         return GhostKind::BrowserCache;
     }
 
-    // 11. System & App Logs
+    // 11. System & App Logs (require directory context or recognizable log extensions)
     if path_str.contains("/var/log")
         || path_str.contains("/.npm/_logs")
-        || file_name == "journal"
-        || file_name == "log"
-        || file_name == "logs"
-        || file_name.ends_with(".log")
-        || file_name.ends_with(".log.gz")
-        || file_name.ends_with(".log.1")
-        || file_name.ends_with(".log.old")
+        || (path_str.contains("/.local/state/")
+            && (file_name.eq_ignore_ascii_case("log") || file_name.eq_ignore_ascii_case("logs")))
+        || (file_name.eq_ignore_ascii_case("journal") && path_str.contains("/log"))
+        || has_suffix_ignore_ascii_case(file_name, ".log")
+        || has_suffix_ignore_ascii_case(file_name, ".log.gz")
+        || has_suffix_ignore_ascii_case(file_name, ".log.1")
+        || has_suffix_ignore_ascii_case(file_name, ".log.old")
     {
         return GhostKind::LogFiles;
     }
 
     // 12. Project dependencies (separated from transient build caches)
-    match file_name {
-        "node_modules" | "vendor" | ".venv" | "venv" | "site-packages" | "dist-packages" => {
-            return GhostKind::DependencyTree;
-        }
-        _ => {}
+    // Matches dependency root as well as nested files inside dependencies
+    if matches!(
+        file_name,
+        "node_modules" | "vendor" | ".venv" | "venv" | "site-packages" | "dist-packages"
+    ) || path_str.contains("/node_modules/")
+        || path_str.contains("/.venv/")
+        || path_str.contains("/venv/")
+        || path_str.contains("/vendor/")
+        || path_str.contains("/site-packages/")
+        || path_str.contains("/dist-packages/")
+    {
+        return GhostKind::DependencyTree;
     }
 
     // 13. Package manager caches (Arch pacman, apt, dnf, AUR helpers)
@@ -173,13 +191,36 @@ pub fn classify_path(path: &Path) -> GhostKind {
     }
 
     // 14. Common heavy build and compiler caches
-    match file_name {
-        "target" | "__pycache__" | ".pytest_cache" | ".next" | ".nuxt" | ".svelte-kit"
-        | ".turbo" | ".gradle" | ".cargo/registry" | ".cargo/git" | "go-build" | ".mypy_cache"
-        | ".ruff_cache" | "ccache" => {
-            return GhostKind::BuildCache;
-        }
-        _ => {}
+    // Matches build cache root as well as nested files inside
+    if matches!(
+        file_name,
+        "target"
+            | "__pycache__"
+            | ".pytest_cache"
+            | ".next"
+            | ".nuxt"
+            | ".svelte-kit"
+            | ".turbo"
+            | ".gradle"
+            | "go-build"
+            | ".mypy_cache"
+            | ".ruff_cache"
+            | "ccache"
+    ) || path_str.ends_with("/.cargo/registry")
+        || path_str.ends_with("/.cargo/git")
+        || path_str.contains("/__pycache__/")
+        || path_str.contains("/.pytest_cache/")
+        || path_str.contains("/.next/")
+        || path_str.contains("/.nuxt/")
+        || path_str.contains("/.turbo/")
+        || path_str.contains("/.gradle/")
+        || path_str.contains("/.cargo/registry/")
+        || path_str.contains("/.cargo/git/")
+        || path_str.contains("/go-build/")
+        || path_str.contains("/.mypy_cache/")
+        || path_str.contains("/.ruff_cache/")
+    {
+        return GhostKind::BuildCache;
     }
 
     // 15. Fallback for general ~/.cache folders
@@ -245,9 +286,7 @@ pub fn classify_safety(path: &Path, ghost: GhostKind) -> DeleteSafety {
         | GhostKind::PackageCache
         | GhostKind::BrowserCache
         | GhostKind::CoreDump
-        | GhostKind::DeletedOpen
-        | GhostKind::DockerOverlay
-        | GhostKind::DockerBuildkit => {
+        | GhostKind::DeletedOpen => {
             return DeleteSafety::Safe;
         }
         // Steam shadercache is 100% safe to remove; compatdata / wine prefixes contain prefixes/saves so recheck
@@ -258,12 +297,18 @@ pub fn classify_safety(path: &Path, ghost: GhostKind) -> DeleteSafety {
                 return DeleteSafety::Recheck;
             }
         }
-        // Rotated or old logs or journal logs are safe to clean
+        // Rotated or old logs or journal logs are safe to clean, but /var/log container itself is Recheck!
         GhostKind::LogFiles => {
+            if p == "/var/log" || p == "/var/log/" {
+                return DeleteSafety::Recheck;
+            }
             return DeleteSafety::Safe;
         }
         // Dependencies, AI weights, ISOs, Snapshots, Flatpak/Snap app data, Docker volumes require recheck
-        GhostKind::DependencyTree
+        // Docker overlay & buildkit MUST be pruned via daemon prune, never raw rm -rf
+        GhostKind::DockerOverlay
+        | GhostKind::DockerBuildkit
+        | GhostKind::DependencyTree
         | GhostKind::AiModel
         | GhostKind::VmOrIso
         | GhostKind::SystemSnapshot
@@ -324,6 +369,7 @@ pub fn is_virtual_fs_path(path: &Path) -> bool {
         || p.starts_with("/dev/shm/")
         || p == "/dev/pts"
         || p.starts_with("/dev/pts/")
+        || p.starts_with("/var/lib/snapd/mnt/")
     {
         return true;
     }
@@ -420,6 +466,18 @@ mod tests {
         assert_eq!(
             classify_path(&PathBuf::from("/home/ron/Downloads/archlinux.iso")),
             GhostKind::VmOrIso
+        );
+        assert_eq!(
+            classify_path(&PathBuf::from("/home/ron/Downloads/archlinux.ISO")),
+            GhostKind::VmOrIso
+        );
+        assert_eq!(
+            classify_path(&PathBuf::from("/home/ron/models/mistral.GGUF")),
+            GhostKind::AiModel
+        );
+        assert_eq!(
+            classify_path(&PathBuf::from("/home/ron/project/APP.LOG")),
+            GhostKind::LogFiles
         );
         assert_eq!(
             classify_path(&PathBuf::from("/home/ron/.ollama/models/blobs/sha256-abc")),

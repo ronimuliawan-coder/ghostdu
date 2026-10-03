@@ -7,7 +7,10 @@ use crossterm::{
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
-use fs::{format_count, format_size, scan_directory, ScanProgress};
+use fs::{
+    format_count, format_size, scan_directory, truncate_end_by_width, truncate_start_by_width,
+    ScanProgress,
+};
 use ratatui::{
     backend::CrosstermBackend,
     layout::{Alignment, Rect},
@@ -27,12 +30,13 @@ use std::{
     time::{Duration, Instant},
 };
 use ui::{handle_key_event, render_ui, App, EventResult};
+use unicode_width::UnicodeWidthStr;
 
 use std::io::IsTerminal;
 
 /// ghostdu: Modern, ultra-fast native Linux disk usage & ghost file analyzer
 #[derive(Parser, Debug)]
-#[command(name = "ghostdu", author = "Ron", version = "0.1.0")]
+#[command(name = "ghostdu", author = "Ron", version)]
 #[command(
     about = "Modern, ultra-fast native Linux disk usage & ghost file analyzer with wastebin support"
 )]
@@ -187,11 +191,7 @@ fn run_app<B: ratatui::backend::Backend>(
                     Line::from(vec![
                         Span::styled("Scanning: ", Style::default().fg(Color::DarkGray)),
                         Span::styled(
-                            if path_str.len() > 44 {
-                                format!("...{}", &path_str[path_str.len() - 41..])
-                            } else {
-                                path_str.to_string()
-                            },
+                            truncate_start_by_width(&path_str, 44),
                             Style::default().fg(Color::Yellow),
                         ),
                     ]),
@@ -340,15 +340,14 @@ fn run_headless_summary(target_path: PathBuf) -> Result<(), Box<dyn std::error::
 
         let icon = if entry.is_dir { "📁 " } else { "📄 " };
         let display_name = format!("{}{}", icon, entry.name);
+        let name = truncate_end_by_width(&display_name, 40);
+        let padding = " ".repeat(40usize.saturating_sub(name.width()));
         let badge = entry.ghost_kind.badge();
 
         println!(
-            "     {:<40} {:<12} {:<18} {:<12}",
-            if display_name.len() > 40 {
-                format!("{}...", &display_name[..37])
-            } else {
-                display_name
-            },
+            "     {}{} {:<12} {:<18} {:<12}",
+            name,
+            padding,
             format_size(entry.disk_usage),
             bar_text,
             badge

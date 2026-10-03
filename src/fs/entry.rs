@@ -1,4 +1,6 @@
 use std::path::PathBuf;
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(dead_code)]
@@ -159,9 +161,12 @@ impl DeleteSafety {
 pub struct FileEntry {
     pub name: String,
     pub path: PathBuf,
-    pub size: u64,          // Apparent file size in bytes
-    pub disk_usage: u64,    // Allocated disk space (blocks * 512)
-    pub items_count: usize, // Total recursive items count
+    pub size: u64,             // Apparent file size in bytes
+    pub disk_usage: u64,       // Allocated disk space (blocks * 512)
+    pub reclaimable: u64,      // Conservative blocks freed; excludes all multiply-linked files
+    pub items_count: usize,    // Total recursive items count
+    pub safe_reclaimable: u64, // Precomputed recursive safe reclaimable bytes
+    pub safe_items: usize,     // Precomputed recursive safe items count
     pub is_dir: bool,
     pub is_symlink: bool,
     pub dev: u64,
@@ -185,12 +190,20 @@ impl FileEntry {
         ghost_kind: GhostKind,
         delete_safety: DeleteSafety,
     ) -> Self {
+        let (safe_reclaimable, safe_items) = if delete_safety == DeleteSafety::Safe {
+            (disk_usage, 1)
+        } else {
+            (0, 0)
+        };
         Self {
             name,
             path,
             size,
             disk_usage,
+            reclaimable: disk_usage,
             items_count: 1,
+            safe_reclaimable,
+            safe_items,
             is_dir: false,
             is_symlink,
             dev,
@@ -215,7 +228,10 @@ impl FileEntry {
             path,
             size: 0,
             disk_usage: 0,
+            reclaimable: 0,
             items_count: 1,
+            safe_reclaimable: 0,
+            safe_items: 0,
             is_dir: true,
             is_symlink: false,
             dev,
@@ -235,19 +251,22 @@ impl FileEntry {
         }
     }
 
+    #[inline]
     pub fn safe_reclaimable_bytes(&self) -> u64 {
-        self.children
-            .iter()
-            .filter(|c| c.delete_safety == DeleteSafety::Safe)
-            .map(|c| c.disk_usage)
-            .sum()
+        if self.delete_safety == DeleteSafety::Safe {
+            self.reclaimable
+        } else {
+            self.safe_reclaimable
+        }
     }
 
+    #[inline]
     pub fn safe_items_count(&self) -> usize {
-        self.children
-            .iter()
-            .filter(|c| c.delete_safety == DeleteSafety::Safe)
-            .count()
+        if self.delete_safety == DeleteSafety::Safe && self.is_dir {
+            1
+        } else {
+            self.safe_items
+        }
     }
 }
 
@@ -289,4 +308,44 @@ pub fn format_count(count: usize) -> String {
     } else {
         format!("{} items", s)
     }
+}
+
+/// Truncates string from the end to fit within `max_width` terminal columns,
+/// appending "..." if truncated. Never splits a grapheme cluster.
+pub fn truncate_end_by_width(s: &str, max_width: usize) -> String {
+    let total_width = s.width();
+    if total_width <= max_width {
+        return s.to_string();
+    }
+    let marker = if max_width > 3 { "..." } else { "" };
+    let mut end = 0;
+    for (index, grapheme) in s.grapheme_indices(true) {
+        let next_end = index + grapheme.len();
+        // Sequence widths can differ from the sum of individual character widths.
+        let candidate = format!("{}{}", &s[..next_end], marker);
+        if candidate.width() > max_width {
+            break;
+        }
+        end = next_end;
+    }
+    format!("{}{}", &s[..end], marker)
+}
+
+/// Truncates string from the beginning to fit within `max_width` terminal columns,
+/// prepending "..." if truncated. Never splits a grapheme cluster.
+pub fn truncate_start_by_width(s: &str, max_width: usize) -> String {
+    let total_width = s.width();
+    if total_width <= max_width {
+        return s.to_string();
+    }
+    let marker = if max_width > 3 { "..." } else { "" };
+    let mut start = s.len();
+    for (index, _) in s.grapheme_indices(true).rev() {
+        let candidate = format!("{}{}", marker, &s[index..]);
+        if candidate.width() > max_width {
+            break;
+        }
+        start = index;
+    }
+    format!("{}{}", marker, &s[start..])
 }
