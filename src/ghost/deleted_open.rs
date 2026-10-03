@@ -10,6 +10,22 @@ pub struct DeletedOpenFile {
     pub original_path: String,
     pub size: u64,
     pub fd: String,
+    /// Instance identity recorded at scan time. `None` when unreadable; such
+    /// rows can never arm a kill confirmation.
+    pub start_time: Option<u64>,
+}
+
+/// Process start time (field 22 of /proc/<pid>/stat) as a stable instance
+/// identity. `None` when the process is gone or unreadable.
+pub(crate) fn proc_start_time(pid: u32) -> Option<u64> {
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // comm may contain spaces or ')'; fields after the last ')' start at field 3.
+    stat.rsplit_once(')')?
+        .1
+        .split_whitespace()
+        .nth(19)?
+        .parse()
+        .ok()
 }
 
 pub fn scan_deleted_open_files() -> Vec<DeletedOpenFile> {
@@ -83,6 +99,7 @@ pub fn scan_deleted_open_files() -> Vec<DeletedOpenFile> {
                     original_path: clean_path,
                     size,
                     fd: fd_entry.file_name().to_string_lossy().to_string(),
+                    start_time: proc_start_time(pid),
                 });
             }
         }

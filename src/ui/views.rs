@@ -2633,22 +2633,41 @@ fn render_footer(f: &mut Frame, app: &App, area: Rect) {
         ActiveView::ConfirmModal => {
             // The kill confirmation answers 1/2, not y.
             if matches!(&app.pending_action, Some(ConfirmAction::KillProcess { .. })) {
-                vec![
-                    Span::styled(
-                        " [1] SIGTERM ",
-                        Style::default().fg(Color::Black).bg(Color::Yellow),
-                    ),
-                    Span::raw(" "),
-                    Span::styled(
-                        " [2] SIGKILL ",
-                        Style::default().fg(Color::White).bg(Color::Red),
-                    ),
-                    Span::raw(" "),
-                    Span::styled(
-                        " [n / Esc] Cancel ",
-                        Style::default().fg(Color::White).bg(Color::DarkGray),
-                    ),
-                ]
+                if area.width >= 80 {
+                    vec![
+                        Span::styled(
+                            " [1] SIGTERM ",
+                            Style::default().fg(Color::Black).bg(Color::Yellow),
+                        ),
+                        Span::raw(" "),
+                        Span::styled(
+                            " [2] SIGKILL ",
+                            Style::default().fg(Color::White).bg(Color::Red),
+                        ),
+                        Span::raw(" "),
+                        Span::styled(
+                            " [n / Esc] Cancel ",
+                            Style::default().fg(Color::White).bg(Color::DarkGray),
+                        ),
+                    ]
+                } else {
+                    vec![
+                        Span::styled(
+                            " [1] TERM ",
+                            Style::default().fg(Color::Black).bg(Color::Yellow),
+                        ),
+                        Span::raw(" "),
+                        Span::styled(
+                            " [2] KILL ",
+                            Style::default().fg(Color::White).bg(Color::Red),
+                        ),
+                        Span::raw(" "),
+                        Span::styled(
+                            " [Esc] ",
+                            Style::default().fg(Color::White).bg(Color::DarkGray),
+                        ),
+                    ]
+                }
             } else {
                 vec![
                     Span::styled(
