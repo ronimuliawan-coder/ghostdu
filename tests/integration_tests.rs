@@ -701,10 +701,51 @@ fn test_scanner_cross_mount_option() {
     let stop_signal = Arc::new(AtomicBool::new(false));
     let options = ghostdu_scanner::ScannerOptions {
         cross_mounts: false,
+        ..Default::default()
     };
     let root =
         ghostdu_scanner::scan_directory_with_options(base, None, stop_signal, options).unwrap();
     assert_eq!(root.children.len(), 1);
+}
+
+#[test]
+fn test_scan_excludes_and_depth_cap() {
+    let temp_dir = tempfile::tempdir().expect("create temp dir");
+    let base = temp_dir.path();
+    let excluded = base.join("node_modules");
+    let deep = base.join("deep").join("deeper");
+    fs::create_dir_all(&excluded).unwrap();
+    fs::create_dir_all(&deep).unwrap();
+    fs::write(excluded.join("dep.js"), "x").unwrap();
+    fs::write(base.join("top.txt"), "x").unwrap();
+    fs::write(deep.join("nested.txt"), "x").unwrap();
+
+    let stop_signal = Arc::new(AtomicBool::new(false));
+    let root = ghostdu_scanner::scan_directory_with_options(
+        base,
+        None,
+        stop_signal,
+        ghostdu_scanner::ScannerOptions {
+            excludes: vec!["node_modules".to_string()],
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert!(root.children.iter().all(|e| e.name != "node_modules"));
+
+    let stop_signal = Arc::new(AtomicBool::new(false));
+    let shallow = ghostdu_scanner::scan_directory_with_options(
+        base,
+        None,
+        stop_signal,
+        ghostdu_scanner::ScannerOptions {
+            max_depth: Some(1),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let deep_entry = shallow.children.iter().find(|e| e.name == "deep").unwrap();
+    assert!(deep_entry.children.is_empty());
 }
 
 #[test]

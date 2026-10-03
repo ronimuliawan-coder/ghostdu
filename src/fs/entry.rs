@@ -1,8 +1,9 @@
+use serde::Serialize;
 use std::path::PathBuf;
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[allow(dead_code)]
 pub enum GhostKind {
     None,
@@ -99,7 +100,7 @@ impl GhostKind {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
 #[allow(dead_code)]
 pub enum DeleteSafety {
     Safe,    // 🟢 Safe to remove, transient/ephemeral/cache
@@ -156,7 +157,7 @@ impl DeleteSafety {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 #[allow(dead_code)]
 pub struct FileEntry {
     pub name: String,

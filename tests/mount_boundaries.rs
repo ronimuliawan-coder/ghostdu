@@ -82,7 +82,10 @@ fn bind_mount_boundaries_and_ancestor_cycles() {
             &root,
             None,
             Arc::new(AtomicBool::new(false)),
-            ScannerOptions { cross_mounts },
+            ScannerOptions {
+                cross_mounts,
+                ..Default::default()
+            },
         )
         .unwrap();
         assert_eq!(tree.size, if cross_mounts { 21 } else { 7 });
