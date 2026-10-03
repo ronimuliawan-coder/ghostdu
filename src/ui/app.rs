@@ -2,8 +2,8 @@ use crate::fs::entry::{DeleteSafety, FileEntry, GhostKind};
 use crate::fs::mount_info::{get_detailed_item_info, query_fs_info, DetailedItemInfo, FsMountInfo};
 use crate::fs::scanner::ScannerOptions;
 use crate::ghost::{
-    classify_path, classify_safety, fetch_docker_disk_info, proc_start_time, prune_docker_dangling,
-    scan_deleted_open_files, DeletedOpenFile, DockerDiskInfo,
+    classify_path, classify_safety, describe_pid_ghost, fetch_docker_disk_info, proc_start_time,
+    prune_docker_dangling, scan_deleted_open_files, DeletedOpenFile, DockerDiskInfo,
 };
 use crate::ops::delete::permanently_delete_confirmed;
 use crate::ops::trash::move_to_trash_confirmed;
@@ -1360,48 +1360,35 @@ impl App {
     }
 
     /// Open the process-termination confirmation for a ghost-table PID. The row,
-    /// confirmation, and signal bind to one process instance: the table is
-    /// rescanned, a replacement PID is refused instead of adopted, the modal
-    /// shows the freshly validated name, and the instance is pinned with a
-    /// pidfd. Callers pass PIDs from the ghost table, never free-form input.
+    /// confirmation, and signal bind to one process instance: the row's recorded
+    /// identity must still match the live holder, which must still hold a ghost
+    /// file (checked per-PID, never via a full table walk on the key path).
+    /// A recycled PID is refused instead of adopted; the modal shows the
+    /// freshly validated name, and the instance is pinned with a pidfd.
+    /// Callers pass PIDs from the ghost table, never free-form input.
     pub fn prompt_kill_process(&mut self, pid: u32) {
-        // Bind to the displayed row's recorded instance: a PID recycled since
-        // the scan must be refused here, not adopted into the confirmation.
         let recorded = self
             .deleted_open_files
             .iter()
             .find(|f| f.pid == pid)
             .and_then(|f| f.start_time);
         let Some(recorded) = recorded else {
-            self.deleted_open_files = crate::ghost::scan_deleted_open_files();
-            self.set_status("Process row carries no recorded identity; table refreshed");
+            self.set_status("Process row carries no recorded identity; press r to refresh");
             return;
         };
-        if proc_start_time(pid) != Some(recorded) {
-            self.deleted_open_files = crate::ghost::scan_deleted_open_files();
+        // Targeted liveness: only this PID's fd directory is walked.
+        let Some((name, start_time)) = describe_pid_ghost(pid) else {
             self.set_status(format!(
-                "Process {pid} changed since scan; table refreshed, select it again"
-            ));
-            return;
-        }
-        // The ghost table is a snapshot; re-confirm the PID still holds one,
-        // and that it is still the recorded instance (not a replacement the
-        // rescan adopted).
-        self.deleted_open_files = crate::ghost::scan_deleted_open_files();
-        let Some(entry) = self.deleted_open_files.iter().find(|f| f.pid == pid) else {
-            self.set_status(format!(
-                "Process {pid} no longer holds ghost files; table refreshed"
+                "Process {pid} no longer holds ghost files; press r to refresh"
             ));
             return;
         };
-        if entry.start_time != Some(recorded) {
+        if start_time != recorded {
             self.set_status(format!(
-                "Process {pid} changed since scan; table refreshed, select it again"
+                "Process {pid} changed since scan; press r to refresh, then select it again"
             ));
             return;
         }
-        let name = entry.process_name.clone();
-        let start_time = recorded;
         // Pin the verified instance; a recycled PID names a different process,
         // never this handle. Execution refuses without a pinned handle.
         let pidfd = rustix::process::Pid::from_raw(pid as i32).and_then(|target| {
@@ -1467,9 +1454,13 @@ impl App {
             ));
             return;
         }
-        self.deleted_open_files = crate::ghost::scan_deleted_open_files();
-        self.ghost_cursor_index = 0;
-        self.set_status(format!("Signaled process {pid}; ghost table refreshed"));
+        // Drop the signalled rows surgically; the next manual refresh
+        // re-scans the table. No full procfs walk on the key path.
+        self.deleted_open_files.retain(|f| f.pid != pid);
+        self.ghost_cursor_index = self
+            .ghost_cursor_index
+            .min(self.deleted_open_files.len().saturating_sub(1));
+        self.set_status(format!("Signaled process {pid}"));
     }
 
     /// Execute pending action after user confirms
@@ -2117,7 +2108,12 @@ mod reconciliation_tests {
         assert!(app.pending_action.is_none());
         assert_ne!(app.active_view, ActiveView::ConfirmModal);
         // Row recorded a different instance than the live PID holder:
-        // replacement refused, never adopted into a confirmation.
+        // replacement refused, never adopted into a confirmation. The test
+        // process holds a deleted file so the targeted check reaches the
+        // instance comparison instead of stopping at "no ghost file".
+        let held = tempfile::NamedTempFile::new().unwrap();
+        fs::write(held.path(), vec![0u8; 100]).unwrap();
+        fs::remove_file(held.path()).unwrap();
         let own = std::process::id();
         app.deleted_open_files.push(DeletedOpenFile {
             pid: own,
@@ -2133,6 +2129,22 @@ mod reconciliation_tests {
             .current_status()
             .unwrap_or("")
             .contains("changed since scan"));
+        // Same instance, still holding: confirmation opens with a pin.
+        app.deleted_open_files.retain(|f| f.pid != own);
+        app.deleted_open_files.push(DeletedOpenFile {
+            pid: own,
+            process_name: "test-proc".to_string(),
+            original_path: "/deleted".to_string(),
+            size: 100,
+            fd: "3".to_string(),
+            start_time: crate::ghost::proc_start_time(own),
+        });
+        app.prompt_kill_process(own);
+        assert!(matches!(
+            app.pending_action,
+            Some(ConfirmAction::KillProcess { .. })
+        ));
+        app.cancel_modal();
         // Recycled PID: stored start time mismatches the live process.
         // Positive PID below i32::MAX that cannot exist (default pid_max is
         // far lower); kill(-1) would signal everything, so never test that.
@@ -2187,7 +2199,7 @@ mod reconciliation_tests {
         assert!(app
             .current_status()
             .unwrap_or("")
-            .contains("ghost table refreshed"));
+            .contains("Signaled process"));
     }
 
     #[test]
