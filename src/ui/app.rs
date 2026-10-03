@@ -128,8 +128,8 @@ pub enum ConfirmAction {
         name: String,
         start_time: u64,
         /// Pinned handle to the confirmed instance. Signals go through it, so
-        /// PID reuse cannot redirect them. `None` where the kernel predates
-        /// pidfd (fallback: start-time recheck before `kill`).
+        /// PID reuse cannot redirect them. `None` only on kernels predating
+        /// pidfd (below the app's 5.6 floor): execution refuses without one.
         pidfd: Option<rustix::fd::OwnedFd>,
     },
 }
@@ -1081,6 +1081,7 @@ impl App {
     }
 
     /// Toggle the row under the janitor cursor: a whole category on headers.
+    /// Selected bytes update incrementally (O(row), not O(tree)).
     pub fn toggle_janitor_row(&mut self) {
         if let Some((cat_idx, item_idx)) = self.janitor_row_at(self.janitor_cursor) {
             match item_idx {
@@ -1090,19 +1091,36 @@ impl App {
                         .iter()
                         .all(|item| item.selected);
                     for item in &mut self.janitor_cats[cat_idx].items {
+                        if item.selected == all_on {
+                            if all_on {
+                                self.janitor_selected_bytes =
+                                    self.janitor_selected_bytes.saturating_sub(item.size);
+                            } else {
+                                self.janitor_selected_bytes =
+                                    self.janitor_selected_bytes.saturating_add(item.size);
+                            }
+                        }
                         item.selected = !all_on;
                     }
                 }
                 Some(item_idx) => {
-                    let selected = self.janitor_cats[cat_idx].items[item_idx].selected;
-                    self.janitor_cats[cat_idx].items[item_idx].selected = !selected;
+                    let item = &mut self.janitor_cats[cat_idx].items[item_idx];
+                    item.selected = !item.selected;
+                    if item.selected {
+                        self.janitor_selected_bytes =
+                            self.janitor_selected_bytes.saturating_add(item.size);
+                    } else {
+                        self.janitor_selected_bytes =
+                            self.janitor_selected_bytes.saturating_sub(item.size);
+                    }
                 }
             }
-            self.refresh_janitor_selected();
         }
     }
 
     /// Select all janitor rows, or clear when everything is already selected.
+    /// One aggregate pass for the bulk action (explicitly allowed); rebuilds
+    /// recompute from scratch.
     pub fn toggle_janitor_all(&mut self) {
         let all_on = self
             .janitor_cats
@@ -1111,10 +1129,18 @@ impl App {
             .all(|item| item.selected);
         for cat in &mut self.janitor_cats {
             for item in &mut cat.items {
+                if item.selected == all_on {
+                    if all_on {
+                        self.janitor_selected_bytes =
+                            self.janitor_selected_bytes.saturating_sub(item.size);
+                    } else {
+                        self.janitor_selected_bytes =
+                            self.janitor_selected_bytes.saturating_add(item.size);
+                    }
+                }
                 item.selected = !all_on;
             }
         }
-        self.refresh_janitor_selected();
     }
 
     /// Trash or delete checked janitor rows through the standard confirmation
@@ -1346,7 +1372,7 @@ impl App {
             return;
         };
         // Pin the verified instance; a recycled PID names a different process,
-        // never this handle. Absent on pre-pidfd kernels (fallback below).
+        // never this handle. Execution refuses without a pinned handle.
         let pidfd = rustix::process::Pid::from_raw(pid as i32).and_then(|target| {
             rustix::process::pidfd_open(target, rustix::process::PidfdFlags::empty()).ok()
         });
@@ -1372,6 +1398,11 @@ impl App {
     /// refuses when the process instance changed since confirmation.
     /// `sigterm` selects SIGTERM (graceful) over SIGKILL. Kernel ESRCH/EPERM
     /// surface as status messages.
+    /// Signal the stored confirmed kill target through its pinned handle, which
+    /// is immune to PID reuse. Refuses when no handle could be pinned: there is
+    /// no numeric-PID fallback, so a recycled PID can never be signalled.
+    /// `sigterm` selects SIGTERM (graceful) over SIGKILL. Kernel errors surface
+    /// as status messages.
     pub fn execute_kill(&mut self, sigterm: bool) {
         let confirmed = self.pending_action.take();
         self.active_view = self.previous_view;
@@ -1379,49 +1410,26 @@ impl App {
             pid,
             name: _,
             start_time,
-            pidfd,
+            pidfd: Some(fd),
         }) = confirmed
         else {
+            self.set_status("Cannot signal: process was not pinned at confirmation");
             return;
         };
+        // The handle pins the confirmed instance, but refuse when the current
+        // holder already moved on: signalling it deserves refusal, not ESRCH.
+        if proc_start_time(pid) != Some(start_time) {
+            self.set_status(format!(
+                "Process {pid} changed since confirmation; not signalled"
+            ));
+            return;
+        }
         let signal = if sigterm {
             rustix::process::Signal::TERM
         } else {
             rustix::process::Signal::KILL
         };
-        // Prefer the pinned handle (immune to PID reuse); without one,
-        // recheck the start time before falling back to `kill`. The handle
-        // branch rechecks too: signalling a holder that changed since
-        // confirmation deserves refusal, not ESRCH.
-        let result = match pidfd {
-            Some(fd) => {
-                if proc_start_time(pid) != Some(start_time) {
-                    self.set_status(format!(
-                        "Process {pid} changed since confirmation; not signalled"
-                    ));
-                    return;
-                }
-                rustix::process::pidfd_send_signal(&fd, signal)
-            }
-            None => {
-                if proc_start_time(pid) != Some(start_time) {
-                    self.set_status(format!(
-                        "Process {pid} changed since confirmation; not signalled"
-                    ));
-                    return;
-                }
-                match rustix::process::Pid::from_raw(pid as i32) {
-                    Some(target) => rustix::process::kill_process(target, signal),
-                    None => {
-                        self.set_status(format!(
-                            "Process {pid} changed since confirmation; not signalled"
-                        ));
-                        return;
-                    }
-                }
-            }
-        };
-        if let Err(error) = result {
+        if let Err(error) = rustix::process::pidfd_send_signal(&fd, signal) {
             self.set_status(format!(
                 "Cannot signal process {pid}: {}",
                 std::io::Error::from(error)
@@ -1981,7 +1989,24 @@ mod reconciliation_tests {
             .iter()
             .flat_map(|cat| &cat.items)
             .all(|item| item.selected));
+        let selected_total: u64 = app
+            .janitor_cats
+            .iter()
+            .flat_map(|cat| &cat.items)
+            .map(|item| item.size)
+            .sum();
+        assert_eq!(app.janitor_selected_bytes, selected_total);
+        // Single-row toggle adjusts the total incrementally and reversibly.
+        app.toggle_janitor_all();
+        assert_eq!(app.janitor_selected_bytes, 0);
+        app.janitor_cursor = 1;
+        app.toggle_janitor_row();
+        let one = app.janitor_selected_bytes;
+        assert!(one > 0);
+        app.toggle_janitor_row();
+        assert_eq!(app.janitor_selected_bytes, 0);
         // Action routes through the standard trash confirmation.
+        app.toggle_janitor_all();
         app.janitor_action(true);
         assert_eq!(app.active_view, ActiveView::ConfirmModal);
         assert!(!app.action_targets.is_empty());
@@ -2045,10 +2070,7 @@ mod reconciliation_tests {
         app.active_view = ActiveView::ConfirmModal;
         app.execute_kill(true);
         assert!(app.pending_action.is_none());
-        assert!(app
-            .current_status()
-            .unwrap_or("")
-            .contains("changed since confirmation"));
+        assert!(app.current_status().unwrap_or("").contains("not pinned"));
         // Sanity: the current process has a readable start time.
         assert!(super::proc_start_time(std::process::id()).is_some());
     }
