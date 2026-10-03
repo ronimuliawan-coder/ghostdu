@@ -1173,3 +1173,56 @@ fn failed_deletion_rescans_only_affected_subtrees_and_preserves_hardlink_totals(
     assert_eq!(app.root_entry.items_count, 5);
     assert!(app.current_status().unwrap().contains("1 failed"));
 }
+
+#[test]
+fn replacement_between_scan_and_confirmation_or_selection_is_rejected() {
+    let fixture = tempfile::tempdir().unwrap();
+    let file_path = fixture.path().join("target.txt");
+    fs::write(&file_path, "initial").unwrap();
+    let root =
+        ghostdu_scanner::scan_directory(fixture.path(), None, Arc::new(AtomicBool::new(false)))
+            .unwrap();
+
+    // Replace the scanned target before selection or confirmation
+    fs::remove_file(&file_path).unwrap();
+    fs::write(&file_path, "replaced with different ino").unwrap();
+
+    // 1. Attempting to select the replaced item must fail closed
+    let mut app = ghostdu::ui::App::new(root.clone());
+    app.toggle_selection();
+    assert!(app.selected_paths.is_empty());
+    assert!(app
+        .current_status()
+        .unwrap()
+        .contains("Target changed since scan"));
+
+    // 2. Attempting to confirm action on replaced cursor item must fail closed
+    let mut app2 = ghostdu::ui::App::new(root);
+    app2.prompt_permanent_delete();
+    assert!(app2.pending_action.is_none());
+    assert!(app2
+        .current_status()
+        .unwrap()
+        .contains("Target changed since scan"));
+
+    // 3. Verify nested subdirectory target replacement also traverses and fails closed
+    let nested_dir = fixture.path().join("sub/nested");
+    fs::create_dir_all(&nested_dir).unwrap();
+    let nested_file = nested_dir.join("inner.txt");
+    fs::write(&nested_file, "nested initial").unwrap();
+    let root_nested =
+        ghostdu_scanner::scan_directory(fixture.path(), None, Arc::new(AtomicBool::new(false)))
+            .unwrap();
+
+    fs::remove_file(&nested_file).unwrap();
+    fs::write(&nested_file, "nested replaced").unwrap();
+
+    let mut app3 = ghostdu::ui::App::new(root_nested);
+    assert!(app3.navigate_to_path(&nested_dir));
+    app3.toggle_selection();
+    assert!(app3.selected_paths.is_empty());
+    assert!(app3
+        .current_status()
+        .unwrap()
+        .contains("Target changed since scan"));
+}

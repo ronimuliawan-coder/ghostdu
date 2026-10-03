@@ -514,7 +514,7 @@ impl App {
             }
             Ok(_) => {}
         }
-        match TargetIdentity::capture(&path) {
+        match self.capture_verified_identity(&path) {
             Ok(identity) => {
                 self.selected_identities.insert(path.clone(), identity);
                 self.selected_paths.insert(path);
@@ -525,6 +525,19 @@ impl App {
                 false
             }
         }
+    }
+
+    fn capture_verified_identity(&self, path: &Path) -> std::io::Result<TargetIdentity> {
+        TargetIdentity::capture(path).and_then(|identity| match self.find_entry(path) {
+            Some(entry)
+                if identity.matches_ids(entry.dev, entry.ino, entry.is_dir, entry.is_symlink) =>
+            {
+                Ok(identity)
+            }
+            _ => Err(std::io::Error::other(
+                "Target changed since scan; refresh and select it again",
+            )),
+        })
     }
 
     fn select_path(&mut self, path: PathBuf) -> bool {
@@ -546,7 +559,7 @@ impl App {
                         )
                     })
             } else {
-                TargetIdentity::capture(path)
+                self.capture_verified_identity(path)
             };
             match identity {
                 Ok(identity) => {
@@ -1103,6 +1116,33 @@ impl App {
 
         self.refresh_fs_info();
         !self.path_stack.is_empty()
+    }
+
+    /// Look up the scanned FileEntry for a given target path if present in root_entry
+    pub fn find_entry(&self, target: &Path) -> Option<&FileEntry> {
+        if !target.starts_with(&self.root_entry.path) {
+            return None;
+        }
+        if target == self.root_entry.path {
+            return Some(&self.root_entry);
+        }
+        let mut curr = &self.root_entry;
+        loop {
+            let mut matched = false;
+            for child in &curr.children {
+                if child.path == target {
+                    return Some(child);
+                }
+                if child.is_dir && target.starts_with(&child.path) {
+                    curr = child;
+                    matched = true;
+                    break;
+                }
+            }
+            if !matched {
+                return None;
+            }
+        }
     }
 }
 

@@ -45,6 +45,21 @@ impl TargetIdentity {
             .and_then(|current| self.verify(&current.0))
             .is_ok()
     }
+
+    pub(crate) fn matches_ids(&self, dev: u64, ino: u64, is_dir: bool, is_symlink: bool) -> bool {
+        if dev == 0 && ino == 0 {
+            return false;
+        }
+        self.0
+            .metadata()
+            .map(|meta| {
+                meta.dev() == dev
+                    && meta.ino() == ino
+                    && meta.is_dir() == is_dir
+                    && meta.is_symlink() == is_symlink
+            })
+            .unwrap_or(false)
+    }
 }
 
 pub(crate) type TargetIdentities = HashMap<PathBuf, TargetIdentity>;
