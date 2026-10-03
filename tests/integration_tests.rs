@@ -776,7 +776,13 @@ fn test_export_supports_non_utf8_names() {
     let root = ghostdu_scanner::scan_directory(temp_dir.path(), None, stop_signal).unwrap();
     // Serde's PathBuf serializer rejects non-UTF-8; the export path must not.
     let json = serde_json::to_string_pretty(&root).unwrap();
-    assert!(json.contains("name"));
+    let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+    let entry = &parsed["children"][0];
+    assert_eq!(entry["name"], "na\u{FFFD}me".to_string());
+    assert_eq!(
+        entry["path"],
+        root.children[0].path.to_string_lossy().into_owned()
+    );
 }
 
 #[test]
