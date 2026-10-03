@@ -84,6 +84,14 @@ struct Cli {
     /// Write the scan tree as JSON to FILE and exit
     #[arg(long, value_name = "FILE")]
     export: Option<PathBuf>,
+
+    /// Print shell completions for SHELL and exit
+    #[arg(long, value_name = "SHELL")]
+    print_completions: Option<clap_complete::Shell>,
+
+    /// Print a man page to stdout and exit
+    #[arg(long)]
+    print_manpage: bool,
 }
 
 #[derive(Copy, Clone, Debug, clap::ValueEnum)]
@@ -100,7 +108,21 @@ enum SortArg {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    use clap::CommandFactory;
     let cli = Cli::parse();
+
+    if let Some(shell) = cli.print_completions {
+        let mut command = Cli::command();
+        clap_complete::generate(shell, &mut command, "ghostdu", &mut io::stdout());
+        return Ok(());
+    }
+    if cli.print_manpage {
+        let command = Cli::command();
+        let man = clap_mangen::Man::new(command);
+        man.render(&mut io::stdout())?;
+        return Ok(());
+    }
+
     let target_path = cli.path.clone();
 
     if !target_path.exists() {
