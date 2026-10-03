@@ -156,8 +156,12 @@ fn handle_ghost_keys(app: &mut App, key: KeyEvent) -> EventResult {
         // Terminate the highlighted ghost-table process (table PIDs only).
         KeyCode::Char('K') => {
             if app.ghost_tab_index == 1 {
-                if let Some(entry) = app.deleted_open_files.get(app.ghost_cursor_index) {
-                    app.prompt_kill_process(entry.pid, entry.process_name.clone());
+                let target = app
+                    .deleted_open_files
+                    .get(app.ghost_cursor_index)
+                    .map(|entry| entry.pid);
+                if let Some(pid) = target {
+                    app.prompt_kill_process(pid);
                 }
             }
         }
