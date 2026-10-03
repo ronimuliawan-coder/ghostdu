@@ -374,22 +374,31 @@ fn export_scan(
         scan_directory_with_options(&target_path, None, stop_signal, scan_options.clone())?;
     // Stage through a private temp file and rename: a failed export never leaves
     // a truncated destination, and the listing is never world-readable mid-write.
+    // Exclusive creation fails closed if the staging name already exists (even as
+    // a planted symlink) instead of following it and truncating its target.
     let mut temp = export_file.clone().into_os_string();
     temp.push(format!(".tmp-{}", std::process::id()));
     let temp_path = PathBuf::from(temp);
-    {
-        let file = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(&temp_path)?;
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&temp_path)?;
+    let result = (|| -> Result<(), Box<dyn std::error::Error>> {
         let mut writer = BufWriter::new(file);
         // Stream serialization instead of buffering the whole JSON string.
         serde_json::to_writer_pretty(&mut writer, &root_entry)?;
         writer.flush()?;
+        drop(writer);
+        std::fs::rename(&temp_path, export_file)?;
+        Ok(())
+    })();
+    // Remove only the staging file this invocation created; the final
+    // destination is untouched unless the rename succeeded.
+    if let Err(err) = result {
+        let _ = std::fs::remove_file(&temp_path);
+        return Err(err);
     }
-    std::fs::rename(&temp_path, export_file)?;
     println!(
         "Exported {} ({} apparent) to {}",
         format_count(root_entry.items_count),
