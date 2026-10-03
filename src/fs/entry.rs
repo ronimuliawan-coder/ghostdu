@@ -1,4 +1,4 @@
-use serde::{Serialize, Serializer};
+use serde::{Deserialize, Serialize, Serializer};
 use std::path::PathBuf;
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
@@ -10,7 +10,7 @@ fn lossy_path<S: Serializer>(path: &PathBuf, serializer: S) -> Result<S::Ok, S::
     serializer.serialize_str(&path.to_string_lossy())
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[allow(dead_code)]
 pub enum GhostKind {
     None,
@@ -107,7 +107,7 @@ impl GhostKind {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[allow(dead_code)]
 pub enum DeleteSafety {
     Safe,    // 🟢 Safe to remove, transient/ephemeral/cache
@@ -164,7 +164,7 @@ impl DeleteSafety {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[allow(dead_code)]
 pub struct FileEntry {
     pub name: String,
@@ -275,6 +275,27 @@ impl FileEntry {
             1
         } else {
             self.safe_items
+        }
+    }
+}
+
+/// Versioned `--export` envelope (Phase 0). Bump on breaking tree-shape changes;
+/// `--import`/`diff` reject unknown major versions with a clear error.
+pub const EXPORT_FORMAT_VERSION: u32 = 1;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExportEnvelope {
+    pub format_version: u32,
+    pub tool_version: String,
+    pub root: FileEntry,
+}
+
+impl ExportEnvelope {
+    pub fn wrap(root: FileEntry) -> Self {
+        Self {
+            format_version: EXPORT_FORMAT_VERSION,
+            tool_version: env!("CARGO_PKG_VERSION").to_string(),
+            root,
         }
     }
 }

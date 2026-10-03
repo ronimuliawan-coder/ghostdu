@@ -372,6 +372,9 @@ fn export_scan(
     let stop_signal = Arc::new(AtomicBool::new(false));
     let root_entry =
         scan_directory_with_options(&target_path, None, stop_signal, scan_options.clone())?;
+    let items = root_entry.items_count;
+    let apparent = root_entry.size;
+    let envelope = fs::ExportEnvelope::wrap(root_entry);
     // Stage through a private temp file and rename: a failed export never leaves
     // a truncated destination, and the listing is never world-readable mid-write.
     // Exclusive creation fails closed if the staging name already exists (even as
@@ -387,7 +390,7 @@ fn export_scan(
     let result = (|| -> Result<(), Box<dyn std::error::Error>> {
         let mut writer = BufWriter::new(file);
         // Stream serialization instead of buffering the whole JSON string.
-        serde_json::to_writer_pretty(&mut writer, &root_entry)?;
+        serde_json::to_writer_pretty(&mut writer, &envelope)?;
         writer.flush()?;
         drop(writer);
         std::fs::rename(&temp_path, export_file)?;
@@ -401,8 +404,8 @@ fn export_scan(
     }
     println!(
         "Exported {} ({} apparent) to {}",
-        format_count(root_entry.items_count),
-        format_size(root_entry.size),
+        format_count(items),
+        format_size(apparent),
         export_file.display()
     );
     Ok(())
