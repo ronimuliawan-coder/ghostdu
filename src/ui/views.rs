@@ -2769,6 +2769,10 @@ mod render_sweep_tests {
         std::fs::create_dir(&sub).unwrap();
         std::fs::write(dir.path().join("a.txt"), "aaaaaaaaaa").unwrap();
         std::fs::write(sub.join("b.txt"), "b").unwrap();
+        // Safe-classified content exercises safe totals, badges, and filters.
+        let cache = dir.path().join(".cache").join("thumbnails");
+        std::fs::create_dir_all(&cache).unwrap();
+        std::fs::write(cache.join("thumb.png"), vec![0u8; 1000]).unwrap();
         let root = scan_directory(dir.path(), None, Arc::new(AtomicBool::new(false))).unwrap();
         Fixture {
             app: App::new(root),
@@ -2824,6 +2828,8 @@ mod render_sweep_tests {
         assert!(out.contains("a.txt"));
         // Narrow, short, and tiny terminals take compact paths.
         let _ = render(&fx.app, 40, 20);
+        let _ = render(&fx.app, 100, 12);
+        let _ = render(&fx.app, 60, 7);
         let _ = render(&fx.app, 100, 4);
         let tiny = render(&fx.app, 20, 2);
         assert!(tiny.contains("Terminal too small"));
