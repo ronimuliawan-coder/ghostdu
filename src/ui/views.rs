@@ -2901,6 +2901,13 @@ mod render_sweep_tests {
                 GhostKind::None,
                 DeleteSafety::System,
             ));
+            // Render again unfiltered so every synthetic row is visible.
+            fx.app.safe_only_filter = false;
+            fx.app.search_query.clear();
+            fx.app.is_searching = false;
+            for (width, height) in [(100, 30), (40, 20), (100, 12)] {
+                let _ = render(&fx.app, width, height);
+            }
         }
         for (width, height) in [
             (100, 30),
