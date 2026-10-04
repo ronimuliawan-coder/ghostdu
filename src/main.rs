@@ -84,6 +84,14 @@ struct Cli {
     /// Write the scan tree as JSON to FILE and exit
     #[arg(long, value_name = "FILE")]
     export: Option<PathBuf>,
+
+    /// Print shell completions for SHELL and exit
+    #[arg(long, value_name = "SHELL")]
+    print_completions: Option<clap_complete::Shell>,
+
+    /// Print a man page to stdout and exit
+    #[arg(long)]
+    print_manpage: bool,
 }
 
 #[derive(Copy, Clone, Debug, clap::ValueEnum)]
@@ -100,7 +108,21 @@ enum SortArg {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    use clap::CommandFactory;
     let cli = Cli::parse();
+
+    if let Some(shell) = cli.print_completions {
+        let mut command = Cli::command();
+        clap_complete::generate(shell, &mut command, "ghostdu", &mut io::stdout());
+        return Ok(());
+    }
+    if cli.print_manpage {
+        let command = Cli::command();
+        let man = clap_mangen::Man::new(command);
+        man.render(&mut io::stdout())?;
+        return Ok(());
+    }
+
     let target_path = cli.path.clone();
 
     if !target_path.exists() {
@@ -336,6 +358,15 @@ fn run_app<B: ratatui::backend::Backend>(
                             target_path = new_path;
                             break true;
                         }
+                        EventResult::Subshell(dir) => {
+                            if let Err(error) = run_subshell(terminal, &dir) {
+                                app.set_status(error.to_string());
+                            } else if app.refresh_path(&dir) {
+                                app.set_status("Subshell exited; directory refreshed");
+                            } else {
+                                app.set_status("Subshell exited; refresh failed");
+                            }
+                        }
                     }
                 }
             }
@@ -346,6 +377,27 @@ fn run_app<B: ratatui::backend::Backend>(
         }
     }
 
+    Ok(())
+}
+
+/// Suspend the TUI, run an interactive shell in `dir`, then restore the TUI.
+/// Restoration runs even when the shell cannot start.
+fn run_subshell<B: ratatui::backend::Backend>(
+    terminal: &mut Terminal<B>,
+    dir: &std::path::Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
+
+    disable_raw_mode()?;
+    execute!(stdout(), LeaveAlternateScreen)?;
+    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
+    let result = std::process::Command::new(shell).current_dir(dir).status();
+    execute!(stdout(), EnterAlternateScreen)?;
+    enable_raw_mode()?;
+    terminal.clear()?;
+    if let Err(error) = result {
+        return Err(format!("Cannot start shell: {error}").into());
+    }
     Ok(())
 }
 
@@ -372,6 +424,9 @@ fn export_scan(
     let stop_signal = Arc::new(AtomicBool::new(false));
     let root_entry =
         scan_directory_with_options(&target_path, None, stop_signal, scan_options.clone())?;
+    let items = root_entry.items_count;
+    let apparent = root_entry.size;
+    let envelope = fs::ExportEnvelope::wrap(root_entry);
     // Stage through a private temp file and rename: a failed export never leaves
     // a truncated destination, and the listing is never world-readable mid-write.
     // Exclusive creation fails closed if the staging name already exists (even as
@@ -387,7 +442,7 @@ fn export_scan(
     let result = (|| -> Result<(), Box<dyn std::error::Error>> {
         let mut writer = BufWriter::new(file);
         // Stream serialization instead of buffering the whole JSON string.
-        serde_json::to_writer_pretty(&mut writer, &root_entry)?;
+        serde_json::to_writer_pretty(&mut writer, &envelope)?;
         writer.flush()?;
         drop(writer);
         std::fs::rename(&temp_path, export_file)?;
@@ -401,8 +456,8 @@ fn export_scan(
     }
     println!(
         "Exported {} ({} apparent) to {}",
-        format_count(root_entry.items_count),
-        format_size(root_entry.size),
+        format_count(items),
+        format_size(apparent),
         export_file.display()
     );
     Ok(())
