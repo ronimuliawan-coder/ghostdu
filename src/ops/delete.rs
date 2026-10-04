@@ -70,6 +70,12 @@ pub(super) fn prepare_target(path: &Path) -> io::Result<(File, CString, File)> {
     )?);
     // Verify the path of the pinned parent, not a fresh resolution of the user's path.
     let pinned_path = fs::read_link(format!("/proc/self/fd/{}", parent.as_raw_fd()))?;
+    // Defensive TOCTOU guard: the parent would have to be renamed between the
+    // open above and this readlink. Untestable in-process by construction, so
+    // excluded from line coverage; the ancestor-redirection test covers the
+    // companion threat.
+    #[cfg(not(tarpaulin_include))]
+    #[allow(unexpected_cfgs)]
     if pinned_path != canonical_parent {
         return Err(io::Error::other(
             "Target parent changed during verification",

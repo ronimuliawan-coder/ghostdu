@@ -619,6 +619,18 @@ mod tests {
             classify_path(&PathBuf::from("/home/ron/documents/photo.jpg")),
             GhostKind::None
         );
+        assert_eq!(
+            classify_path(&PathBuf::from("/home/ron/.docker/config.json")),
+            GhostKind::DockerUser
+        );
+        assert_eq!(
+            classify_path(&PathBuf::from("/home/ron/.local/state/app/log")),
+            GhostKind::LogFiles
+        );
+        assert_eq!(
+            classify_safety(&PathBuf::from("/var/log"), GhostKind::LogFiles),
+            DeleteSafety::Recheck
+        );
     }
 
     #[test]
