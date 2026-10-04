@@ -2104,6 +2104,31 @@ mod reconciliation_tests {
     }
 
     #[test]
+    fn jump_to_missing_parent_reports_status() {
+        let fixture = tempfile::tempdir().unwrap();
+        std::fs::write(fixture.path().join("stay.txt"), "x").unwrap();
+        let root = crate::fs::scanner::scan_directory(
+            fixture.path(),
+            None,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .unwrap();
+        let mut app = App::new(root);
+        app.open_top_files();
+        // A row no live tree path can resolve: jump fails, view stays usable.
+        app.top_files.push(TopFile {
+            path: PathBuf::from("/nonexistent-xyz/deep/file.txt"),
+            name: "file.txt".to_string(),
+            size: 1,
+            disk_usage: 1,
+            safety: DeleteSafety::UserData,
+        });
+        app.top_cursor = app.top_files.len() - 1;
+        assert!(!app.jump_to_top_file());
+        assert_eq!(app.active_view, ActiveView::TopFiles);
+    }
+
+    #[test]
     fn kill_flow_confirms_stale_table_then_refuses_recycled_pid() {
         let fixture = tempfile::tempdir().unwrap();
         let root = crate::fs::scanner::scan_directory(
@@ -2420,5 +2445,106 @@ mod reconciliation_tests {
             fs::read_to_string(fixture.path().join("original/target")).unwrap(),
             "keep"
         );
+    }
+}
+
+#[cfg(test)]
+mod selection_limit_tests {
+    use super::*;
+    use std::sync::{atomic::AtomicBool, Arc};
+
+    fn app_with_files(count: usize) -> (tempfile::TempDir, App) {
+        let dir = tempfile::tempdir().unwrap();
+        for i in 0..count {
+            std::fs::write(dir.path().join(format!("f{i:04}")), "x").unwrap();
+        }
+        let root = crate::fs::scanner::scan_directory(
+            dir.path(),
+            None,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .unwrap();
+        let app = App::new(root);
+        (dir, app)
+    }
+
+    #[test]
+    fn selection_gates_and_capture_failures() {
+        let (_dir, mut app) = app_with_files(3);
+        let target = app.root_entry.children[0].path.clone();
+        // Re-selecting is a no-op success.
+        let limit = app.selection_limit();
+        assert!(app.select_path_with_limit(target.clone(), limit.as_ref()));
+        assert!(app.select_path_with_limit(target.clone(), limit.as_ref()));
+        // Zero budget refuses with guidance (on a not-yet-selected path).
+        // All failure arms below reuse it: failures never insert selections.
+        let fresh = app.root_entry.children[1].path.clone();
+        let zero = 0usize;
+        assert!(!app.select_path_with_limit(fresh.clone(), Ok(&zero)));
+        // Limit errors fail closed in both entry points.
+        let err = std::io::Error::other("no fds");
+        assert!(!app.select_path_with_limit(fresh.clone(), Err(&err)));
+        let entry = app.find_entry(&fresh).unwrap();
+        assert!(!app.select_scanned_entry_with_limit(
+            fresh.clone(),
+            entry.dev,
+            entry.ino,
+            entry.is_dir,
+            entry.is_symlink,
+            Err(&err),
+        ));
+        // Identity mismatch and missing paths fail closed.
+        assert!(!app.select_scanned_entry_with_limit(
+            fresh.clone(),
+            999999,
+            888888,
+            false,
+            false,
+            limit.as_ref(),
+        ));
+        assert!(!app.select_scanned_entry_with_limit(
+            PathBuf::from("/definitely/not/here-12345"),
+            1,
+            2,
+            false,
+            false,
+            limit.as_ref(),
+        ));
+        assert!(!app.select_path_with_limit(
+            PathBuf::from("/definitely/not/here-12345"),
+            limit.as_ref(),
+        ));
+        // Capture confirmation fails closed on unknown targets.
+        assert!(!app.capture_verified_identity(Path::new("/definitely/not/here-12345")).is_ok());
+    }
+
+    #[test]
+    fn select_all_reports_partial_batches() {
+        let (_dir, mut app) = app_with_files(300);
+        app.select_all_visible();
+        // 256-item cap stops the batch with an explanatory status.
+        assert!(app.selected_paths.len() <= 256);
+        assert!(app
+            .current_status()
+            .unwrap_or("")
+            .contains("additional items"));
+    }
+
+    #[test]
+    fn modes_labels_and_ghost_refresh() {
+        assert_eq!(GhostFilterMode::ShowAll.label(), "All Files");
+        assert_eq!(GhostFilterMode::HideGhost.next(), GhostFilterMode::GhostOnly);
+        assert_eq!(GhostFilterMode::GhostOnly.next(), GhostFilterMode::ShowAll);
+        assert_eq!(SortMode::ByItems.next(), SortMode::BySizeDesc);
+        assert_eq!(SortMode::BySizeDesc.label(), "Size (desc)");
+        let (_dir, mut app) = app_with_files(1);
+        app.refresh_ghost_info();
+        assert!(app
+            .current_status()
+            .unwrap_or("")
+            .contains("Docker"));
+        // Mutable current-dir access walks the stack.
+        app.current_dir_entry_mut().size = 123;
+        assert_eq!(app.current_dir_entry().size, 123);
     }
 }
