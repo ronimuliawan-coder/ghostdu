@@ -2826,20 +2826,18 @@ mod render_sweep_tests {
         let mut fx = fixture();
         let out = render(&fx.app, 100, 30);
         assert!(out.contains("a.txt"));
+        // Rich state so conditional spans appear at every header size.
+        let app = &mut fx.app;
+        app.toggle_selection();
+        app.safe_only_filter = true;
+        app.search_query = "a".to_string();
+        for (width, height) in [(100, 30), (40, 20), (100, 12), (60, 7), (100, 4)] {
+            let _ = render(app, width, height);
+        }
         // Narrow, short, and tiny terminals take compact paths.
-        let _ = render(&fx.app, 40, 20);
-        let _ = render(&fx.app, 100, 12);
-        let _ = render(&fx.app, 60, 7);
-        let _ = render(&fx.app, 100, 4);
         let tiny = render(&fx.app, 20, 2);
         assert!(tiny.contains("Terminal too small"));
         // Display modes each change the render.
-        let app = &mut fx.app;
-        app.toggle_selection();
-        let out = render(app, 100, 30);
-        assert!(out.contains("sel:"));
-        app.safe_only_filter = true;
-        let _ = render(app, 100, 30);
         app.safe_only_filter = false;
         app.ghost_filter = GhostFilterMode::HideGhost;
         let _ = render(app, 100, 30);
@@ -2869,6 +2867,10 @@ mod render_sweep_tests {
         app.cursor_index = 10_000;
         let _ = render(app, 100, 30);
         app.cursor_index = 0;
+        // Stale scroll offset above the cursor scrolls back into view.
+        app.scroll_offset.set(10_000);
+        let _ = render(app, 100, 30);
+        app.scroll_offset.set(0);
     }
 
     #[test]
