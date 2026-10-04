@@ -2830,7 +2830,17 @@ mod render_sweep_tests {
         fx.app.toggle_selection();
         fx.app.safe_only_filter = true;
         fx.app.search_query = "a".to_string();
-        for (width, height) in [(100, 30), (40, 20), (100, 12), (60, 7), (100, 4)] {
+        for (width, height) in [
+            (100, 30),
+            (40, 20),
+            (100, 12),
+            (60, 7),
+            (100, 4),
+            (30, 30),
+            (50, 30),
+            (70, 30),
+            (140, 30),
+        ] {
             let _ = render(&fx.app, width, height);
         }
         // Narrow, short, and tiny terminals take compact paths.
@@ -2871,6 +2881,15 @@ mod render_sweep_tests {
         app.scroll_offset.set(10_000);
         let _ = render(app, 100, 30);
         app.scroll_offset.set(0);
+        // Near-full disk exercises the warning bar colors.
+        if let Some(ref mut fs) = app.fs_info {
+            fs.use_percent = 95.0;
+        }
+        let _ = render(app, 100, 30);
+        if let Some(ref mut fs) = app.fs_info {
+            fs.use_percent = 80.0;
+        }
+        let _ = render(app, 100, 30);
     }
 
     #[test]
