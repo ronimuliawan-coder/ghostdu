@@ -39,11 +39,7 @@ pub fn query_fs_info(path: &Path) -> Option<FsMountInfo> {
     let free_bytes = ((stat.f_bfree as u128) * frsize).min(u64::MAX as u128) as u64;
     let avail_bytes = ((stat.f_bavail as u128) * frsize).min(u64::MAX as u128) as u64;
     let used_bytes = total_bytes.saturating_sub(free_bytes);
-    let use_percent = if total_bytes > 0 {
-        ((used_bytes as f64 / total_bytes as f64) * 100.0).clamp(0.0, 100.0)
-    } else {
-        0.0
-    };
+    let use_percent = usage_percent(used_bytes, total_bytes);
 
     // 2. Parse /proc/mounts to match mount point and filesystem type
     let (device, mount_point, fs_type) = resolve_mount_point(&canonical);
@@ -62,6 +58,15 @@ pub fn query_fs_info(path: &Path) -> Option<FsMountInfo> {
 
 /// Unescapes octal sequences (e.g. \040 -> ' ', \011 -> '\t', \012 -> '\n', \134 -> '\')
 /// used by Linux /proc/mounts and mntent for paths containing whitespace or special characters.
+/// Usage percentage that stays defined for zero-sized filesystems.
+fn usage_percent(used_bytes: u64, total_bytes: u64) -> f64 {
+    if total_bytes > 0 {
+        ((used_bytes as f64 / total_bytes as f64) * 100.0).clamp(0.0, 100.0)
+    } else {
+        0.0
+    }
+}
+
 pub fn unescape_mount_path(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut chars = s.chars().peekable();
@@ -325,5 +330,51 @@ mod tests {
         assert!(info.is_dir);
         assert_eq!(info.items_count, 42);
         assert!(info.fs_info.is_some());
+    }
+}
+
+#[cfg(test)]
+mod coverage_tests {
+    use super::*;
+
+    #[test]
+    fn usage_percent_handles_empty_filesystems() {
+        assert_eq!(usage_percent(0, 0), 0.0);
+        assert_eq!(usage_percent(50, 100), 50.0);
+        assert_eq!(usage_percent(200, 100), 100.0);
+    }
+
+    #[test]
+    fn unescape_handles_octal_and_literals() {
+        assert_eq!(unescape_mount_path("/mnt/my\\040disk"), "/mnt/my disk");
+        assert_eq!(unescape_mount_path("/plain/path"), "/plain/path");
+        assert_eq!(unescape_mount_path("/x\\999y"), "/x\\999y");
+        assert_eq!(unescape_mount_path("/x\\4y"), "/x\\4y");
+        assert_eq!(unescape_mount_path("/trailing\\"), "/trailing\\");
+        assert_eq!(unescape_mount_path(""), "");
+    }
+
+    #[test]
+    fn mode_strings_cover_special_bits() {
+        assert_eq!(format_mode(0o755, false, false), "-rwxr-xr-x");
+        assert_eq!(format_mode(0o4755, false, false), "-rwsr-xr-x");
+        assert_eq!(format_mode(0o4744, false, false), "-rwsr--r--");
+        assert_eq!(format_mode(0o4644, false, false), "-rwSr--r--");
+        assert_eq!(format_mode(0o2755, false, false), "-rwxr-sr-x");
+        assert_eq!(format_mode(0o2744, false, false), "-rwxr-Sr--");
+        assert_eq!(format_mode(0o1755, true, false), "drwxr-xr-t");
+        assert_eq!(format_mode(0o1744, true, false), "drwxr--r-T");
+        assert_eq!(format_mode(0o777, false, true), "lrwxrwxrwx");
+        assert_eq!(format_mode(0o600, false, false), "-rw-------");
+    }
+
+    #[test]
+    fn item_info_missing_path_returns_none() {
+        assert!(get_detailed_item_info(
+            std::path::Path::new("/definitely/not/here-12345"),
+            0
+        )
+        .is_none());
+        assert!(query_fs_info(std::path::Path::new("/definitely/not/here-12345")).is_none());
     }
 }
