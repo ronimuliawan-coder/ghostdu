@@ -169,7 +169,6 @@ fn handle_ghost_keys(app: &mut App, key: KeyEvent) -> EventResult {
             if app.ghost_tab_index == 0 && app.docker_info.is_available {
                 // Requires a live Docker daemon; excluded from line coverage.
                 #[cfg(not(tarpaulin_include))]
-                #[allow(unexpected_cfgs)]
                 app.prompt_docker_prune();
             }
         }

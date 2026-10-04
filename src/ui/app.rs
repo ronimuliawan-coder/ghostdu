@@ -2548,3 +2548,108 @@ mod selection_limit_tests {
         assert_eq!(app.current_dir_entry().size, 123);
     }
 }
+
+#[cfg(test)]
+mod prompt_branch_tests {
+    use super::*;
+    use crate::ghost::docker::DockerItemSummary;
+    use crate::ghost::DockerDiskInfo;
+    use std::sync::{atomic::AtomicBool, Arc};
+
+    fn app_with_files() -> (tempfile::TempDir, App) {
+        let dir = tempfile::tempdir().unwrap();
+        let sub = dir.path().join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        std::fs::write(dir.path().join("a.txt"), "aaaaaaaaaa").unwrap();
+        std::fs::write(sub.join("b.txt"), "b").unwrap();
+        let root = crate::fs::scanner::scan_directory(
+            dir.path(),
+            None,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .unwrap();
+        let app = App::new(root);
+        (dir, app)
+    }
+
+    fn docker_items() -> DockerDiskInfo {
+        DockerDiskInfo {
+            is_available: true,
+            items: vec![
+                DockerItemSummary {
+                    category: "Image",
+                    id_or_name: "i1".to_string(),
+                    size: 10,
+                    is_reclaimable: true,
+                    details: "d".to_string(),
+                },
+                DockerItemSummary {
+                    category: "Image",
+                    id_or_name: "i2".to_string(),
+                    size: 20,
+                    is_reclaimable: false,
+                    details: "d".to_string(),
+                },
+            ],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn misc_branches() {
+        assert_eq!(GhostFilterMode::GhostOnly.label(), "Ghost Files ONLY");
+        let (_dir, mut app) = app_with_files();
+        // Mutable descent below the root.
+        app.navigate_to_path(&app.root_entry.children[0].path.clone());
+        app.current_dir_entry_mut().size = 7;
+        assert_eq!(app.current_dir_entry().size, 7);
+        // Docker-tab cursor movement with fabricated rows.
+        app.docker_info = docker_items();
+        app.ghost_tab_index = 0;
+        app.active_view = ActiveView::GhostInspector;
+        app.cursor_down();
+        assert_eq!(app.ghost_cursor_index, 1);
+        app.cursor_down();
+        assert_eq!(app.ghost_cursor_index, 1);
+        app.cursor_up();
+        app.page_down(5);
+        app.page_up(5);
+        app.cursor_to_start();
+        app.cursor_to_end();
+        // Scan root without a parent has nowhere to ascend.
+        app.root_entry.path = PathBuf::from("/");
+        app.path_stack.clear();
+        assert!(app.go_up().is_none());
+    }
+
+    #[test]
+    fn prompt_target_sources_and_safety_flags() {
+        let (_dir, mut app) = app_with_files();
+        // Selected set feeds the prompt.
+        app.toggle_selection();
+        assert!(!app.selected_paths.is_empty());
+        app.prompt_move_to_trash();
+        assert_eq!(app.active_view, ActiveView::ConfirmModal);
+        app.cancel_modal();
+        app.prompt_permanent_delete();
+        assert_eq!(app.active_view, ActiveView::ConfirmModal);
+        app.cancel_modal();
+        app.selected_paths.clear();
+        app.selected_identities.clear();
+        // Empty view prompts report instead of opening.
+        app.safe_only_filter = true;
+        app.prompt_move_to_trash();
+        assert_ne!(app.active_view, ActiveView::ConfirmModal);
+        app.prompt_permanent_delete();
+        assert_ne!(app.active_view, ActiveView::ConfirmModal);
+        app.safe_only_filter = false;
+        // Safety flags route through the shared gate (pure path logic).
+        let (system, _) =
+            App::action_safety_flags(&[PathBuf::from("/etc/hostname")]);
+        assert!(system);
+        let (_, recheck) =
+            App::action_safety_flags(&[PathBuf::from("/proj/node_modules/pkg")]);
+        assert!(recheck);
+        app.cancel_modal();
+    }
+}
