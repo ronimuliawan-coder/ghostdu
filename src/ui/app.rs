@@ -566,6 +566,9 @@ impl App {
             rlim_max: 0,
         };
         // getrlimit writes a valid rlimit to this live, writable object.
+        // Excluded from line coverage: the syscall cannot fail in-process.
+        #[cfg(not(tarpaulin_include))]
+        #[allow(unexpected_cfgs)]
         if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } != 0 {
             return Err(std::io::Error::last_os_error());
         }
@@ -1364,6 +1367,23 @@ impl App {
         self.active_view = ActiveView::ConfirmModal;
     }
 
+    /// Execute a confirmed Docker prune. Excluded from line coverage: every
+    /// outcome needs a live daemon, and success would mutate real state.
+    #[cfg(not(tarpaulin_include))]
+    #[allow(unexpected_cfgs)]
+    fn execute_docker_prune(&mut self) {
+        match prune_docker_dangling() {
+            Ok(msg) => {
+                self.refresh_ghost_info();
+                self.set_status(format!("✔ Docker Prune: {}", msg));
+            }
+            Err(err) => {
+                self.refresh_ghost_info();
+                self.set_status(format!("❌ Docker Prune failed: {}", err));
+            }
+        }
+    }
+
     /// Open the process-termination confirmation for a ghost-table PID. The row,
     /// confirmation, and signal bind to one process instance: the row's recorded
     /// identity must still match the live holder, which must still hold a ghost
@@ -1565,17 +1585,7 @@ impl App {
                     ));
                 }
             }
-            ConfirmAction::DockerPrune => match prune_docker_dangling() {
-                Ok(msg) => {
-                    self.refresh_ghost_info();
-                    self.set_status(format!("✔ Docker Prune: {}", msg));
-                }
-                Err(err) => {
-                    // Some categories may have succeeded before another request failed.
-                    self.refresh_ghost_info();
-                    self.set_status(format!("❌ Docker Prune failed: {}", err));
-                }
-            },
+            ConfirmAction::DockerPrune => self.execute_docker_prune(),
             // Termination uses the 1/2 number keys, never y. Reaching here
             // means an unexpected confirm path; cancel without signaling.
             ConfirmAction::KillProcess { .. } => {
@@ -2799,5 +2809,213 @@ mod janitor_edge_tests {
         app.top_file_action(false);
         assert_eq!(app.active_view, ActiveView::ConfirmModal);
         app.cancel_modal();
+    }
+}
+
+#[cfg(test)]
+mod execution_tests {
+    use super::*;
+    use std::sync::{atomic::AtomicBool, Arc};
+
+    fn scanned(dir: &std::path::Path) -> FileEntry {
+        crate::fs::scanner::scan_directory(dir, None, Arc::new(AtomicBool::new(false))).unwrap()
+    }
+
+    #[test]
+    fn execute_trash_and_delete_in_tempdir() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("trash-me.txt"), "x").unwrap();
+        std::fs::write(dir.path().join("delete-me.txt"), "x").unwrap();
+        // Scope trash into the fixture so nothing touches the real wastebin.
+        let saved_xdg = std::env::var_os("XDG_DATA_HOME");
+        unsafe { std::env::set_var("XDG_DATA_HOME", dir.path().join("xdg")) };
+        let mut app = App::new(scanned(dir.path()));
+        // Trash flow succeeds end to end.
+        app.cursor_index = app
+            .visible_children()
+            .iter()
+            .position(|e| e.name == "trash-me.txt")
+            .unwrap();
+        app.toggle_selection();
+        app.prompt_move_to_trash();
+        app.execute_pending_action();
+        assert!(app
+            .current_status()
+            .unwrap_or("")
+            .contains("Wastebin"));
+        assert!(!dir.path().join("trash-me.txt").exists());
+        // Permanent delete flow succeeds end to end.
+        app.cursor_index = app
+            .visible_children()
+            .iter()
+            .position(|e| e.name == "delete-me.txt")
+            .unwrap();
+        app.toggle_selection();
+        app.prompt_permanent_delete();
+        app.execute_pending_action();
+        assert!(!dir.path().join("delete-me.txt").exists());
+        // Empty confirmation restores the view without acting.
+        app.execute_pending_action();
+        if let Some(saved) = saved_xdg {
+            unsafe { std::env::set_var("XDG_DATA_HOME", saved) };
+        } else {
+            unsafe { std::env::remove_var("XDG_DATA_HOME") };
+        }
+    }
+
+    #[test]
+    fn docker_prune_prompt_opens_without_daemon() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = App::new(scanned(dir.path()));
+        app.prompt_docker_prune();
+        assert_eq!(app.active_view, ActiveView::ConfirmModal);
+        assert!(matches!(
+            app.pending_action,
+            Some(ConfirmAction::DockerPrune)
+        ));
+        app.cancel_modal();
+    }
+
+    #[test]
+    fn kill_sigkill_path_and_ghost_cursor_moves() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = App::new(scanned(dir.path()));
+        // Ghost cursor movement across fabricated rows.
+        app.docker_info = DockerDiskInfo {
+            is_available: true,
+            ..Default::default()
+        };
+        app.active_view = ActiveView::GhostInspector;
+        app.cursor_down();
+        app.cursor_up();
+        app.page_down(5);
+        app.page_up(5);
+        app.cursor_to_start();
+        app.cursor_to_end();
+        // SIGKILL branch on a pinned child.
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("sleep must exist");
+        let pid = child.id();
+        let start = crate::ghost::proc_start_time(pid).expect("child alive");
+        let pidfd = rustix::process::Pid::from_raw(pid as i32)
+            .and_then(|t| {
+                rustix::process::pidfd_open(t, rustix::process::PidfdFlags::empty()).ok()
+            })
+            .expect("pidfd on this kernel");
+        app.pending_action = Some(ConfirmAction::KillProcess {
+            pid,
+            name: "sleep".to_string(),
+            start_time: start,
+            pidfd: Some(pidfd),
+        });
+        app.active_view = ActiveView::ConfirmModal;
+        app.execute_kill(false);
+        let exited = child.wait().expect("child reaped");
+        assert!(!exited.success());
+    }
+}
+
+#[cfg(test)]
+mod refresh_lookup_tests {
+    use super::*;
+    use std::sync::{atomic::AtomicBool, Arc};
+
+    fn scanned(dir: &std::path::Path) -> FileEntry {
+        crate::fs::scanner::scan_directory(dir, None, Arc::new(AtomicBool::new(false))).unwrap()
+    }
+
+    #[test]
+    fn refresh_all_covers_root_subtree_and_modal() {
+        let dir = tempfile::tempdir().unwrap();
+        let sub = dir.path().join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        std::fs::write(sub.join("b.txt"), "b").unwrap();
+        let mut app = App::new(scanned(dir.path()));
+        // Root refresh rescans everything.
+        app.refresh_all();
+        // Subtree refresh with a depth budget.
+        app.scan_options.max_depth = Some(2);
+        app.navigate_to_path(&sub);
+        app.refresh_all();
+        // Item-info modal gets fresh details on refresh.
+        app.open_item_info();
+        assert_eq!(app.active_view, ActiveView::ItemInfoModal);
+        app.refresh_all();
+        // Cursor clamp at the end of a shrunken list.
+        app.active_view = ActiveView::Filesystem;
+        app.cursor_index = 9999;
+        app.refresh_all();
+        assert!(app.cursor_index < 9999);
+    }
+
+    #[test]
+    fn find_entry_resolves_all_shapes() {
+        let dir = tempfile::tempdir().unwrap();
+        let sub = dir.path().join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        std::fs::write(sub.join("b.txt"), "b").unwrap();
+        let app = App::new(scanned(dir.path()));
+        assert!(app.find_entry(Path::new("/definitely/not/here")).is_none());
+        assert!(app.find_entry(&app.root_entry.path).is_some());
+        assert!(app.find_entry(&sub.join("b.txt")).is_some());
+        assert!(app.find_entry(&sub.join("missing.txt")).is_none());
+    }
+
+    #[test]
+    fn refresh_path_covers_root_failure_and_subtree() {
+        let dir = tempfile::tempdir().unwrap();
+        let sub = dir.path().join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        std::fs::write(sub.join("b.txt"), "b").unwrap();
+        let mut app = App::new(scanned(dir.path()));
+        assert!(app.refresh_path(&sub));
+        assert!(app.refresh_path(&app.root_entry.path.clone()));
+        assert!(!app.refresh_path(Path::new("/definitely/not/here-12345")));
+    }
+
+    #[test]
+    fn failed_delete_with_broken_rescan_marks_stale() {
+        let dir = tempfile::tempdir().unwrap();
+        let sub = dir.path().join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        std::fs::write(sub.join("victim.txt"), "x").unwrap();
+        let mut app = App::new(scanned(dir.path()));
+        // Fail the delete (no captured identity), then break rescans by
+        // locking the whole tree: rescan reports the stale tree.
+        let target = sub.join("victim.txt");
+        app.action_targets = vec![target.clone()];
+        app.action_identities = TargetIdentities::new();
+        app.pending_action = Some(ConfirmAction::PermanentDelete);
+        app.previous_view = ActiveView::Filesystem;
+        app.active_view = ActiveView::ConfirmModal;
+        // Make the rescan fail with a non-NotFound error: lock the root.
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(dir.path()).unwrap().permissions();
+        perms.set_mode(0o000);
+        std::fs::set_permissions(dir.path(), perms).unwrap();
+        app.execute_pending_action();
+        assert!(app.root_entry.has_err);
+        let mut perms = std::fs::metadata(dir.path()).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(dir.path(), perms).unwrap();
+    }
+
+    #[test]
+    fn kill_confirm_cancels_without_signalling() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = App::new(scanned(dir.path()));
+        // y on a kill confirmation is a no-op by design (1/2 answer).
+        app.pending_action = Some(ConfirmAction::KillProcess {
+            pid: 424242,
+            name: "x".to_string(),
+            start_time: 0,
+            pidfd: None,
+        });
+        app.previous_view = ActiveView::Filesystem;
+        app.active_view = ActiveView::ConfirmModal;
+        app.execute_pending_action();
+        assert_eq!(app.active_view, ActiveView::Filesystem);
     }
 }
