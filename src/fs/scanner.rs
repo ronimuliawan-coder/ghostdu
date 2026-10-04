@@ -170,8 +170,7 @@ fn scan_dir_recursive(
             // cannot be triggered deterministically in-process. Excluded from
             // line coverage; the sibling metadata race is stress-tested.
             #[cfg(not(tarpaulin_include))]
-            #[allow(unexpected_cfgs)]
-            Err(_) => {
+                    Err(_) => {
                 parent_entry.has_err = true;
                 continue;
             }

@@ -372,7 +372,6 @@ struct DockerPruneResponse {
 /// Live-daemon prune entry point. Excluded from line coverage: exercising it
 /// would prune a real daemon; the request core is covered via stub tests.
 #[cfg(not(tarpaulin_include))]
-#[allow(unexpected_cfgs)]
 pub fn prune_docker_dangling() -> Result<String, String> {
     // Reporting and mutation must use the same socket, regardless of CLI context/DOCKER_HOST.
     // Prune operations can take significantly longer than basic inspection, so grant them an extended read timeout.

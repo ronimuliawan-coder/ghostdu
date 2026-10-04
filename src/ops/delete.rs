@@ -75,7 +75,6 @@ pub(super) fn prepare_target(path: &Path) -> io::Result<(File, CString, File)> {
     // excluded from line coverage; the ancestor-redirection test covers the
     // companion threat.
     #[cfg(not(tarpaulin_include))]
-    #[allow(unexpected_cfgs)]
     if pinned_path != canonical_parent {
         return Err(io::Error::other(
             "Target parent changed during verification",

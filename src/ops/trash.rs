@@ -68,7 +68,6 @@ fn trash_with_destination<P: AsRef<Path>>(
                 // Excluded from line coverage: statx mount IDs exist on all
                 // supported kernels, so this fallback never runs in tests.
                 #[cfg(not(tarpaulin_include))]
-                #[allow(unexpected_cfgs)]
                 {
                     let (trash, topdir) = resolve(&parent)?;
                     uncached = TrashDestination::open(&parent, trash, topdir)?;
@@ -152,16 +151,14 @@ impl MountTopology {
             // /proc/self/mountinfo is always readable on Linux; excluded from
             // line coverage as an environment-dependent defensive arm.
             #[cfg(not(tarpaulin_include))]
-            #[allow(unexpected_cfgs)]
-            Err(e) => return Err(io::Error::new(e.kind(), e.to_string())),
+                    Err(e) => return Err(io::Error::new(e.kind(), e.to_string())),
         };
         let path = fd_path(target)?;
         if root.has_mount_at_or_under(&path) {
             // Requires a real mount inside the target (needs namespaces to
             // fake); excluded from line coverage as environment-dependent.
             #[cfg(not(tarpaulin_include))]
-            #[allow(unexpected_cfgs)]
-            return Err(io::Error::from_raw_os_error(libc::EXDEV));
+                    return Err(io::Error::from_raw_os_error(libc::EXDEV));
         }
         Ok(())
     }
@@ -295,8 +292,7 @@ fn same_mount(left: &File, right: &File) -> io::Result<bool> {
         // Older kernels lack mount IDs; a cross-mount rename will still fail safely.
         // Excluded from line coverage: all supported kernels report mount IDs.
         #[cfg(not(tarpaulin_include))]
-        #[allow(unexpected_cfgs)]
-        {
+            {
             Ok(left.metadata()?.dev() == right.metadata()?.dev())
         }
     }
@@ -454,8 +450,7 @@ fn move_prepared_with_hook(
             // Name collision with a concurrent trash run; excluded from line
             // coverage as timing-dependent (sequence is process-global).
             #[cfg(not(tarpaulin_include))]
-            #[allow(unexpected_cfgs)]
-            Err(rustix::io::Errno::EXIST) => continue,
+                    Err(rustix::io::Errno::EXIST) => continue,
             Err(error) => return Err(error.into()),
         };
         hook(MovePhase::Reserved, info, &info_name);
