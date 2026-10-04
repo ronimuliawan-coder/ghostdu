@@ -390,3 +390,141 @@ pub fn truncate_start_by_width(s: &str, max_width: usize) -> String {
     }
     format!("{}{}", marker, &s[start..])
 }
+
+#[cfg(test)]
+mod coverage_tests {
+    use super::*;
+
+    #[test]
+    fn every_kind_reports_labels() {
+        let kinds = [
+            GhostKind::None,
+            GhostKind::DockerOverlay,
+            GhostKind::DockerVolume,
+            GhostKind::DockerContainer,
+            GhostKind::DockerBuildkit,
+            GhostKind::DockerUser,
+            GhostKind::PodmanUser,
+            GhostKind::BuildCache,
+            GhostKind::PackageCache,
+            GhostKind::DeletedOpen,
+            GhostKind::Trash,
+            GhostKind::LogFiles,
+            GhostKind::Flatpak,
+            GhostKind::SnapPackage,
+            GhostKind::DependencyTree,
+            GhostKind::GamingCompat,
+            GhostKind::AiModel,
+            GhostKind::VmOrIso,
+            GhostKind::BrowserCache,
+            GhostKind::CoreDump,
+            GhostKind::SystemSnapshot,
+        ];
+        for kind in kinds {
+            let _ = kind.label();
+            let _ = kind.badge();
+            let _ = kind.is_ghost();
+            let _ = kind.is_docker();
+        }
+        assert!(!GhostKind::None.is_ghost());
+        assert!(GhostKind::DockerOverlay.is_docker());
+        assert!(!GhostKind::Trash.is_docker());
+    }
+
+    #[test]
+    fn every_safety_tier_reports() {
+        let tiers = [
+            DeleteSafety::Safe,
+            DeleteSafety::Recheck,
+            DeleteSafety::UserData,
+            DeleteSafety::System,
+        ];
+        for tier in tiers {
+            assert!(!tier.glyph().is_empty());
+            assert!(!tier.label().is_empty());
+            assert!(!tier.badge().is_empty());
+            assert!(!tier.description().is_empty());
+        }
+        assert!(DeleteSafety::Safe.is_safe());
+        assert!(!DeleteSafety::UserData.is_safe());
+        assert!(DeleteSafety::System.is_system());
+        assert!(!DeleteSafety::Safe.is_system());
+        assert_eq!(DeleteSafety::default(), DeleteSafety::UserData);
+    }
+
+    #[test]
+    fn sizes_counts_and_constructors() {
+        assert_eq!(format_size(0), "0 B");
+        assert_eq!(format_size(512), "512 B");
+        assert_eq!(format_size(2048), "2.0 KiB");
+        assert_eq!(format_size(3 * 1024 * 1024), "3.0 MiB");
+        assert_eq!(format_size(2 * 1024 * 1024 * 1024), "2.00 GiB");
+        assert_eq!(format_size(5 * 1024 * 1024 * 1024 * 1024), "5.00 TiB");
+        assert_eq!(format_count_short(999), "999");
+        assert_eq!(format_count_short(1500), "1.5k");
+        assert_eq!(format_count_short(2_500_000), "2.5M");
+        assert_eq!(format_count_short(3_000_000_000), "3.0B");
+        assert_eq!(format_count(1), "1 item");
+        assert_eq!(format_count(5), "5 items");
+
+        let file = FileEntry::new_file(
+            "f".to_string(),
+            PathBuf::from("/f"),
+            10,
+            4096,
+            false,
+            1,
+            2,
+            GhostKind::BuildCache,
+            DeleteSafety::Safe,
+        );
+        assert_eq!(file.display_size(true), 10);
+        assert_eq!(file.display_size(false), 4096);
+        assert_eq!(file.safe_reclaimable_bytes(), 4096);
+        assert_eq!(file.safe_items_count(), 1);
+
+        let user = FileEntry::new_file(
+            "u".to_string(),
+            PathBuf::from("/u"),
+            10,
+            4096,
+            false,
+            1,
+            3,
+            GhostKind::None,
+            DeleteSafety::UserData,
+        );
+        assert_eq!(user.safe_reclaimable_bytes(), 0);
+        assert_eq!(user.safe_items_count(), 0);
+
+        let dir = FileEntry::new_dir(
+            "d".to_string(),
+            PathBuf::from("/d"),
+            1,
+            4,
+            GhostKind::None,
+            DeleteSafety::Safe,
+        );
+        assert!(dir.is_dir && !dir.is_symlink);
+        assert_eq!(dir.safe_reclaimable_bytes(), 0);
+        assert_eq!(dir.safe_items_count(), 1);
+    }
+
+    #[test]
+    fn truncation_edges() {
+        assert_eq!(truncate_end_by_width("", 5), "");
+        assert_eq!(truncate_end_by_width("abc", 5), "abc");
+        assert_eq!(truncate_end_by_width("abcdef", 4), "a...");
+        assert_eq!(truncate_end_by_width("abcdef", 3), "abc");
+        assert_eq!(truncate_end_by_width("abcdef", 0), "");
+        assert_eq!(truncate_start_by_width("", 5), "");
+        assert_eq!(truncate_start_by_width("abc", 5), "abc");
+        assert_eq!(truncate_start_by_width("abcdef", 4), "...f");
+        assert_eq!(truncate_start_by_width("abcdef", 3), "def");
+        // Grapheme clusters never split (markers only apply past width 3).
+        assert_eq!(truncate_end_by_width("xe\u{301}yz", 2), "xe\u{301}");
+        assert_eq!(truncate_end_by_width("xye\u{301}zzz", 5), "xy...");
+        assert_eq!(truncate_start_by_width("xye\u{301}", 2), "ye\u{301}");
+        assert_eq!(truncate_start_by_width("zzzzye\u{301}", 5), "...ye\u{301}");
+    }
+}
