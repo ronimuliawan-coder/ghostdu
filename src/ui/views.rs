@@ -2773,6 +2773,7 @@ mod render_sweep_tests {
         let cache = dir.path().join(".cache").join("thumbnails");
         std::fs::create_dir_all(&cache).unwrap();
         std::fs::write(cache.join("thumb.png"), vec![0u8; 1000]).unwrap();
+        std::os::unix::fs::symlink("a.txt", dir.path().join("link.txt")).unwrap();
         let root = scan_directory(dir.path(), None, Arc::new(AtomicBool::new(false))).unwrap();
         Fixture {
             app: App::new(root),
@@ -2811,11 +2812,18 @@ mod render_sweep_tests {
                     details: "dangling".to_string(),
                 },
                 DockerItemSummary {
-                    category: "Volume",
-                    id_or_name: "vol1".to_string(),
-                    size: 20,
+                    category: "BuildCache",
+                    id_or_name: "bc1".to_string(),
+                    size: 40,
+                    is_reclaimable: true,
+                    details: "layer".to_string(),
+                },
+                DockerItemSummary {
+                    category: "Container",
+                    id_or_name: "c1".to_string(),
+                    size: 30,
                     is_reclaimable: false,
-                    details: "in use".to_string(),
+                    details: "running".to_string(),
                 },
             ],
         }
@@ -2978,6 +2986,14 @@ mod render_sweep_tests {
         app.active_view = ActiveView::GhostInspector;
         // Unavailable daemon branch (typical in CI).
         let _ = render(app, 100, 30);
+        // Unavailable daemon without an error message takes the fallback.
+        app.docker_info = DockerDiskInfo {
+            is_available: false,
+            error_message: None,
+            ..Default::default()
+        };
+        app.ghost_tab_index = 0;
+        let _ = render(app, 100, 30);
         // Available daemon with items.
         app.docker_info = available_docker();
         app.ghost_cursor_index = 1;
@@ -2986,6 +3002,7 @@ mod render_sweep_tests {
         // Deleted-open tab: empty, then fabricated rows.
         app.ghost_tab_index = 1;
         app.ghost_cursor_index = 0;
+        app.deleted_open_files = Vec::new();
         let _ = render(app, 100, 30);
         app.deleted_open_files = vec![DeletedOpenFile {
             pid: 1234,
@@ -3020,13 +3037,19 @@ mod render_sweep_tests {
         let app = &mut fx.app;
         app.open_janitor();
         let _ = render(app, 100, 30);
-        // Collapse the first category and move the cursor.
-        if let Some(cat) = app.janitor_cats.first_mut() {
-            cat.expanded = false;
-        }
+        // Collapse a non-empty category and move the cursor.
+        let target = app
+            .janitor_cats
+            .iter()
+            .position(|cat| !cat.items.is_empty())
+            .unwrap_or(0);
+        app.janitor_cats[target].expanded = false;
         app.janitor_cursor = 2;
         let _ = render(app, 100, 30);
         let _ = render(app, 40, 20);
+        // Current-folder scope exercises the scope label.
+        app.janitor_scope = crate::ui::app::JanitorScope::Current;
+        let _ = render(app, 100, 30);
     }
 
     #[test]
@@ -3044,7 +3067,8 @@ mod render_sweep_tests {
         app.prompt_permanent_delete();
         let _ = render(app, 100, 30);
         app.cancel_modal();
-        // Multi-target list with scroll offset in both directions.
+        // Multi-target list with scroll offset in both directions, from the
+        // Janitor view so the scope label renders too.
         app.action_targets = vec![
             std::path::PathBuf::from("/a/0"),
             std::path::PathBuf::from("/a/1"),
@@ -3057,9 +3081,12 @@ mod render_sweep_tests {
         ];
         app.action_total_size = 8;
         app.pending_action = Some(ConfirmAction::MoveToTrash);
-        app.previous_view = ActiveView::Filesystem;
+        app.previous_view = ActiveView::Janitor;
         app.active_view = ActiveView::ConfirmModal;
         let _ = render(app, 100, 30);
+        app.janitor_scope = crate::ui::app::JanitorScope::Current;
+        let _ = render(app, 100, 30);
+        app.janitor_scope = crate::ui::app::JanitorScope::Global;
         app.confirm_list_offset = 2;
         let out = render(app, 100, 30);
         assert!(out.contains("more"));
@@ -3117,6 +3144,22 @@ mod render_sweep_tests {
         assert_eq!(app.active_view, ActiveView::ItemInfoModal);
         let _ = render(app, 100, 30);
         let _ = render(app, 40, 20);
+        // Compact modal layout on short terminals.
+        let _ = render(app, 60, 12);
         app.cancel_modal();
+        // Every safety tier and entry shape gets an info modal.
+        for name in ["sub", "link.txt", "hosts"] {
+            if let Some(index) = app
+                .visible_children()
+                .iter()
+                .position(|e| e.name == name)
+            {
+                app.cursor_index = index;
+                app.open_item_info();
+                assert_eq!(app.active_view, ActiveView::ItemInfoModal);
+                let _ = render(app, 100, 30);
+                app.cancel_modal();
+            }
+        }
     }
 }
