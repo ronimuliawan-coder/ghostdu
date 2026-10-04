@@ -107,9 +107,16 @@ enum SortArg {
     Items,
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    use clap::CommandFactory;
+fn main() {
     let cli = Cli::parse();
+    if let Err(error) = run(cli) {
+        eprintln!("ghostdu error: {error}");
+        std::process::exit(1);
+    }
+}
+
+fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
+    use clap::CommandFactory;
 
     if let Some(shell) = cli.print_completions {
         let mut command = Cli::command();
@@ -126,8 +133,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let target_path = cli.path.clone();
 
     if !target_path.exists() {
-        eprintln!("Error: Path {:?} does not exist", target_path);
-        std::process::exit(1);
+        return Err(format!("Path {target_path:?} does not exist").into());
     }
 
     let scan_options = ScannerOptions {
@@ -170,12 +176,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     terminal.show_cursor()?;
 
-    if let Err(err) = app_result {
-        eprintln!("ghostdu error: {}", err);
-        std::process::exit(1);
-    }
-
-    Ok(())
+    app_result
 }
 
 fn run_app<B: ratatui::backend::Backend>(
@@ -317,25 +318,7 @@ fn run_app<B: ratatui::backend::Backend>(
         // Step 2: Main interactive loop
         let mut app = App::new(root_entry);
         app.scan_options = scan_options.clone();
-        if cli.safe_only {
-            app.safe_only_filter = true;
-        }
-        if cli.ghost_only {
-            app.ghost_filter = GhostFilterMode::GhostOnly;
-        } else if cli.hide_ghost {
-            app.ghost_filter = GhostFilterMode::HideGhost;
-        }
-        if cli.apparent_size {
-            app.apparent_size = true;
-        }
-        if let Some(sort) = cli.sort {
-            app.sort_mode = match sort {
-                SortArg::Size => SortMode::BySizeDesc,
-                SortArg::SizeAsc => SortMode::BySizeAsc,
-                SortArg::Name => SortMode::ByName,
-                SortArg::Items => SortMode::ByItems,
-            };
-        }
+        apply_cli_display(&mut app, cli);
         if let Some(ref saved) = saved_current_path.take() {
             app.navigate_to_path(saved);
             app.set_status("⚡ Rescanned entire tree from root");
@@ -399,6 +382,29 @@ fn run_subshell<B: ratatui::backend::Backend>(
         return Err(format!("Cannot start shell: {error}").into());
     }
     Ok(())
+}
+
+/// Apply CLI display presets to a fresh App. Split out for unit testing.
+fn apply_cli_display(app: &mut App, cli: &Cli) {
+    if cli.safe_only {
+        app.safe_only_filter = true;
+    }
+    if cli.ghost_only {
+        app.ghost_filter = GhostFilterMode::GhostOnly;
+    } else if cli.hide_ghost {
+        app.ghost_filter = GhostFilterMode::HideGhost;
+    }
+    if cli.apparent_size {
+        app.apparent_size = true;
+    }
+    if let Some(sort) = cli.sort {
+        app.sort_mode = match sort {
+            SortArg::Size => SortMode::BySizeDesc,
+            SortArg::SizeAsc => SortMode::BySizeAsc,
+            SortArg::Name => SortMode::ByName,
+            SortArg::Items => SortMode::ByItems,
+        };
+    }
 }
 
 fn centered_rect(width: u16, height: u16, r: Rect) -> Rect {
@@ -611,4 +617,318 @@ fn run_headless_summary(
 
     println!("════════════════════════════════════════════════════════════════════════════════");
     Ok(())
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::*;
+    use clap::Parser;
+
+    fn parse(args: &[&str]) -> Cli {
+        Cli::try_parse_from(args).expect("valid CLI args")
+    }
+
+    #[test]
+    fn cli_defaults_and_full_matrix() {
+        let cli = parse(&["ghostdu"]);
+        assert_eq!(cli.path, PathBuf::from("."));
+        assert!(!cli.summary && !cli.cross_mounts && !cli.safe_only);
+        assert!(!cli.ghost_only && !cli.hide_ghost && !cli.apparent_size);
+        assert!(cli.sort.is_none() && cli.export.is_none());
+        assert!(cli.exclude.is_empty() && cli.depth.is_none());
+
+        let cli = parse(&["ghostdu", "/tmp", "-s", "--cm", "--safe-only"]);
+        assert_eq!(cli.path, PathBuf::from("/tmp"));
+        assert!(cli.summary && cli.cross_mounts && cli.safe_only);
+
+        let cli = parse(&[
+            "ghostdu",
+            "--exclude",
+            "a",
+            "--exclude",
+            "b",
+            "--depth",
+            "3",
+        ]);
+        assert_eq!(cli.exclude, vec!["a".to_string(), "b".to_string()]);
+        assert_eq!(cli.depth, Some(3));
+
+        let cli = parse(&[
+            "ghostdu",
+            "--ghost-only",
+            "--apparent-size",
+            "--sort",
+            "name",
+        ]);
+        assert!(cli.ghost_only && cli.apparent_size);
+        assert!(matches!(cli.sort, Some(SortArg::Name)));
+
+        let cli = parse(&["ghostdu", "--hide-ghost", "--sort", "size-asc"]);
+        assert!(cli.hide_ghost);
+        assert!(matches!(cli.sort, Some(SortArg::SizeAsc)));
+
+        let cli = parse(&["ghostdu", "--sort", "size"]);
+        assert!(matches!(cli.sort, Some(SortArg::Size)));
+        let cli = parse(&["ghostdu", "--sort", "items"]);
+        assert!(matches!(cli.sort, Some(SortArg::Items)));
+        let cli = parse(&["ghostdu", "--export", "/tmp/x.json"]);
+        assert_eq!(cli.export, Some(PathBuf::from("/tmp/x.json")));
+        let cli = parse(&["ghostdu", "--print-completions", "bash"]);
+        assert!(matches!(
+            cli.print_completions,
+            Some(clap_complete::Shell::Bash)
+        ));
+        let cli = parse(&["ghostdu", "--print-manpage"]);
+        assert!(cli.print_manpage);
+
+        assert!(Cli::try_parse_from(["ghostdu", "--ghost-only", "--hide-ghost"]).is_err());
+        assert!(Cli::try_parse_from(["ghostdu", "--sort", "bogus"]).is_err());
+        assert!(Cli::try_parse_from(["ghostdu", "--print-completions", "bogus"]).is_err());
+    }
+
+    #[test]
+    fn run_rejects_missing_path() {
+        let cli = parse(&["ghostdu", "/definitely/not/here-12345"]);
+        assert!(run(cli).is_err());
+    }
+
+    #[test]
+    fn run_headless_summary_and_export() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("f.txt"), "x").unwrap();
+        let path = dir.path().to_string_lossy().into_owned();
+
+        let cli = parse(&["ghostdu", "--summary", &path]);
+        run(cli).expect("headless summary");
+
+        let out = dir.path().join("tree.json");
+        let out_str = out.to_string_lossy().into_owned();
+        let cli = parse(&["ghostdu", "--export", &out_str, &path]);
+        run(cli).expect("export");
+        assert!(out.exists());
+
+        let cli = parse(&[
+            "ghostdu",
+            "--export",
+            "/definitely/not/here-12345/tree.json",
+            &path,
+        ]);
+        assert!(run(cli).is_err());
+    }
+
+    #[test]
+    fn run_generators_exit_cleanly() {
+        assert!(run(parse(&["ghostdu", "--print-completions", "bash"])).is_ok());
+        assert!(run(parse(&["ghostdu", "--print-completions", "zsh"])).is_ok());
+        assert!(run(parse(&["ghostdu", "--print-completions", "fish"])).is_ok());
+        assert!(run(parse(&["ghostdu", "--print-manpage"])).is_ok());
+    }
+
+    #[test]
+    fn apply_cli_display_covers_every_branch() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = ghostdu::fs::scan_directory(dir.path(), None, stop_signal()).unwrap();
+        let mut app = App::new(root);
+        apply_cli_display(&mut app, &parse(&["ghostdu"]));
+        assert!(!app.safe_only_filter && !app.apparent_size);
+
+        let cli = parse(&[
+            "ghostdu",
+            "--safe-only",
+            "--ghost-only",
+            "--apparent-size",
+            "--sort",
+            "items",
+        ]);
+        apply_cli_display(&mut app, &cli);
+        assert!(app.safe_only_filter);
+        assert_eq!(app.ghost_filter, GhostFilterMode::GhostOnly);
+        assert!(app.apparent_size);
+        assert_eq!(app.sort_mode, SortMode::ByItems);
+
+        for (flag, sort) in [
+            ("--hide-ghost", SortArg::Size),
+            ("--hide-ghost", SortArg::SizeAsc),
+            ("--hide-ghost", SortArg::Name),
+        ] {
+            let flag = flag.to_string();
+            let cli = parse(&["ghostdu", &flag, "--sort", sort_name(sort)]);
+            apply_cli_display(&mut app, &cli);
+            assert_eq!(app.ghost_filter, GhostFilterMode::HideGhost);
+        }
+        assert_eq!(app.sort_mode, SortMode::ByName);
+    }
+
+    fn sort_name(sort: SortArg) -> &'static str {
+        match sort {
+            SortArg::Size => "size",
+            SortArg::SizeAsc => "size-asc",
+            SortArg::Name => "name",
+            SortArg::Items => "items",
+        }
+    }
+
+    fn stop_signal() -> Arc<AtomicBool> {
+        Arc::new(AtomicBool::new(false))
+    }
+
+    #[test]
+    fn centered_rect_clamps_to_small_terminals() {
+        let full = centered_rect(60, 10, Rect::new(0, 0, 100, 40));
+        assert_eq!((full.width, full.height), (60, 10));
+        let tiny = centered_rect(60, 10, Rect::new(0, 0, 20, 5));
+        assert!(tiny.width <= 20 && tiny.height <= 5);
+    }
+
+    #[test]
+    fn run_subshell_reports_without_tty() {
+        use ratatui::backend::TestBackend;
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        // No TTY in tests: exercises the early restore-and-report path.
+        let _ = run_subshell(&mut terminal, std::path::Path::new("/tmp"));
+    }
+}
+
+
+
+#[cfg(test)]
+mod pty_session_tests {
+    use super::*;
+    use ratatui::backend::TestBackend;
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::sync::{Arc, Mutex};
+
+    /// One pty-backed session shared by every phase of the test. crossterm
+    /// keeps a process-global event reader bound to the first pty it sees, so
+    /// a second session in the same test binary would hang: everything runs
+    /// through this single live pty instead. The master stays open until
+    /// teardown (dropped there), so the session never observes a premature
+    /// hangup; each send is a detached short write that cannot block.
+    struct PtySession {
+        master: Option<Arc<Mutex<std::fs::File>>>,
+        slave: std::fs::File,
+        saved_stdin: std::fs::File,
+    }
+
+    impl PtySession {
+        fn open() -> Self {
+            // Save real stdin; restored in teardown.
+            let saved = unsafe { libc::dup(0) };
+            assert!(saved >= 0);
+            // SAFETY: owned fd, closed in teardown.
+            let saved_stdin = unsafe { std::fs::File::from_raw_fd(saved) };
+
+            let master = unsafe { libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY) };
+            assert!(master >= 0);
+            assert_eq!(unsafe { libc::grantpt(master) }, 0);
+            assert_eq!(unsafe { libc::unlockpt(master) }, 0);
+            let slave_name = unsafe {
+                let ptr = libc::ptsname(master);
+                assert!(!ptr.is_null());
+                std::ffi::CStr::from_ptr(ptr).to_string_lossy().into_owned()
+            };
+            let slave = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .custom_flags(libc::O_NOCTTY)
+                .open(&slave_name)
+                .unwrap();
+            // SAFETY: owned by this struct until teardown.
+            let master = unsafe { std::fs::File::from_raw_fd(master) };
+
+            // Route stdin through the pty slave for the session.
+            assert_eq!(unsafe { libc::dup2(slave.as_raw_fd(), 0) }, 0, "stdin reroute");
+            enable_raw_mode().expect("raw mode on pty slave");
+            Self {
+                master: Some(Arc::new(Mutex::new(master))),
+                slave,
+                saved_stdin,
+            }
+        }
+
+        fn send_later(&self, bytes: &'static [u8], delay: std::time::Duration) {
+            let master = self.master.clone().expect("session torn down");
+            std::thread::spawn(move || {
+                std::thread::sleep(delay);
+                use std::io::Write;
+                if let Ok(mut master) = master.lock() {
+                    let _ = master.write_all(bytes);
+                    let _ = master.flush();
+                }
+            });
+        }
+
+        fn teardown(self) {
+            drop(self.master);
+            let _ = disable_raw_mode();
+            use std::os::unix::io::AsFd;
+            assert_eq!(
+                unsafe { libc::dup2(self.saved_stdin.as_fd().as_raw_fd(), 0) },
+                0,
+                "stdin restore"
+            );
+        }
+    }
+
+    fn test_cli(path: PathBuf) -> (Cli, ScannerOptions) {
+        (
+            Cli {
+                path,
+                summary: false,
+                cross_mounts: false,
+                exclude: Vec::new(),
+                depth: None,
+                safe_only: false,
+                ghost_only: false,
+                hide_ghost: false,
+                apparent_size: false,
+                sort: None,
+                export: None,
+                print_completions: None,
+                print_manpage: false,
+            },
+            ScannerOptions {
+                cross_mounts: false,
+                excludes: Vec::new(),
+                max_depth: None,
+            },
+        )
+    }
+
+    #[test]
+    fn interactive_session_cancels_rescans_and_quits() {
+        use std::time::Duration;
+        let session = PtySession::open();
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        // Phase 1: `q` lands mid-scan of a slow tree (50k files take seconds
+        // even locally, far longer under coverage) and cancels it cleanly.
+        let big = tempfile::tempdir().unwrap();
+        for d in 0..100 {
+            let sub = big.path().join(format!("d{d}"));
+            std::fs::create_dir(&sub).unwrap();
+            for i in 0..500 {
+                std::fs::write(sub.join(format!("f{i}.txt")), "x").unwrap();
+            }
+        }
+        let (cli, options) = test_cli(big.path().to_path_buf());
+        session.send_later(b"q", Duration::from_millis(50));
+        let result = run_app(&mut terminal, big.path().to_path_buf(), &cli, &options);
+        assert!(result.is_ok(), "cancelled scan exits Ok: {result:?}");
+
+        // Phase 2: full rescan, path rescan via Backspace at the root, quit.
+        let small = tempfile::tempdir().unwrap();
+        std::fs::write(small.path().join("f.txt"), "x").unwrap();
+        let (cli, options) = test_cli(small.path().to_path_buf());
+        session.send_later(b"R", Duration::from_secs(2));
+        session.send_later(b"\x7f", Duration::from_secs(4));
+        session.send_later(b"q", Duration::from_secs(6));
+        let result = run_app(&mut terminal, small.path().to_path_buf(), &cli, &options);
+        assert!(result.is_ok(), "session exits on q: {result:?}");
+
+        session.teardown();
+    }
 }
