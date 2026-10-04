@@ -2653,3 +2653,151 @@ mod prompt_branch_tests {
         app.cancel_modal();
     }
 }
+
+#[cfg(test)]
+mod janitor_edge_tests {
+    use super::*;
+    use std::sync::{atomic::AtomicBool, Arc};
+
+    fn scan(path: &Path) -> FileEntry {
+        crate::fs::scanner::scan_directory(path, None, Arc::new(AtomicBool::new(false))).unwrap()
+    }
+
+    #[test]
+    fn janitor_groups_cover_all_kinds() {
+        assert!(App::janitor_group(GhostKind::BrowserCache).is_some());
+        assert!(App::janitor_group(GhostKind::BuildCache).is_some());
+        assert!(App::janitor_group(GhostKind::PackageCache).is_some());
+        assert!(App::janitor_group(GhostKind::Trash).is_some());
+        assert!(App::janitor_group(GhostKind::LogFiles).is_some());
+        assert!(App::janitor_group(GhostKind::CoreDump).is_some());
+        assert!(App::janitor_group(GhostKind::None).is_none());
+        assert!(App::janitor_group(GhostKind::DependencyTree).is_none());
+        assert!(App::janitor_group(GhostKind::VmOrIso).is_none());
+    }
+
+    #[test]
+    fn janitor_row_lookup_and_scope() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = scan(dir.path());
+        let mut app = App::new(root);
+        // Empty categories: any cursor resolves to None.
+        assert!(app.janitor_row_at(9999).is_none());
+        // Scope toggle rebuilds and resets the cursor.
+        app.open_janitor();
+        app.toggle_janitor_scope();
+        assert_eq!(app.janitor_scope, JanitorScope::Current);
+        assert_eq!(app.janitor_cursor, 0);
+        app.toggle_janitor_scope();
+        assert_eq!(app.janitor_scope, JanitorScope::Global);
+    }
+
+    #[test]
+    fn janitor_header_toggle_and_trash_only_gate() {
+        let dir = tempfile::tempdir().unwrap();
+        let trash_files = dir.path().join(".local/share/Trash/files");
+        std::fs::create_dir_all(&trash_files).unwrap();
+        std::fs::write(trash_files.join("old.txt"), vec![0u8; 1000]).unwrap();
+        std::fs::write(dir.path().join("app.log"), vec![0u8; 1000]).unwrap();
+        let mut app = App::new(scan(dir.path()));
+        app.open_janitor();
+        // Header toggle flips its whole category both ways.
+        let trash_header = (0..app.janitor_row_count())
+            .find(|&cursor| {
+                matches!(app.janitor_row_at(cursor), Some((cat, None))
+                    if !app.janitor_cats[cat].items.is_empty())
+            })
+            .unwrap();
+        app.janitor_cursor = trash_header;
+        app.toggle_janitor_row();
+        assert!(app
+            .janitor_cats
+            .iter()
+            .flat_map(|cat| &cat.items)
+            .any(|item| item.selected));
+        app.toggle_janitor_row();
+        assert!(app
+            .janitor_cats
+            .iter()
+            .flat_map(|cat| &cat.items)
+            .all(|item| !item.selected));
+        // Permanent delete on a normal selection opens the confirm flow.
+        app.toggle_janitor_all();
+        app.janitor_action(false);
+        assert_eq!(app.active_view, ActiveView::ConfirmModal);
+        app.cancel_modal();
+        // Trash-category rows refuse the trash path with guidance.
+        for cat in &mut app.janitor_cats {
+            for item in &mut cat.items {
+                item.selected = item.trash_only_delete;
+            }
+        }
+        assert!(app
+            .janitor_cats
+            .iter()
+            .flat_map(|cat| &cat.items)
+            .any(|item| item.selected));
+        app.janitor_action(true);
+        assert_ne!(app.active_view, ActiveView::ConfirmModal);
+        assert!(app
+            .current_status()
+            .unwrap_or("")
+            .contains("permanently deleted"));
+    }
+
+    #[test]
+    fn oversized_batches_abort_before_capturing() {
+        // 300 loose logs in one directory exceed the 256-identity cap.
+        let dir = tempfile::tempdir().unwrap();
+        for i in 0..300 {
+            std::fs::write(dir.path().join(format!("rotated-{i}.log")), "x").unwrap();
+        }
+        let mut app = App::new(scan(dir.path()));
+        app.open_janitor();
+        app.toggle_janitor_all();
+        app.janitor_action(true);
+        assert_ne!(app.active_view, ActiveView::ConfirmModal);
+        assert!(app
+            .current_status()
+            .unwrap_or("")
+            .contains("smaller batch"));
+    }
+
+    #[test]
+    fn changed_targets_abort_batch_confirmation() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.log"), "x").unwrap();
+        std::fs::write(dir.path().join("b.log"), "x").unwrap();
+        let mut app = App::new(scan(dir.path()));
+        app.open_janitor();
+        app.toggle_janitor_all();
+        // Remove a target out from under the snapshot: fail closed.
+        std::fs::remove_file(dir.path().join("a.log")).unwrap();
+        app.janitor_action(true);
+        assert_ne!(app.active_view, ActiveView::ConfirmModal);
+        assert!(app
+            .current_status()
+            .unwrap_or("")
+            .contains("Target changed"));
+    }
+
+    #[test]
+    fn top_files_empty_and_apparent() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = App::new(scan(dir.path()));
+        app.open_top_files();
+        assert_ne!(app.active_view, ActiveView::TopFiles);
+        assert!(app
+            .current_status()
+            .unwrap_or("")
+            .contains("No files"));
+        // Apparent-size display path for direct actions.
+        std::fs::write(dir.path().join("f.txt"), vec![0u8; 100]).unwrap();
+        let mut app = App::new(scan(dir.path()));
+        app.apparent_size = true;
+        app.open_top_files();
+        app.top_file_action(false);
+        assert_eq!(app.active_view, ActiveView::ConfirmModal);
+        app.cancel_modal();
+    }
+}
