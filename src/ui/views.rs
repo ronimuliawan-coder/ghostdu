@@ -2830,6 +2830,78 @@ mod render_sweep_tests {
         fx.app.toggle_selection();
         fx.app.safe_only_filter = true;
         fx.app.search_query = "a".to_string();
+        // Synthetic rows of every ghost kind + error/symlink/dir shapes, so
+        // the badge match and name styles render deterministically.
+        {
+            use crate::fs::entry::{DeleteSafety, FileEntry, GhostKind};
+            use crate::ghost::classify_safety;
+            use std::path::PathBuf;
+            let kinds = [
+                GhostKind::None,
+                GhostKind::DockerOverlay,
+                GhostKind::DockerVolume,
+                GhostKind::DockerContainer,
+                GhostKind::DockerBuildkit,
+                GhostKind::DockerUser,
+                GhostKind::PodmanUser,
+                GhostKind::BuildCache,
+                GhostKind::PackageCache,
+                GhostKind::DeletedOpen,
+                GhostKind::Trash,
+                GhostKind::LogFiles,
+                GhostKind::Flatpak,
+                GhostKind::SnapPackage,
+                GhostKind::DependencyTree,
+                GhostKind::GamingCompat,
+                GhostKind::AiModel,
+                GhostKind::VmOrIso,
+                GhostKind::BrowserCache,
+                GhostKind::CoreDump,
+                GhostKind::SystemSnapshot,
+            ];
+            for (i, kind) in kinds.iter().enumerate() {
+                let path = PathBuf::from(format!("/synth/k{i}"));
+                let safety = classify_safety(&path, *kind);
+                let mut row = FileEntry::new_file(
+                    format!("k{i}"),
+                    path,
+                    100,
+                    4096,
+                    false,
+                    1,
+                    1000 + i as u64,
+                    *kind,
+                    safety,
+                );
+                if i == 0 {
+                    row.has_err = true;
+                }
+                fx.app.root_entry.children.push(row);
+            }
+            fx.app.root_entry.children.push(FileEntry::new_file(
+                "link".to_string(),
+                PathBuf::from("/synth/link"),
+                10,
+                10,
+                true,
+                1,
+                2000,
+                GhostKind::None,
+                DeleteSafety::UserData,
+            ));
+            // A System-safety row exercises the protected-name embedding.
+            fx.app.root_entry.children.push(FileEntry::new_file(
+                "hosts".to_string(),
+                PathBuf::from("/etc/hosts"),
+                10,
+                10,
+                false,
+                1,
+                2001,
+                GhostKind::None,
+                DeleteSafety::System,
+            ));
+        }
         for (width, height) in [
             (100, 30),
             (40, 20),
