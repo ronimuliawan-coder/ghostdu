@@ -2941,6 +2941,8 @@ mod render_sweep_tests {
             for (width, height) in [(100, 30), (40, 20), (100, 12)] {
                 let _ = render(&fx.app, width, height);
             }
+            // And again filtered, so filter spans appear at every size.
+            fx.app.safe_only_filter = true;
         }
         for (width, height) in [
             (100, 30),
@@ -2988,10 +2990,14 @@ mod render_sweep_tests {
         // Cursor deep past the list exercises scroll clamping.
         app.cursor_index = 10_000;
         let _ = render(app, 100, 30);
-        // Mid-list cursor with overflowing rows shows both-direction scroll.
+        // Explicit scroll offsets exercise every scroll indicator.
         app.cursor_index = 25;
+        app.scroll_offset.set(4);
+        let _ = render(app, 100, 30);
+        app.scroll_offset.set(20);
         let _ = render(app, 100, 30);
         app.cursor_index = 0;
+        app.scroll_offset.set(0);
         // Empty visible table shows the zero-items indicator.
         app.search_query = "zzz-no-match".to_string();
         let _ = render(app, 100, 30);
@@ -3164,6 +3170,8 @@ mod render_sweep_tests {
         // Missing fs info takes the fallback header branch.
         app.fs_info = None;
         let _ = render(app, 100, 30);
+        let _ = render(app, 60, 7);
+        let _ = render(app, 100, 12);
         // Docker prune + kill confirms, both footer widths.
         app.pending_action = Some(ConfirmAction::DockerPrune);
         app.action_total_size = 42;
