@@ -1,12 +1,44 @@
-use crate::ui::app::{ActiveView, App};
+use crate::ui::app::{ActiveView, App, ConfirmAction};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use std::path::PathBuf;
+
+/// Copy text via Wayland then X11 clipboard tools. Reports the first tool
+/// that accepts the input; errors only when none exists.
+fn copy_to_clipboard(text: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::process::Stdio;
+    let attempts = [
+        ("wl-copy", Vec::<&str>::new()),
+        ("xclip", vec!["-selection", "clipboard"]),
+        ("xsel", vec!["--clipboard", "--input"]),
+    ];
+    for (tool, args) in attempts {
+        if let Ok(mut child) = std::process::Command::new(tool)
+            .args(&args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+        {
+            if child
+                .stdin
+                .take()
+                .is_some_and(|mut stdin| stdin.write_all(text.as_bytes()).is_ok())
+                && child.wait().is_ok_and(|status| status.success())
+            {
+                return Ok(());
+            }
+        }
+    }
+    Err(std::io::Error::other("no clipboard tool available"))
+}
 
 pub enum EventResult {
     Continue,
     Exit,
     RescanRequested,
     RescanPath(PathBuf),
+    Subshell(PathBuf),
 }
 
 pub fn handle_key_event(app: &mut App, key: KeyEvent) -> EventResult {
@@ -20,11 +52,42 @@ pub fn handle_key_event(app: &mut App, key: KeyEvent) -> EventResult {
         ActiveView::HelpModal => handle_help_keys(app, key),
         ActiveView::ItemInfoModal => handle_item_info_keys(app, key),
         ActiveView::GhostInspector => handle_ghost_keys(app, key),
+        ActiveView::TopFiles => handle_top_files_keys(app, key),
+        ActiveView::Janitor => handle_janitor_keys(app, key),
         ActiveView::Filesystem => handle_filesystem_keys(app, key),
     }
 }
 
 fn handle_confirm_keys(app: &mut App, key: KeyEvent) -> EventResult {
+    // Scroll the frozen multi-target list without touching the confirmation.
+    if app.action_targets.len() > 1 {
+        match key.code {
+            KeyCode::Up => {
+                app.confirm_list_offset = app.confirm_list_offset.saturating_sub(1);
+                return EventResult::Continue;
+            }
+            KeyCode::Down => {
+                let max = app.action_targets.len().saturating_sub(1);
+                if app.confirm_list_offset < max {
+                    app.confirm_list_offset += 1;
+                }
+                return EventResult::Continue;
+            }
+            _ => {}
+        }
+    }
+    // Process termination answers 1/2 instead of y/n. Execution consumes the
+    // stored confirmation, so no fresh PID crosses this boundary.
+    let killing = matches!(&app.pending_action, Some(ConfirmAction::KillProcess { .. }));
+    if killing {
+        match key.code {
+            KeyCode::Char('1') => app.execute_kill(true),
+            KeyCode::Char('2') => app.execute_kill(false),
+            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => app.cancel_modal(),
+            _ => {}
+        }
+        return EventResult::Continue;
+    }
     match key.code {
         KeyCode::Char('y') | KeyCode::Char('Y') => {
             if app.action_safety_blocked {
@@ -107,6 +170,18 @@ fn handle_ghost_keys(app: &mut App, key: KeyEvent) -> EventResult {
                 app.prompt_docker_prune();
             }
         }
+        // Terminate the highlighted ghost-table process (table PIDs only).
+        KeyCode::Char('K') => {
+            if app.ghost_tab_index == 1 {
+                let target = app
+                    .deleted_open_files
+                    .get(app.ghost_cursor_index)
+                    .map(|entry| entry.pid);
+                if let Some(pid) = target {
+                    app.prompt_kill_process(pid);
+                }
+            }
+        }
         KeyCode::Char('r') | KeyCode::F(5) => {
             app.refresh_all();
         }
@@ -116,6 +191,77 @@ fn handle_ghost_keys(app: &mut App, key: KeyEvent) -> EventResult {
         KeyCode::Char('?') => {
             app.previous_view = app.active_view;
             app.active_view = ActiveView::HelpModal;
+        }
+        _ => {}
+    }
+    EventResult::Continue
+}
+
+fn handle_top_files_keys(app: &mut App, key: KeyEvent) -> EventResult {
+    match key.code {
+        KeyCode::Char('j') | KeyCode::Down => {
+            if !app.top_files.is_empty() {
+                app.top_cursor = (app.top_cursor + 1).min(app.top_files.len() - 1);
+            }
+        }
+        KeyCode::Char('k') | KeyCode::Up => {
+            app.top_cursor = app.top_cursor.saturating_sub(1);
+        }
+        KeyCode::Home => app.top_cursor = 0,
+        KeyCode::End => {
+            app.top_cursor = app.top_files.len().saturating_sub(1);
+        }
+        KeyCode::Enter => {
+            if !app.jump_to_top_file() {
+                app.set_status("Cannot jump: file no longer in tree");
+            }
+        }
+        KeyCode::Char('t') => app.top_file_action(true),
+        KeyCode::Char('d') | KeyCode::Char('D') => app.top_file_action(false),
+        KeyCode::Esc | KeyCode::Char('q') | KeyCode::Tab | KeyCode::Char('g') => {
+            app.active_view = ActiveView::Filesystem;
+        }
+        _ => {}
+    }
+    EventResult::Continue
+}
+
+fn handle_janitor_keys(app: &mut App, key: KeyEvent) -> EventResult {
+    match key.code {
+        KeyCode::Char('j') | KeyCode::Down => {
+            let rows = app.janitor_row_count();
+            if rows > 0 {
+                app.janitor_cursor = (app.janitor_cursor + 1).min(rows - 1);
+            }
+        }
+        KeyCode::Char('k') | KeyCode::Up => {
+            app.janitor_cursor = app.janitor_cursor.saturating_sub(1);
+        }
+        KeyCode::Home => app.janitor_cursor = 0,
+        KeyCode::End => {
+            app.janitor_cursor = app.janitor_row_count().saturating_sub(1);
+        }
+        KeyCode::Right => {
+            if let Some((cat_idx, item_idx)) = app.janitor_row_at(app.janitor_cursor) {
+                if item_idx.is_none() {
+                    app.janitor_cats[cat_idx].expanded = true;
+                }
+            }
+        }
+        KeyCode::Left => {
+            if let Some((cat_idx, item_idx)) = app.janitor_row_at(app.janitor_cursor) {
+                if item_idx.is_none() {
+                    app.janitor_cats[cat_idx].expanded = false;
+                }
+            }
+        }
+        KeyCode::Char(' ') => app.toggle_janitor_row(),
+        KeyCode::Char('a') => app.toggle_janitor_all(),
+        KeyCode::Tab => app.toggle_janitor_scope(),
+        KeyCode::Enter => app.janitor_action(true),
+        KeyCode::Char('d') | KeyCode::Char('D') => app.janitor_action(false),
+        KeyCode::Esc | KeyCode::Char('q') => {
+            app.active_view = ActiveView::Filesystem;
         }
         _ => {}
     }
@@ -268,6 +414,72 @@ fn handle_filesystem_keys(app: &mut App, key: KeyEvent) -> EventResult {
         // Utilities
         KeyCode::Char('i') | KeyCode::Char('I') => {
             app.open_item_info();
+            EventResult::Continue
+        }
+        KeyCode::Char('T') => {
+            app.open_top_files();
+            EventResult::Continue
+        }
+        KeyCode::Char('J') => {
+            app.open_janitor();
+            EventResult::Continue
+        }
+        // Shell & desktop integration: suspend for a subshell, or fire-and-forget.
+        KeyCode::Char('!') => {
+            let dir = app
+                .visible_children()
+                .get(app.cursor_index)
+                .map(|e| {
+                    if e.is_dir && !e.is_symlink {
+                        e.path.clone()
+                    } else {
+                        e.path
+                            .parent()
+                            .map(|p| p.to_path_buf())
+                            .unwrap_or_else(|| e.path.clone())
+                    }
+                })
+                .unwrap_or_else(|| app.current_dir_entry().path.clone());
+            EventResult::Subshell(dir)
+        }
+        KeyCode::Char('o') | KeyCode::Char('O') => {
+            if let Some(target) = app
+                .visible_children()
+                .get(app.cursor_index)
+                .map(|e| e.path.clone())
+            {
+                use std::process::Stdio;
+                match std::process::Command::new("xdg-open")
+                    .arg(&target)
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .spawn()
+                {
+                    // Detach output so child warnings cannot corrupt the TUI;
+                    // reap on a thread so no zombie is left behind.
+                    Ok(mut child) => {
+                        std::thread::spawn(move || {
+                            let _ = child.wait();
+                        });
+                        app.set_status(format!("Opened {}", target.display()))
+                    }
+                    Err(error) => app.set_status(format!("Cannot open: {error}")),
+                }
+            }
+            EventResult::Continue
+        }
+        KeyCode::Char('y') | KeyCode::Char('Y') => {
+            if let Some(target) = app
+                .visible_children()
+                .get(app.cursor_index)
+                .map(|e| e.path.clone())
+            {
+                match copy_to_clipboard(&target.to_string_lossy()) {
+                    Ok(_) => app.set_status(format!("Copied: {}", target.display())),
+                    Err(_) => app.set_status("No clipboard tool (wl-copy/xclip/xsel)"),
+                }
+            }
             EventResult::Continue
         }
         KeyCode::Char('r') => {

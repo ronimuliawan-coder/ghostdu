@@ -1,24 +1,68 @@
-use crate::fs::entry::{DeleteSafety, FileEntry};
+use crate::fs::entry::{DeleteSafety, FileEntry, GhostKind};
 use crate::fs::mount_info::{get_detailed_item_info, query_fs_info, DetailedItemInfo, FsMountInfo};
 use crate::fs::scanner::ScannerOptions;
 use crate::ghost::{
-    classify_path, classify_safety, fetch_docker_disk_info, prune_docker_dangling,
-    scan_deleted_open_files, DeletedOpenFile, DockerDiskInfo,
+    classify_path, classify_safety, describe_pid_ghost, fetch_docker_disk_info, proc_start_time,
+    prune_docker_dangling, scan_deleted_open_files, DeletedOpenFile, DockerDiskInfo,
 };
 use crate::ops::delete::permanently_delete_confirmed;
 use crate::ops::trash::move_to_trash_confirmed;
 use crate::ops::{TargetIdentities, TargetIdentity};
 use std::cell::Cell;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ActiveView {
     Filesystem,
     GhostInspector,
+    TopFiles,
+    Janitor,
     HelpModal,
     ConfirmModal,
     ItemInfoModal,
+}
+
+/// Leaderboard size; the ranking heap never holds more entries.
+const TOP_FILES_LIMIT: usize = 50;
+
+/// One ranked row of the Top-50 leaderboard. Snapshot data for display; the
+/// destructive actions re-verify the live target before touching disk.
+#[derive(Debug, Clone)]
+pub struct TopFile {
+    pub path: PathBuf,
+    pub name: String,
+    pub size: u64,
+    pub disk_usage: u64,
+    pub safety: DeleteSafety,
+}
+
+/// Scope of the Janitor view: the current directory or the whole scan tree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JanitorScope {
+    Current,
+    Global,
+}
+
+/// One toggleable janitor row. A directory unit covers its whole subtree;
+/// grouped loose files share their parent row but only trash the listed files.
+#[derive(Debug, Clone)]
+pub struct JanitorItem {
+    pub display: String,
+    pub targets: Vec<PathBuf>,
+    pub size: u64,
+    /// Trash contents cannot be trashed again; only permanent delete applies.
+    pub trash_only_delete: bool,
+    pub selected: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct JanitorCategory {
+    pub title: &'static str,
+    pub items: Vec<JanitorItem>,
+    pub expanded: bool,
+    /// Sum of item sizes, computed at build so rendering never re-sums.
+    pub total: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -74,11 +118,20 @@ impl SortMode {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug)]
 pub enum ConfirmAction {
     MoveToTrash,
     PermanentDelete,
     DockerPrune,
+    KillProcess {
+        pid: u32,
+        name: String,
+        start_time: u64,
+        /// Pinned handle to the confirmed instance. Signals go through it, so
+        /// PID reuse cannot redirect them. `None` only on kernels predating
+        /// pidfd (below the app's 5.6 floor): execution refuses without one.
+        pidfd: Option<rustix::fd::OwnedFd>,
+    },
 }
 
 pub struct App {
@@ -102,6 +155,8 @@ pub struct App {
     pub pending_action: Option<ConfirmAction>,
     pub action_targets: Vec<PathBuf>,
     pub action_total_size: u64,
+    /// Scroll offset for the multi-target list in the confirmation modal.
+    pub confirm_list_offset: usize,
     pub action_safety_blocked: bool,
     pub action_has_recheck: bool,
     pub action_has_system: bool,
@@ -112,6 +167,14 @@ pub struct App {
     pub deleted_open_files: Vec<DeletedOpenFile>,
     pub ghost_tab_index: usize, // 0 = Docker, 1 = Deleted-Open Files
     pub ghost_cursor_index: usize,
+    pub top_files: Vec<TopFile>,
+    pub top_cursor: usize,
+    pub janitor_cats: Vec<JanitorCategory>,
+    pub janitor_cursor: usize,
+    pub janitor_scope: JanitorScope,
+    /// Selected-byte total, refreshed on rebuild/toggle so rendering is O(page).
+    pub janitor_selected_bytes: u64,
+    pub janitor_offset: Cell<usize>,
     pub ghost_docker_scroll_offset: Cell<usize>,
     pub ghost_deleted_scroll_offset: Cell<usize>,
 
@@ -146,6 +209,7 @@ impl App {
             pending_action: None,
             action_targets: Vec::new(),
             action_total_size: 0,
+            confirm_list_offset: 0,
             action_safety_blocked: false,
             action_has_recheck: false,
             action_has_system: false,
@@ -154,6 +218,13 @@ impl App {
             deleted_open_files,
             ghost_tab_index: 0,
             ghost_cursor_index: 0,
+            top_files: Vec::new(),
+            top_cursor: 0,
+            janitor_cats: Vec::new(),
+            janitor_cursor: 0,
+            janitor_scope: JanitorScope::Global,
+            janitor_selected_bytes: 0,
+            janitor_offset: Cell::new(0),
             ghost_docker_scroll_offset: Cell::new(0),
             ghost_deleted_scroll_offset: Cell::new(0),
             fs_info,
@@ -713,30 +784,7 @@ impl App {
             self.set_status("No item selected to move to wastebin");
             return;
         }
-
-        let mut has_system = false;
-        let mut has_recheck = false;
-        for path in &targets {
-            let ghost = classify_path(path);
-            let safety = classify_safety(path, ghost);
-            if safety == DeleteSafety::System {
-                has_system = true;
-            } else if safety == DeleteSafety::Recheck {
-                has_recheck = true;
-            }
-        }
-
-        if !has_system && !self.capture_confirmation(&targets) {
-            return;
-        }
-        self.action_targets = targets;
-        self.action_total_size = total_size;
-        self.action_has_system = has_system;
-        self.action_has_recheck = has_recheck;
-        self.action_safety_blocked = has_system;
-        self.pending_action = Some(ConfirmAction::MoveToTrash);
-        self.previous_view = self.active_view;
-        self.active_view = ActiveView::ConfirmModal;
+        self.open_action_confirm(targets, total_size, ConfirmAction::MoveToTrash);
     }
 
     /// Prepare Permanent Deletion confirmation
@@ -760,10 +808,28 @@ impl App {
             self.set_status("No item selected to permanently delete");
             return;
         }
+        self.open_action_confirm(targets, total_size, ConfirmAction::PermanentDelete);
+    }
 
+    /// Shared confirmation gate: system check, identity capture, modal setup.
+    fn open_action_confirm(
+        &mut self,
+        targets: Vec<PathBuf>,
+        total_size: u64,
+        action: ConfirmAction,
+    ) {
+        let (has_system, has_recheck) = Self::action_safety_flags(&targets);
+        if !has_system && !self.capture_confirmation(&targets) {
+            return;
+        }
+        self.finish_action_confirm(targets, total_size, has_system, has_recheck, action);
+    }
+
+    /// System/Recheck classification shared by every confirmation entry point.
+    fn action_safety_flags(targets: &[PathBuf]) -> (bool, bool) {
         let mut has_system = false;
         let mut has_recheck = false;
-        for path in &targets {
+        for path in targets {
             let ghost = classify_path(path);
             let safety = classify_safety(path, ghost);
             if safety == DeleteSafety::System {
@@ -772,18 +838,512 @@ impl App {
                 has_recheck = true;
             }
         }
+        (has_system, has_recheck)
+    }
 
-        if !has_system && !self.capture_confirmation(&targets) {
-            return;
-        }
+    /// Store targets and open the confirmation modal.
+    fn finish_action_confirm(
+        &mut self,
+        targets: Vec<PathBuf>,
+        total_size: u64,
+        has_system: bool,
+        has_recheck: bool,
+        action: ConfirmAction,
+    ) {
         self.action_targets = targets;
         self.action_total_size = total_size;
         self.action_has_system = has_system;
         self.action_has_recheck = has_recheck;
         self.action_safety_blocked = has_system;
-        self.pending_action = Some(ConfirmAction::PermanentDelete);
+        self.confirm_list_offset = 0;
+        self.pending_action = Some(action);
         self.previous_view = self.active_view;
         self.active_view = ActiveView::ConfirmModal;
+    }
+
+    /// Resolve scanned identities for many targets in one tree walk, avoiding
+    /// a linear `find_entry` scan per target.
+    fn resolve_scan_identities(
+        &self,
+        targets: &[PathBuf],
+    ) -> HashMap<PathBuf, (u64, u64, bool, bool)> {
+        let wanted: HashSet<&Path> = targets.iter().map(PathBuf::as_path).collect();
+        fn walk(
+            entry: &FileEntry,
+            wanted: &HashSet<&Path>,
+            map: &mut HashMap<PathBuf, (u64, u64, bool, bool)>,
+        ) {
+            if wanted.contains(entry.path.as_path()) {
+                map.insert(
+                    entry.path.clone(),
+                    (entry.dev, entry.ino, entry.is_dir, entry.is_symlink),
+                );
+            }
+            for child in &entry.children {
+                walk(child, wanted, map);
+            }
+        }
+        let mut map = HashMap::new();
+        walk(&self.root_entry, &wanted, &mut map);
+        map
+    }
+
+    /// Capture confirmation identities for a pre-resolved batch, honouring the
+    /// same descriptor-aware limit as interactive selection. All-or-nothing,
+    /// like `capture_confirmation`.
+    fn capture_confirmed_batch(
+        &mut self,
+        targets: &[PathBuf],
+        resolved: &HashMap<PathBuf, (u64, u64, bool, bool)>,
+    ) -> bool {
+        self.action_identities.clear();
+        let limit = match self.selection_limit() {
+            Ok(limit) => limit,
+            Err(error) => {
+                self.set_status(format!("Cannot determine safe selection limit: {error}"));
+                return false;
+            }
+        };
+        for path in targets {
+            if self.selected_identities.len() + self.action_identities.len() >= limit {
+                self.action_identities.clear();
+                self.set_status(format!(
+                    "Selection limit reached ({limit} items); confirm a smaller batch"
+                ));
+                return false;
+            }
+            let identity = match (TargetIdentity::capture(path), resolved.get(path)) {
+                (Ok(identity), Some(&(dev, ino, is_dir, is_symlink)))
+                    if identity.matches_ids(dev, ino, is_dir, is_symlink) =>
+                {
+                    identity
+                }
+                _ => {
+                    self.selected_paths.remove(path);
+                    self.selected_identities.remove(path);
+                    self.action_identities.clear();
+                    self.set_status(
+                        "Cannot confirm action: Target changed since scan; refresh and select it again",
+                    );
+                    return false;
+                }
+            };
+            self.action_identities.insert(path.clone(), identity);
+        }
+        true
+    }
+
+    /// Rank the largest files across the scanned tree (files only, no symlinks).
+    /// Bounded heap keeps O(50) entries: keys only in pass one, full rows for
+    /// winners in pass two. No per-file allocation beyond the traversal itself.
+    fn rank_top_files(root: &FileEntry) -> Vec<TopFile> {
+        fn collect_keys<'a>(
+            entry: &'a FileEntry,
+            heap: &mut BinaryHeap<std::cmp::Reverse<(u64, u64, u64, &'a Path)>>,
+        ) {
+            if !entry.is_dir && !entry.is_symlink {
+                heap.push(std::cmp::Reverse((
+                    entry.disk_usage,
+                    entry.dev,
+                    entry.ino,
+                    entry.path.as_path(),
+                )));
+                if heap.len() > TOP_FILES_LIMIT {
+                    heap.pop();
+                }
+            }
+            for child in &entry.children {
+                collect_keys(child, heap);
+            }
+        }
+        fn collect_winners(entry: &FileEntry, winners: &HashSet<&Path>, out: &mut Vec<TopFile>) {
+            if !entry.is_dir && !entry.is_symlink && winners.contains(entry.path.as_path()) {
+                out.push(TopFile {
+                    path: entry.path.clone(),
+                    name: entry.name.clone(),
+                    size: entry.size,
+                    disk_usage: entry.disk_usage,
+                    safety: entry.delete_safety,
+                });
+            }
+            for child in &entry.children {
+                collect_winners(child, winners, out);
+            }
+        }
+        let mut heap = BinaryHeap::new();
+        collect_keys(root, &mut heap);
+        // Winners keyed by path: one inode with many hard links cannot
+        // multiply into more rows than the limit.
+        let winners: HashSet<&Path> = heap
+            .into_iter()
+            .map(|std::cmp::Reverse((_, _, _, path))| path)
+            .collect();
+        let mut files = Vec::with_capacity(winners.len().min(TOP_FILES_LIMIT));
+        collect_winners(root, &winners, &mut files);
+        // Total order: deterministic across runs and filesystems even on ties.
+        files.sort_by(|a, b| {
+            b.disk_usage
+                .cmp(&a.disk_usage)
+                .then_with(|| a.path.cmp(&b.path))
+        });
+        files
+    }
+
+    /// Open the Janitor. Defaults to the current folder when navigating below
+    /// the scan root, otherwise the whole tree.
+    pub fn open_janitor(&mut self) {
+        self.janitor_scope = if self.path_stack.is_empty() {
+            JanitorScope::Global
+        } else {
+            JanitorScope::Current
+        };
+        self.rebuild_janitor();
+        self.janitor_cursor = 0;
+        self.previous_view = self.active_view;
+        self.active_view = ActiveView::Janitor;
+    }
+
+    fn janitor_scope_root(&self) -> &FileEntry {
+        match self.janitor_scope {
+            JanitorScope::Global => &self.root_entry,
+            JanitorScope::Current => self.current_dir_entry(),
+        }
+    }
+
+    fn rebuild_janitor(&mut self) {
+        // Borrow the scope for collection; store the owned rows after it ends.
+        let cats = {
+            let scope = self.janitor_scope_root();
+            Self::collect_janitor(scope)
+        };
+        self.janitor_cats = cats;
+        self.janitor_cursor = self.janitor_cursor.min(self.janitor_row_count().max(1) - 1);
+        self.refresh_janitor_selected();
+    }
+
+    /// Recompute the selected-byte total. Called on rebuild/toggle (keypress
+    /// rate), never during rendering (frame rate).
+    fn refresh_janitor_selected(&mut self) {
+        self.janitor_selected_bytes = self
+            .janitor_cats
+            .iter()
+            .flat_map(|cat| &cat.items)
+            .filter(|item| item.selected)
+            .map(|item| item.size)
+            .sum();
+    }
+
+    /// Flat row count (category headers plus expanded items).
+    pub fn janitor_row_count(&self) -> usize {
+        self.janitor_cats
+            .iter()
+            .map(|cat| 1 + if cat.expanded { cat.items.len() } else { 0 })
+            .sum()
+    }
+
+    /// Flat start index of each category header; O(categories).
+    pub(crate) fn janitor_offsets(&self) -> Vec<usize> {
+        let mut offsets = Vec::with_capacity(self.janitor_cats.len());
+        let mut index = 0;
+        for cat in &self.janitor_cats {
+            offsets.push(index);
+            index += 1 + if cat.expanded { cat.items.len() } else { 0 };
+        }
+        offsets
+    }
+
+    /// Resolve a flat cursor position to (category, item). `None` = header row.
+    /// Indexed by category offsets; never scans item rows.
+    pub fn janitor_row_at(&self, cursor: usize) -> Option<(usize, Option<usize>)> {
+        let offsets = self.janitor_offsets();
+        let position = offsets.partition_point(|&start| start <= cursor);
+        if position == 0 {
+            return None;
+        }
+        let cat_idx = position - 1;
+        let cat = &self.janitor_cats[cat_idx];
+        if cursor == offsets[cat_idx] {
+            return Some((cat_idx, None));
+        }
+        let item_idx = cursor - offsets[cat_idx] - 1;
+        if cat.expanded && item_idx < cat.items.len() {
+            return Some((cat_idx, Some(item_idx)));
+        }
+        None
+    }
+
+    /// Toggle scope between the current folder and the whole tree.
+    pub fn toggle_janitor_scope(&mut self) {
+        self.janitor_scope = match self.janitor_scope {
+            JanitorScope::Current => JanitorScope::Global,
+            JanitorScope::Global => JanitorScope::Current,
+        };
+        self.rebuild_janitor();
+        self.janitor_cursor = 0;
+        self.set_status(format!(
+            "Janitor scope: {}",
+            match self.janitor_scope {
+                JanitorScope::Current => "current folder",
+                JanitorScope::Global => "whole scan",
+            }
+        ));
+    }
+
+    /// Toggle the row under the janitor cursor: a whole category on headers.
+    /// Selected bytes update incrementally (O(row), not O(tree)).
+    pub fn toggle_janitor_row(&mut self) {
+        if let Some((cat_idx, item_idx)) = self.janitor_row_at(self.janitor_cursor) {
+            match item_idx {
+                None => {
+                    let all_on = self.janitor_cats[cat_idx]
+                        .items
+                        .iter()
+                        .all(|item| item.selected);
+                    for item in &mut self.janitor_cats[cat_idx].items {
+                        if item.selected == all_on {
+                            if all_on {
+                                self.janitor_selected_bytes =
+                                    self.janitor_selected_bytes.saturating_sub(item.size);
+                            } else {
+                                self.janitor_selected_bytes =
+                                    self.janitor_selected_bytes.saturating_add(item.size);
+                            }
+                        }
+                        item.selected = !all_on;
+                    }
+                }
+                Some(item_idx) => {
+                    let item = &mut self.janitor_cats[cat_idx].items[item_idx];
+                    item.selected = !item.selected;
+                    if item.selected {
+                        self.janitor_selected_bytes =
+                            self.janitor_selected_bytes.saturating_add(item.size);
+                    } else {
+                        self.janitor_selected_bytes =
+                            self.janitor_selected_bytes.saturating_sub(item.size);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Select all janitor rows, or clear when everything is already selected.
+    /// One aggregate pass for the bulk action (explicitly allowed); rebuilds
+    /// recompute from scratch.
+    pub fn toggle_janitor_all(&mut self) {
+        let all_on = self
+            .janitor_cats
+            .iter()
+            .flat_map(|cat| &cat.items)
+            .all(|item| item.selected);
+        for cat in &mut self.janitor_cats {
+            for item in &mut cat.items {
+                if item.selected == all_on {
+                    if all_on {
+                        self.janitor_selected_bytes =
+                            self.janitor_selected_bytes.saturating_sub(item.size);
+                    } else {
+                        self.janitor_selected_bytes =
+                            self.janitor_selected_bytes.saturating_add(item.size);
+                    }
+                }
+                item.selected = !all_on;
+            }
+        }
+    }
+
+    /// Trash or delete checked janitor rows through the standard confirmation
+    /// flow. Trash contents route to permanent delete with an explanation.
+    pub fn janitor_action(&mut self, to_trash: bool) {
+        let mut targets = Vec::new();
+        let mut total = 0u64;
+        let mut trash_only_hit = false;
+        for cat in &self.janitor_cats {
+            for item in &cat.items {
+                if item.selected {
+                    if item.trash_only_delete {
+                        trash_only_hit = true;
+                    }
+                    targets.extend(item.targets.iter().cloned());
+                    total = total.saturating_add(item.size);
+                }
+            }
+        }
+        if targets.is_empty() {
+            self.set_status("Nothing selected (Space toggles, a selects all)");
+            return;
+        }
+        if to_trash && trash_only_hit {
+            self.set_status("Trash contents can only be permanently deleted (D)");
+            return;
+        }
+        let action = if to_trash {
+            ConfirmAction::MoveToTrash
+        } else {
+            ConfirmAction::PermanentDelete
+        };
+        let (has_system, has_recheck) = Self::action_safety_flags(&targets);
+        if !has_system {
+            let resolved = self.resolve_scan_identities(&targets);
+            if !self.capture_confirmed_batch(&targets, &resolved) {
+                return;
+            }
+        }
+        self.finish_action_confirm(targets, total, has_system, has_recheck, action);
+    }
+
+    /// Open the Top-50 leaderboard, ranked on demand from the live tree.
+    pub fn open_top_files(&mut self) {
+        let files = Self::rank_top_files(&self.root_entry);
+        if files.is_empty() {
+            self.set_status("No files in the scanned tree");
+            return;
+        }
+        self.top_files = files;
+        self.top_cursor = 0;
+        self.previous_view = self.active_view;
+        self.active_view = ActiveView::TopFiles;
+    }
+
+    /// Jump from the leaderboard to the file's parent in the explorer.
+    pub fn jump_to_top_file(&mut self) -> bool {
+        let target = match self.top_files.get(self.top_cursor) {
+            Some(top) => top.path.clone(),
+            None => return false,
+        };
+        let parent = target
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| self.root_entry.path.clone());
+        if !self.navigate_to_path(&parent) {
+            return false;
+        }
+        self.active_view = ActiveView::Filesystem;
+        let visible = self.visible_children();
+        if let Some(index) = visible.iter().position(|e| e.path == target) {
+            self.cursor_index = index;
+        }
+        true
+    }
+
+    /// Trash or delete the highlighted leaderboard row through the standard
+    /// confirmation flow (live identity re-verified before any mutation).
+    pub fn top_file_action(&mut self, to_trash: bool) {
+        let Some(top) = self.top_files.get(self.top_cursor).cloned() else {
+            return;
+        };
+        let total = if self.apparent_size {
+            top.size
+        } else {
+            top.disk_usage
+        };
+        let action = if to_trash {
+            ConfirmAction::MoveToTrash
+        } else {
+            ConfirmAction::PermanentDelete
+        };
+        self.open_action_confirm(vec![top.path], total, action);
+    }
+
+    /// Janitor category of a cleanable entry, if it belongs in the view.
+    fn janitor_group(kind: GhostKind) -> Option<(&'static str, usize)> {
+        match kind {
+            GhostKind::BrowserCache => Some(("🌐 Browser Caches", 0)),
+            GhostKind::BuildCache | GhostKind::PackageCache => {
+                Some(("📦 Package & Build Caches", 1))
+            }
+            GhostKind::Trash => Some(("🗑️ FreeDesktop Trash", 2)),
+            GhostKind::LogFiles | GhostKind::CoreDump => Some(("📜 Logs & Crash Dumps", 3)),
+            _ => None,
+        }
+    }
+
+    /// Collect toggleable janitor rows under `scope`: cleanable Safe units become
+    /// single rows covering their subtree; loose cleanable files group by parent
+    /// so only the listed files are ever targeted.
+    fn collect_janitor(scope: &FileEntry) -> Vec<JanitorCategory> {
+        const TITLES: [&str; 4] = [
+            "🌐 Browser Caches",
+            "📦 Package & Build Caches",
+            "🗑️ FreeDesktop Trash",
+            "📜 Logs & Crash Dumps",
+        ];
+        let mut groups: [Vec<JanitorItem>; 4] = Default::default();
+        // (parent, category slot) -> (files, bytes, trash_only).
+        let mut loose: HashMap<(PathBuf, usize), (Vec<PathBuf>, u64, bool)> = HashMap::new();
+        fn walk(
+            node: &FileEntry,
+            scope_root: &Path,
+            groups: &mut [Vec<JanitorItem>; 4],
+            loose: &mut HashMap<(PathBuf, usize), (Vec<PathBuf>, u64, bool)>,
+        ) {
+            if node.path != scope_root && node.delete_safety == DeleteSafety::Safe {
+                if let Some((_, slot)) = App::janitor_group(node.ghost_kind) {
+                    let trash_only = node.ghost_kind == GhostKind::Trash;
+                    // Generic containers group distinct apps (per-app rows under
+                    // ~/.cache, files/ + info/ under Trash); everything else is
+                    // one unit covering its subtree.
+                    let is_container = node
+                        .path
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .is_some_and(|n| n == ".cache" || n == "Trash");
+                    if node.is_dir && !node.is_symlink && !is_container {
+                        groups[slot].push(JanitorItem {
+                            display: node.path.to_string_lossy().into_owned(),
+                            targets: vec![node.path.clone()],
+                            size: node.disk_usage,
+                            trash_only_delete: trash_only,
+                            selected: false,
+                        });
+                        return; // Unit covers its subtree; do not descend.
+                    }
+                    if !node.is_dir {
+                        let parent = node
+                            .path
+                            .parent()
+                            .map(|p| p.to_path_buf())
+                            .unwrap_or_else(|| node.path.clone());
+                        let entry = loose
+                            .entry((parent, slot))
+                            .or_insert((Vec::new(), 0, false));
+                        entry.0.push(node.path.clone());
+                        entry.1 += node.disk_usage;
+                        entry.2 |= trash_only;
+                        return;
+                    }
+                }
+            }
+            for child in &node.children {
+                walk(child, scope_root, groups, loose);
+            }
+        }
+        walk(scope, &scope.path.clone(), &mut groups, &mut loose);
+        for ((parent, slot), (mut files, bytes, trash_only)) in loose {
+            files.sort();
+            groups[slot].push(JanitorItem {
+                display: format!("{} ({} files)", parent.display(), files.len()),
+                targets: files,
+                size: bytes,
+                trash_only_delete: trash_only,
+                selected: false,
+            });
+        }
+        TITLES
+            .into_iter()
+            .enumerate()
+            .map(|(index, title)| {
+                let mut items = std::mem::take(&mut groups[index]);
+                items.sort_by_key(|item| std::cmp::Reverse(item.size));
+                let total = items.iter().map(|item| item.size).sum();
+                JanitorCategory {
+                    title,
+                    items,
+                    expanded: true,
+                    total,
+                }
+            })
+            .collect()
     }
 
     /// Prepare Docker Prune confirmation
@@ -802,6 +1362,110 @@ impl App {
         self.pending_action = Some(ConfirmAction::DockerPrune);
         self.previous_view = self.active_view;
         self.active_view = ActiveView::ConfirmModal;
+    }
+
+    /// Open the process-termination confirmation for a ghost-table PID. The row,
+    /// confirmation, and signal bind to one process instance: the row's recorded
+    /// identity must still match the live holder, which must still hold a ghost
+    /// file (checked per-PID, never via a full table walk on the key path).
+    /// A recycled PID is refused instead of adopted; the modal shows the
+    /// freshly validated name, and the instance is pinned with a pidfd.
+    /// Callers pass PIDs from the ghost table, never free-form input.
+    pub fn prompt_kill_process(&mut self, pid: u32) {
+        let recorded = self
+            .deleted_open_files
+            .iter()
+            .find(|f| f.pid == pid)
+            .and_then(|f| f.start_time);
+        let Some(recorded) = recorded else {
+            self.set_status("Process row carries no recorded identity; press r to refresh");
+            return;
+        };
+        // Targeted liveness: only this PID's fd directory is walked.
+        let Some((name, start_time)) = describe_pid_ghost(pid) else {
+            self.set_status(format!(
+                "Process {pid} no longer holds ghost files; press r to refresh"
+            ));
+            return;
+        };
+        if start_time != recorded {
+            self.set_status(format!(
+                "Process {pid} changed since scan; press r to refresh, then select it again"
+            ));
+            return;
+        }
+        // Pin the verified instance; a recycled PID names a different process,
+        // never this handle. Execution refuses without a pinned handle.
+        let pidfd = rustix::process::Pid::from_raw(pid as i32).and_then(|target| {
+            rustix::process::pidfd_open(target, rustix::process::PidfdFlags::empty()).ok()
+        });
+        // The handle pins whoever holds the PID now; refuse if that is already
+        // a different instance than the verified one.
+        if pidfd.is_some() && proc_start_time(pid) != Some(start_time) {
+            self.set_status(format!(
+                "Process {pid} changed during confirmation setup; not opened"
+            ));
+            return;
+        }
+        self.pending_action = Some(ConfirmAction::KillProcess {
+            pid,
+            name,
+            start_time,
+            pidfd,
+        });
+        self.previous_view = self.active_view;
+        self.active_view = ActiveView::ConfirmModal;
+    }
+
+    /// Signal the stored confirmed kill target. Consumes the confirmation and
+    /// refuses when the process instance changed since confirmation.
+    /// `sigterm` selects SIGTERM (graceful) over SIGKILL. Kernel ESRCH/EPERM
+    /// surface as status messages.
+    /// Signal the stored confirmed kill target through its pinned handle, which
+    /// is immune to PID reuse. Refuses when no handle could be pinned: there is
+    /// no numeric-PID fallback, so a recycled PID can never be signalled.
+    /// `sigterm` selects SIGTERM (graceful) over SIGKILL. Kernel errors surface
+    /// as status messages.
+    pub fn execute_kill(&mut self, sigterm: bool) {
+        let confirmed = self.pending_action.take();
+        self.active_view = self.previous_view;
+        let Some(ConfirmAction::KillProcess {
+            pid,
+            name: _,
+            start_time,
+            pidfd: Some(fd),
+        }) = confirmed
+        else {
+            self.set_status("Cannot signal: process was not pinned at confirmation");
+            return;
+        };
+        // The handle pins the confirmed instance, but refuse when the current
+        // holder already moved on: signalling it deserves refusal, not ESRCH.
+        if proc_start_time(pid) != Some(start_time) {
+            self.set_status(format!(
+                "Process {pid} changed since confirmation; not signalled"
+            ));
+            return;
+        }
+        let signal = if sigterm {
+            rustix::process::Signal::TERM
+        } else {
+            rustix::process::Signal::KILL
+        };
+        if let Err(error) = rustix::process::pidfd_send_signal(&fd, signal) {
+            self.set_status(format!(
+                "Cannot signal process {pid}: {}",
+                std::io::Error::from(error)
+            ));
+            return;
+        }
+        // Drop the signalled rows surgically; the next manual refresh
+        // re-scans the table. No full procfs walk on the key path.
+        self.deleted_open_files.retain(|f| f.pid != pid);
+        self.ghost_cursor_index = self
+            .ghost_cursor_index
+            .min(self.deleted_open_files.len().saturating_sub(1));
+        self.set_status(format!("Signaled process {pid}"));
     }
 
     /// Execute pending action after user confirms
@@ -912,6 +1576,11 @@ impl App {
                     self.set_status(format!("❌ Docker Prune failed: {}", err));
                 }
             },
+            // Termination uses the 1/2 number keys, never y. Reaching here
+            // means an unexpected confirm path; cancel without signaling.
+            ConfirmAction::KillProcess { .. } => {
+                self.cancel_modal();
+            }
         }
 
         self.action_identities.clear();
@@ -926,6 +1595,65 @@ impl App {
         self.action_has_recheck = false;
         self.action_has_system = false;
         self.active_view = self.previous_view;
+        // The leaderboard snapshot predates the mutation; rebuild it in place.
+        if self.active_view == ActiveView::TopFiles {
+            self.top_files = Self::rank_top_files(&self.root_entry);
+            self.top_cursor = self.top_cursor.min(self.top_files.len().saturating_sub(1));
+        }
+        if self.active_view == ActiveView::Janitor {
+            self.rebuild_janitor();
+        }
+    }
+
+    /// Refresh one subtree after external changes (e.g. subshell exit) using the
+    /// active scan policy. Returns false when the rescan itself failed.
+    pub fn refresh_path(&mut self, path: &Path) -> bool {
+        let roots: HashSet<PathBuf> = HashSet::from([path.to_path_buf()]);
+        let mut seen = HashSet::new();
+        Self::seed_retained_inodes(&self.root_entry, &roots, &mut seen);
+        let base_depth = path
+            .strip_prefix(&self.root_entry.path)
+            .map(|p| p.components().count())
+            .unwrap_or(0);
+        match crate::fs::scanner::rescan_entry(
+            path,
+            self.root_entry.dev,
+            &mut seen,
+            &self.scan_options,
+            base_depth,
+        ) {
+            Ok(entry) => {
+                if path == self.root_entry.path {
+                    let current = self.current_dir_entry().path.clone();
+                    self.root_entry = entry;
+                    self.navigate_to_path(&current);
+                } else {
+                    self.replace_subtree(path, entry);
+                }
+                self.discard_changed_selections();
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
+    /// Seed hard-link accounting from the retained tree, stopping at rescan roots
+    /// so their descendants are not double-counted.
+    fn seed_retained_inodes(
+        entry: &FileEntry,
+        roots: &HashSet<PathBuf>,
+        seen: &mut HashSet<(u64, u64)>,
+    ) {
+        // Stop at each rescan root, so descendants need no prefix comparisons.
+        if roots.contains(&entry.path) {
+            return;
+        }
+        if entry.is_dir || entry.size > 0 || entry.disk_usage > 0 || entry.safe_items > 0 {
+            seen.insert((entry.dev, entry.ino));
+        }
+        for child in &entry.children {
+            Self::seed_retained_inodes(child, roots, seen);
+        }
     }
 
     fn reconcile_after_delete_failure(
@@ -943,27 +1671,11 @@ impl App {
                 roots.push(path);
             }
         }
-        fn retained_inodes(
-            entry: &FileEntry,
-            roots: &HashSet<PathBuf>,
-            seen: &mut HashSet<(u64, u64)>,
-        ) {
-            // Stop at each failed root, so descendants need no prefix comparisons.
-            if roots.contains(&entry.path) {
-                return;
-            }
-            if entry.is_dir || entry.size > 0 || entry.disk_usage > 0 || entry.safe_items > 0 {
-                seen.insert((entry.dev, entry.ino));
-            }
-            for child in &entry.children {
-                retained_inodes(child, roots, seen);
-            }
-        }
         fn has_errors(entry: &FileEntry) -> bool {
             entry.has_err || entry.children.iter().any(has_errors)
         }
         let mut seen = HashSet::new();
-        retained_inodes(
+        Self::seed_retained_inodes(
             &self.root_entry,
             &roots.iter().cloned().collect(),
             &mut seen,
@@ -1240,6 +1952,265 @@ mod reconciliation_tests {
     use super::*;
     use std::fs;
     use std::sync::{atomic::AtomicBool, Arc};
+
+    #[test]
+    fn janitor_collects_toggleable_units_and_groups_loose_files() {
+        let fixture = tempfile::tempdir().unwrap();
+        // ~/.cache style: dir unit with a nested file (covered whole).
+        let chrome = fixture.path().join(".cache").join("google-chrome");
+        fs::create_dir_all(&chrome).unwrap();
+        fs::write(chrome.join("data"), vec![0u8; 10000]).unwrap();
+        // Loose cleanable files group under their parent.
+        fs::write(fixture.path().join("app.log"), vec![0u8; 1000]).unwrap();
+        fs::write(fixture.path().join("old.log.1"), vec![0u8; 1000]).unwrap();
+        // Non-cleanable file must never appear.
+        fs::write(fixture.path().join("notes.txt"), "x").unwrap();
+        let root = crate::fs::scanner::scan_directory(
+            fixture.path(),
+            None,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .unwrap();
+        let mut app = App::new(root);
+        app.open_janitor();
+        assert_eq!(app.active_view, ActiveView::Janitor);
+        // At scan root the default scope is global.
+        assert_eq!(app.janitor_scope, JanitorScope::Global);
+        let unit = app
+            .janitor_cats
+            .iter()
+            .flat_map(|cat| &cat.items)
+            .find(|item| item.display.contains("google-chrome"))
+            .expect("cache dir unit");
+        assert_eq!(unit.targets.len(), 1);
+        let grouped = app
+            .janitor_cats
+            .iter()
+            .flat_map(|cat| &cat.items)
+            .find(|item| item.display.contains("(2 files)"))
+            .expect("grouped logs");
+        assert_eq!(grouped.targets.len(), 2);
+        assert!(!app
+            .janitor_cats
+            .iter()
+            .flat_map(|cat| &cat.items)
+            .any(|item| item.display.contains("notes.txt")));
+        // Header toggle selects the whole category, cursor rows resolve.
+        assert!(app.janitor_row_count() > 0);
+        app.toggle_janitor_all();
+        assert!(app
+            .janitor_cats
+            .iter()
+            .flat_map(|cat| &cat.items)
+            .all(|item| item.selected));
+        let selected_total: u64 = app
+            .janitor_cats
+            .iter()
+            .flat_map(|cat| &cat.items)
+            .map(|item| item.size)
+            .sum();
+        assert_eq!(app.janitor_selected_bytes, selected_total);
+        // Single-row toggle adjusts the total incrementally and reversibly.
+        app.toggle_janitor_all();
+        assert_eq!(app.janitor_selected_bytes, 0);
+        app.janitor_cursor = 1;
+        app.toggle_janitor_row();
+        let one = app.janitor_selected_bytes;
+        assert!(one > 0);
+        app.toggle_janitor_row();
+        assert_eq!(app.janitor_selected_bytes, 0);
+        // Action routes through the standard trash confirmation.
+        app.toggle_janitor_all();
+        app.janitor_action(true);
+        assert_eq!(app.active_view, ActiveView::ConfirmModal);
+        assert!(!app.action_targets.is_empty());
+    }
+
+    #[test]
+    fn confirm_list_scrolls_through_frozen_batch() {
+        use crate::ui::handle_key_event;
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let fixture = tempfile::tempdir().unwrap();
+        let chrome = fixture.path().join(".cache").join("google-chrome");
+        fs::create_dir_all(&chrome).unwrap();
+        fs::write(chrome.join("data"), vec![0u8; 10000]).unwrap();
+        fs::write(fixture.path().join("a.log"), vec![0u8; 1000]).unwrap();
+        fs::write(fixture.path().join("b.log"), vec![0u8; 1000]).unwrap();
+        let root = crate::fs::scanner::scan_directory(
+            fixture.path(),
+            None,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .unwrap();
+        let mut app = App::new(root);
+        app.open_janitor();
+        app.toggle_janitor_all();
+        app.janitor_action(true);
+        assert_eq!(app.active_view, ActiveView::ConfirmModal);
+        assert!(app.action_targets.len() > 1);
+        assert_eq!(app.confirm_list_offset, 0);
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        handle_key_event(&mut app, key(KeyCode::Down));
+        assert_eq!(app.confirm_list_offset, 1);
+        handle_key_event(&mut app, key(KeyCode::Down));
+        handle_key_event(&mut app, key(KeyCode::Down));
+        assert_eq!(
+            app.confirm_list_offset,
+            app.action_targets.len().saturating_sub(1)
+        );
+        handle_key_event(&mut app, key(KeyCode::Up));
+        assert_eq!(
+            app.confirm_list_offset,
+            app.action_targets.len().saturating_sub(2)
+        );
+    }
+
+    #[test]
+    fn top_files_rank_jump_and_confirm() {
+        let fixture = tempfile::tempdir().unwrap();
+        fs::write(fixture.path().join("small.txt"), "x").unwrap();
+        fs::write(fixture.path().join("big.txt"), vec![0u8; 10000]).unwrap();
+        let sub = fixture.path().join("sub");
+        fs::create_dir(&sub).unwrap();
+        fs::write(sub.join("mid.txt"), vec![0u8; 1000]).unwrap();
+        let root = crate::fs::scanner::scan_directory(
+            fixture.path(),
+            None,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .unwrap();
+        let mut app = App::new(root);
+        app.open_top_files();
+        assert_eq!(app.active_view, ActiveView::TopFiles);
+        assert_eq!(app.top_files.len(), 3);
+        assert_eq!(app.top_files[0].name, "big.txt");
+        // Jump lands the explorer cursor on the file's parent entry. Look the
+        // row up by name: small block counts can tie across filesystems.
+        app.top_cursor = app
+            .top_files
+            .iter()
+            .position(|f| f.name == "mid.txt")
+            .unwrap();
+        assert!(app.jump_to_top_file());
+        assert_eq!(app.active_view, ActiveView::Filesystem);
+        let visible = app.visible_children();
+        assert_eq!(visible[app.cursor_index].name, "mid.txt");
+        // Direct action opens the standard confirmation for the row.
+        app.open_top_files();
+        app.top_file_action(true);
+        assert_eq!(app.active_view, ActiveView::ConfirmModal);
+        assert_eq!(app.action_targets.len(), 1);
+    }
+
+    #[test]
+    fn kill_flow_confirms_stale_table_then_refuses_recycled_pid() {
+        let fixture = tempfile::tempdir().unwrap();
+        let root = crate::fs::scanner::scan_directory(
+            fixture.path(),
+            None,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .unwrap();
+        let mut app = App::new(root);
+        // Unknown PID: confirmation never opens, table refresh reported.
+        app.prompt_kill_process(2_147_000_000);
+        assert!(app.pending_action.is_none());
+        assert_ne!(app.active_view, ActiveView::ConfirmModal);
+        // Row recorded a different instance than the live PID holder:
+        // replacement refused, never adopted into a confirmation. The test
+        // process holds a deleted file so the targeted check reaches the
+        // instance comparison instead of stopping at "no ghost file".
+        let held = tempfile::NamedTempFile::new().unwrap();
+        fs::write(held.path(), vec![0u8; 100]).unwrap();
+        fs::remove_file(held.path()).unwrap();
+        let own = std::process::id();
+        app.deleted_open_files.push(DeletedOpenFile {
+            pid: own,
+            process_name: "test-proc".to_string(),
+            original_path: "/deleted".to_string(),
+            size: 100,
+            fd: "3".to_string(),
+            start_time: Some(u64::MAX),
+        });
+        app.prompt_kill_process(own);
+        assert!(app.pending_action.is_none());
+        assert!(app
+            .current_status()
+            .unwrap_or("")
+            .contains("changed since scan"));
+        // Same instance, still holding: confirmation opens with a pin.
+        app.deleted_open_files.retain(|f| f.pid != own);
+        app.deleted_open_files.push(DeletedOpenFile {
+            pid: own,
+            process_name: "test-proc".to_string(),
+            original_path: "/deleted".to_string(),
+            size: 100,
+            fd: "3".to_string(),
+            start_time: crate::ghost::proc_start_time(own),
+        });
+        app.prompt_kill_process(own);
+        assert!(matches!(
+            app.pending_action,
+            Some(ConfirmAction::KillProcess { .. })
+        ));
+        app.cancel_modal();
+        // Recycled PID: stored start time mismatches the live process.
+        // Positive PID below i32::MAX that cannot exist (default pid_max is
+        // far lower); kill(-1) would signal everything, so never test that.
+        app.pending_action = Some(ConfirmAction::KillProcess {
+            pid: 1,
+            name: "init".to_string(),
+            start_time: u64::MAX,
+            pidfd: None,
+        });
+        app.active_view = ActiveView::ConfirmModal;
+        app.execute_kill(true);
+        assert!(app.pending_action.is_none());
+        assert!(app.current_status().unwrap_or("").contains("not pinned"));
+        // Sanity: the current process has a readable start time.
+        assert!(crate::ghost::proc_start_time(std::process::id()).is_some());
+    }
+
+    #[test]
+    fn kill_through_pidfd_terminates_only_the_pinned_child() {
+        use std::process::Command;
+        let fixture = tempfile::tempdir().unwrap();
+        let root = crate::fs::scanner::scan_directory(
+            fixture.path(),
+            None,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .unwrap();
+        let mut app = App::new(root);
+        let mut child = Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("sleep must exist for the kill test");
+        let pid = child.id();
+        let start_time = crate::ghost::proc_start_time(pid).expect("child is alive");
+        let pidfd = rustix::process::Pid::from_raw(pid as i32)
+            .and_then(|target| {
+                rustix::process::pidfd_open(target, rustix::process::PidfdFlags::empty()).ok()
+            })
+            .expect("pidfd must open on this kernel");
+        app.pending_action = Some(ConfirmAction::KillProcess {
+            pid,
+            name: "sleep".to_string(),
+            start_time,
+            pidfd: Some(pidfd),
+        });
+        app.active_view = ActiveView::ConfirmModal;
+        app.execute_kill(true);
+        // SIGTERM ends the child; the confirmation is consumed either way.
+        let exited = child.wait().expect("child reaped");
+        assert!(app.pending_action.is_none());
+        assert!(!exited.success());
+        assert!(app
+            .current_status()
+            .unwrap_or("")
+            .contains("Signaled process"));
+    }
 
     #[test]
     fn sparse_and_missing_updates_skip_unrelated_descendants() {

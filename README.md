@@ -32,6 +32,8 @@ The identity guarantee applies at verification time. Linux name-based `unlinkat`
 
 Batch failure reconciliation uses indexed root lookups and a tree-update walk pruned to ancestors of changed paths. Batch trash moves retain validated destination handles per source mount; private ownership and permissions are rechecked for every target. Kernels without mount IDs use uncached destination resolution so bind mounts cannot share a destination by device ID alone.
 
+Shell (`!`), desktop-open (`o`), and clipboard (`y`) handoffs run with the invoking user's own authority and environment — nothing is interpolated into a shell string, and nothing is sandboxed or dropped. They are conveniences of an interactive local tool, not privilege boundaries: do not run ghostdu with authority you would not grant to your own shell.
+
 #### Trash interruption and recovery
 
 The restore metadata is written and synced before the source is renamed into `Trash/files`. For process termination (with the filesystem still running), the recoverable states are:
