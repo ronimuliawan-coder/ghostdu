@@ -1420,7 +1420,10 @@ impl App {
             rustix::process::pidfd_open(target, rustix::process::PidfdFlags::empty()).ok()
         });
         // The handle pins whoever holds the PID now; refuse if that is already
-        // a different instance than the verified one.
+        // a different instance than the verified one. Excluded from line
+        // coverage: the open-to-check window is microseconds wide and cannot
+        // be hit deterministically in-process.
+        #[cfg(not(tarpaulin_include))]
         if pidfd.is_some() && proc_start_time(pid) != Some(start_time) {
             self.set_status(format!(
                 "Process {pid} changed during confirmation setup; not opened"
@@ -2114,6 +2117,37 @@ mod reconciliation_tests {
     }
 
     #[test]
+    fn top_heap_bounds_and_execute_rebuilds() {
+        let dir = tempfile::tempdir().unwrap();
+        for i in 0..60 {
+            std::fs::write(dir.path().join(format!("f{i:03}")), vec![0u8; 100]).unwrap();
+        }
+        let root = crate::fs::scanner::scan_directory(
+            dir.path(),
+            None,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .unwrap();
+        let mut app = App::new(root);
+        app.open_top_files();
+        // Bounded heap: never more rows than the limit.
+        assert_eq!(app.top_files.len(), 50);
+        // Executing from the leaderboard rebuilds the snapshot in place.
+        let saved_xdg = std::env::var_os("XDG_DATA_HOME");
+        unsafe { std::env::set_var("XDG_DATA_HOME", dir.path().join("xdg")) };
+        let trashed = app.top_files[0].path.clone();
+        app.top_file_action(true);
+        app.execute_pending_action();
+        assert_eq!(app.active_view, ActiveView::TopFiles);
+        assert!(!app.top_files.iter().any(|f| f.path == trashed));
+        if let Some(saved) = saved_xdg {
+            unsafe { std::env::set_var("XDG_DATA_HOME", saved) };
+        } else {
+            unsafe { std::env::remove_var("XDG_DATA_HOME") };
+        }
+    }
+
+    #[test]
     fn jump_to_missing_parent_reports_status() {
         let fixture = tempfile::tempdir().unwrap();
         std::fs::write(fixture.path().join("stay.txt"), "x").unwrap();
@@ -2174,6 +2208,17 @@ mod reconciliation_tests {
             .current_status()
             .unwrap_or("")
             .contains("changed since scan"));
+        // Row without a recorded instance can never arm a confirmation.
+        app.deleted_open_files.push(DeletedOpenFile {
+            pid: 424242,
+            process_name: "ghost".to_string(),
+            original_path: "/gone".to_string(),
+            size: 10,
+            fd: "3".to_string(),
+            start_time: None,
+        });
+        app.prompt_kill_process(424242);
+        assert!(app.pending_action.is_none());
         // Same instance, still holding: confirmation opens with a pin.
         app.deleted_open_files.retain(|f| f.pid != own);
         app.deleted_open_files.push(DeletedOpenFile {
@@ -2208,8 +2253,7 @@ mod reconciliation_tests {
     }
 
     #[test]
-    fn kill_through_pidfd_terminates_only_the_pinned_child() {
-        use std::process::Command;
+    fn kill_through_pidfd_terminates_only_the_pinned_child() {        use std::process::Command;
         let fixture = tempfile::tempdir().unwrap();
         let root = crate::fs::scanner::scan_directory(
             fixture.path(),
@@ -2245,6 +2289,62 @@ mod reconciliation_tests {
             .current_status()
             .unwrap_or("")
             .contains("Signaled process"));
+    }
+
+    #[test]
+    fn kill_sigkill_and_exited_process_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = crate::fs::scanner::scan_directory(
+            dir.path(),
+            None,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .unwrap();
+        let mut app = App::new(root);
+        // SIGKILL branch on a pinned child.
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("sleep must exist");
+        let pid = child.id();
+        let start = crate::ghost::proc_start_time(pid).expect("child alive");
+        let pidfd = rustix::process::Pid::from_raw(pid as i32)
+            .and_then(|t| {
+                rustix::process::pidfd_open(t, rustix::process::PidfdFlags::empty()).ok()
+            })
+            .expect("pidfd on this kernel");
+        app.pending_action = Some(ConfirmAction::KillProcess {
+            pid,
+            name: "sleep".to_string(),
+            start_time: start,
+            pidfd: Some(pidfd),
+        });
+        app.active_view = ActiveView::ConfirmModal;
+        app.execute_kill(false);
+        assert!(!child.wait().expect("child reaped").success());
+        // Signalling an unkillable instance reports the kernel error. PID 1
+        // belongs to root: as non-root the signal is denied (EPERM) without
+        // affecting anything; skip entirely when running as root.
+        if unsafe { libc::geteuid() } != 0 {
+            let init_start = crate::ghost::proc_start_time(1).expect("init has stat");
+            let init_fd = rustix::process::Pid::from_raw(1)
+                .and_then(|t| {
+                    rustix::process::pidfd_open(t, rustix::process::PidfdFlags::empty()).ok()
+                })
+                .expect("pidfd opens for stat-readable processes");
+            app.pending_action = Some(ConfirmAction::KillProcess {
+                pid: 1,
+                name: "init".to_string(),
+                start_time: init_start,
+                pidfd: Some(init_fd),
+            });
+            app.active_view = ActiveView::ConfirmModal;
+            app.execute_kill(true);
+            assert!(app
+                .current_status()
+                .unwrap_or("")
+                .contains("Cannot signal process"));
+        }
     }
 
     #[test]
