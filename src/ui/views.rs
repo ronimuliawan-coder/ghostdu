@@ -2827,17 +2827,17 @@ mod render_sweep_tests {
         let out = render(&fx.app, 100, 30);
         assert!(out.contains("a.txt"));
         // Rich state so conditional spans appear at every header size.
-        let app = &mut fx.app;
-        app.toggle_selection();
-        app.safe_only_filter = true;
-        app.search_query = "a".to_string();
+        fx.app.toggle_selection();
+        fx.app.safe_only_filter = true;
+        fx.app.search_query = "a".to_string();
         for (width, height) in [(100, 30), (40, 20), (100, 12), (60, 7), (100, 4)] {
-            let _ = render(app, width, height);
+            let _ = render(&fx.app, width, height);
         }
         // Narrow, short, and tiny terminals take compact paths.
         let tiny = render(&fx.app, 20, 2);
         assert!(tiny.contains("Terminal too small"));
         // Display modes each change the render.
+        let app = &mut fx.app;
         app.safe_only_filter = false;
         app.ghost_filter = GhostFilterMode::HideGhost;
         let _ = render(app, 100, 30);
