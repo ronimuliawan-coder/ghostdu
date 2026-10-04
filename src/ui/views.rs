@@ -2825,6 +2825,13 @@ mod render_sweep_tests {
                     is_reclaimable: false,
                     details: "running".to_string(),
                 },
+                DockerItemSummary {
+                    category: "Network",
+                    id_or_name: "n1".to_string(),
+                    size: 5,
+                    is_reclaimable: false,
+                    details: "custom".to_string(),
+                },
             ],
         }
     }
@@ -2909,6 +2916,24 @@ mod render_sweep_tests {
                 GhostKind::None,
                 DeleteSafety::System,
             ));
+            // Gradient sizes exercise every size-color band.
+            for (name, bytes) in [
+                ("huge.bin", 11 * 1024 * 1024 * 1024),
+                ("big.bin", 2 * 1024 * 1024 * 1024),
+                ("med.bin", 150 * 1024 * 1024),
+            ] {
+                fx.app.root_entry.children.push(FileEntry::new_file(
+                    name.to_string(),
+                    PathBuf::from(format!("/synth/{name}")),
+                    bytes,
+                    bytes,
+                    false,
+                    1,
+                    3000 + bytes,
+                    GhostKind::None,
+                    DeleteSafety::UserData,
+                ));
+            }
             // Render again unfiltered so every synthetic row is visible.
             fx.app.safe_only_filter = false;
             fx.app.search_query.clear();
@@ -2963,7 +2988,14 @@ mod render_sweep_tests {
         // Cursor deep past the list exercises scroll clamping.
         app.cursor_index = 10_000;
         let _ = render(app, 100, 30);
+        // Mid-list cursor with overflowing rows shows both-direction scroll.
+        app.cursor_index = 25;
+        let _ = render(app, 100, 30);
         app.cursor_index = 0;
+        // Empty visible table shows the zero-items indicator.
+        app.search_query = "zzz-no-match".to_string();
+        let _ = render(app, 100, 30);
+        app.search_query.clear();
         // Stale scroll offset above the cursor scrolls back into view.
         app.scroll_offset.set(10_000);
         let _ = render(app, 100, 30);
@@ -2999,6 +3031,9 @@ mod render_sweep_tests {
         app.ghost_cursor_index = 1;
         let out = render(app, 100, 30);
         assert!(out.contains("abc123"));
+        // Available daemon with zero items renders the empty table.
+        app.docker_info.items.clear();
+        let _ = render(app, 100, 30);
         // Deleted-open tab: empty, then fabricated rows.
         app.ghost_tab_index = 1;
         app.ghost_cursor_index = 0;
@@ -3015,6 +3050,21 @@ mod render_sweep_tests {
         let out = render(app, 100, 30);
         assert!(out.contains("testproc"));
         let _ = render(app, 40, 20);
+        // Many rows exercise scrolling and the scrollbar.
+        app.deleted_open_files = (0..30)
+            .map(|i| DeletedOpenFile {
+                pid: 2000 + i,
+                process_name: format!("proc{i}"),
+                original_path: format!("/tmp/gone{i}"),
+                size: 4096,
+                fd: "3".to_string(),
+                start_time: Some(999),
+            })
+            .collect();
+        app.ghost_cursor_index = 15;
+        let _ = render(app, 100, 30);
+        app.ghost_cursor_index = 29;
+        let _ = render(app, 100, 30);
     }
 
     #[test]
@@ -3148,8 +3198,7 @@ mod render_sweep_tests {
         let _ = render(app, 60, 12);
         app.cancel_modal();
         // Every safety tier and entry shape gets an info modal.
-        for name in ["sub", "link.txt", "hosts"] {
-            if let Some(index) = app
+        for name in ["sub", "link.txt", "hosts", "huge.bin", "k18"] {            if let Some(index) = app
                 .visible_children()
                 .iter()
                 .position(|e| e.name == name)
