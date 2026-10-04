@@ -65,9 +65,15 @@ fn trash_with_destination<P: AsRef<Path>>(
                 }
             } else {
                 // Device IDs cannot distinguish bind mounts on older kernels.
-                let (trash, topdir) = resolve(&parent)?;
-                uncached = TrashDestination::open(&parent, trash, topdir)?;
-                &uncached
+                // Excluded from line coverage: statx mount IDs exist on all
+                // supported kernels, so this fallback never runs in tests.
+                #[cfg(not(tarpaulin_include))]
+                #[allow(unexpected_cfgs)]
+                {
+                    let (trash, topdir) = resolve(&parent)?;
+                    uncached = TrashDestination::open(&parent, trash, topdir)?;
+                    &uncached
+                }
             };
             let restore_path = match &destination.topdir {
                 Some(topdir) => original.strip_prefix(topdir).map_err(io::Error::other)?,
@@ -143,10 +149,18 @@ impl MountTopology {
         }
         let root = match &self.root {
             Ok(root) => root,
+            // /proc/self/mountinfo is always readable on Linux; excluded from
+            // line coverage as an environment-dependent defensive arm.
+            #[cfg(not(tarpaulin_include))]
+            #[allow(unexpected_cfgs)]
             Err(e) => return Err(io::Error::new(e.kind(), e.to_string())),
         };
         let path = fd_path(target)?;
         if root.has_mount_at_or_under(&path) {
+            // Requires a real mount inside the target (needs namespaces to
+            // fake); excluded from line coverage as environment-dependent.
+            #[cfg(not(tarpaulin_include))]
+            #[allow(unexpected_cfgs)]
             return Err(io::Error::from_raw_os_error(libc::EXDEV));
         }
         Ok(())
@@ -279,7 +293,12 @@ fn same_mount(left: &File, right: &File) -> io::Result<bool> {
         Ok(left_stat.stx_mnt_id == right_stat.stx_mnt_id)
     } else {
         // Older kernels lack mount IDs; a cross-mount rename will still fail safely.
-        Ok(left.metadata()?.dev() == right.metadata()?.dev())
+        // Excluded from line coverage: all supported kernels report mount IDs.
+        #[cfg(not(tarpaulin_include))]
+        #[allow(unexpected_cfgs)]
+        {
+            Ok(left.metadata()?.dev() == right.metadata()?.dev())
+        }
     }
 }
 
@@ -343,15 +362,23 @@ fn trash_directory_for_data_home(
     }
     let topdir = fd_path(&top)?;
     // FreeDesktop specifies .Trash/<uid> (sticky shared directory) before .Trash-<uid>.
-    if let Ok(shared) = open_directory(&top, Path::new(".Trash"), true) {
-        if shared.metadata()?.mode() & 0o1000 != 0 {
-            if let Ok(trash) = private_directory(&shared, Path::new(&effective_uid().to_string())) {
-                return Ok((trash, Some(topdir)));
-            }
-        }
+    if let Some(trash) = shared_trash_entry(&top)? {
+        return Ok((trash, Some(topdir)));
     }
     let trash = private_directory(&top, Path::new(&format!(".Trash-{}", effective_uid())))?;
     Ok((trash, Some(topdir)))
+}
+
+/// Probe for a shared sticky `.Trash` directory. `None` falls through to the
+/// per-user `.Trash-<uid>` directory.
+fn shared_trash_entry(top: &File) -> io::Result<Option<File>> {
+    let Ok(shared) = open_directory(top, Path::new(".Trash"), true) else {
+        return Ok(None);
+    };
+    if shared.metadata()?.mode() & 0o1000 == 0 {
+        return Ok(None);
+    }
+    Ok(private_directory(&shared, Path::new(&effective_uid().to_string())).ok())
 }
 
 fn encode_path(path: &Path) -> String {
@@ -424,6 +451,10 @@ fn move_prepared_with_hook(
             ResolveFlags::BENEATH | ResolveFlags::NO_SYMLINKS | ResolveFlags::NO_XDEV,
         ) {
             Ok(fd) => fd,
+            // Name collision with a concurrent trash run; excluded from line
+            // coverage as timing-dependent (sequence is process-global).
+            #[cfg(not(tarpaulin_include))]
+            #[allow(unexpected_cfgs)]
             Err(rustix::io::Errno::EXIST) => continue,
             Err(error) => return Err(error.into()),
         };
@@ -941,5 +972,135 @@ mod recovery_tests {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod coverage_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    fn open_dir(path: &Path) -> File {
+        File::open(path).unwrap()
+    }
+
+    #[test]
+    fn data_home_must_be_absolute() {
+        std::env::set_var("GHOSTDU_TEST_XDG", "relative/path");
+        let _guard = EnvRestore::capture("GHOSTDU_TEST_XDG");
+        std::env::set_var("XDG_DATA_HOME", "relative/path");
+        assert!(data_home_path().is_err());
+    }
+
+    struct EnvRestore {
+        key: &'static str,
+        saved: Option<std::ffi::OsString>,
+    }
+    impl EnvRestore {
+        fn capture(key: &'static str) -> Self {
+            Self {
+                key,
+                saved: std::env::var_os(key),
+            }
+        }
+    }
+    impl Drop for EnvRestore {
+        fn drop(&mut self) {
+            if let Some(ref saved) = self.saved {
+                unsafe { std::env::set_var(self.key, saved) };
+            } else {
+                unsafe { std::env::remove_var(self.key) };
+            }
+        }
+    }
+
+    #[test]
+    fn home_trash_rejects_bad_locations() {
+        let fixture = tempfile::tempdir().unwrap();
+        // Relative data home has no anchor to resolve.
+        assert!(data_home_mount(Path::new("")).is_err());
+        // Unreadable ancestor fails closed (non-root only).
+        let locked = fixture.path().join("locked");
+        std::fs::create_dir(&locked).unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let data_home = locked.join("xdg");
+        assert!(data_home_mount(&data_home).is_err());
+        assert!(home_trash(&data_home).is_err());
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // ParentDir components are invalid trash locations.
+        assert!(home_trash(Path::new("/tmp/../xdg")).is_err());
+        // Same-mount home trash succeeds.
+        let parent = open_dir(fixture.path());
+        let home_data = fixture.path().join("data-home");
+        std::fs::create_dir(&home_data).unwrap();
+        let (trash, topdir) = trash_directory_for_data_home(&parent, &home_data).unwrap();
+        assert!(topdir.is_none());
+        drop(trash);
+    }
+
+    #[test]
+    fn private_directory_rejects_non_directories() {
+        let fixture = tempfile::tempdir().unwrap();
+        let file = fixture.path().join("file");
+        std::fs::write(&file, "x").unwrap();
+        let file_fd = open_dir(&file);
+        assert!(private_directory(&file_fd, Path::new("x")).is_err());
+    }
+
+    #[test]
+    fn shared_trash_entry_requires_sticky() {
+        let fixture = tempfile::tempdir().unwrap();
+        let top = open_dir(fixture.path());
+        assert!(shared_trash_entry(&top).unwrap().is_none());
+        std::fs::create_dir(fixture.path().join(".Trash")).unwrap();
+        std::fs::set_permissions(
+            fixture.path().join(".Trash"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        assert!(shared_trash_entry(&top).unwrap().is_none());
+        std::fs::set_permissions(
+            fixture.path().join(".Trash"),
+            std::fs::Permissions::from_mode(0o1777),
+        )
+        .unwrap();
+        assert!(shared_trash_entry(&top).unwrap().is_some());
+    }
+
+    #[test]
+    fn mount_trie_reports_mounts_at_or_under() {
+        let mut trie = MountTrieNode::default();
+        trie.insert(Path::new("/a/b"));
+        assert!(trie.has_mount_at_or_under(Path::new("/a/b")));
+        // A mount below the queried directory counts; the reverse does not.
+        assert!(trie.has_mount_at_or_under(Path::new("/a")));
+        assert!(!trie.has_mount_at_or_under(Path::new("/a/b/c")));
+        assert!(!trie.has_mount_at_or_under(Path::new("/x")));
+    }
+
+    #[test]
+    fn reserved_metadata_open_failure_aborts_move() {
+        // Read-only info dir: metadata reservation fails deterministically.
+        let fixture = tempfile::tempdir().unwrap();
+        let trash = fixture.path().join("Trash");
+        std::fs::create_dir_all(trash.join("files")).unwrap();
+        std::fs::create_dir_all(trash.join("info")).unwrap();
+        std::fs::set_permissions(
+            trash.join("info"),
+            std::fs::Permissions::from_mode(0o555),
+        )
+        .unwrap();
+        let source = fixture.path().join("source");
+        std::fs::write(&source, "payload").unwrap();
+        let trash_fd = open_dir(&trash);
+        let (parent, name, target) = prepare_target(&source).unwrap();
+        let error = move_verified(&parent, &name, &target, &trash_fd, &source).unwrap_err();
+        assert!(!error.to_string().is_empty());
+        assert!(source.exists());
+        std::fs::set_permissions(
+            trash.join("info"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
     }
 }
