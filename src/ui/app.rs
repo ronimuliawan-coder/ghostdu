@@ -980,7 +980,12 @@ impl App {
             .collect();
         let mut files = Vec::with_capacity(winners.len().min(TOP_FILES_LIMIT));
         collect_winners(root, &winners, &mut files);
-        files.sort_by_key(|f| std::cmp::Reverse(f.disk_usage));
+        // Total order: deterministic across runs and filesystems even on ties.
+        files.sort_by(|a, b| {
+            b.disk_usage
+                .cmp(&a.disk_usage)
+                .then_with(|| a.path.cmp(&b.path))
+        });
         files
     }
 
@@ -2080,8 +2085,13 @@ mod reconciliation_tests {
         assert_eq!(app.active_view, ActiveView::TopFiles);
         assert_eq!(app.top_files.len(), 3);
         assert_eq!(app.top_files[0].name, "big.txt");
-        // Jump lands the explorer cursor on the file's parent entry.
-        app.top_cursor = 1;
+        // Jump lands the explorer cursor on the file's parent entry. Look the
+        // row up by name: small block counts can tie across filesystems.
+        app.top_cursor = app
+            .top_files
+            .iter()
+            .position(|f| f.name == "mid.txt")
+            .unwrap();
         assert!(app.jump_to_top_file());
         assert_eq!(app.active_view, ActiveView::Filesystem);
         let visible = app.visible_children();
