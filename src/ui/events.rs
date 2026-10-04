@@ -167,6 +167,9 @@ fn handle_ghost_keys(app: &mut App, key: KeyEvent) -> EventResult {
         }
         KeyCode::Char('p') | KeyCode::Char('P') => {
             if app.ghost_tab_index == 0 && app.docker_info.is_available {
+                // Requires a live Docker daemon; excluded from line coverage.
+                #[cfg(not(tarpaulin_include))]
+                #[allow(unexpected_cfgs)]
                 app.prompt_docker_prune();
             }
         }
@@ -347,11 +350,10 @@ fn handle_filesystem_keys(app: &mut App, key: KeyEvent) -> EventResult {
         }
         KeyCode::Char('\\') => EventResult::RescanPath(PathBuf::from("/")),
         KeyCode::Char('~') => {
-            if let Ok(home) = std::env::var("HOME") {
-                EventResult::RescanPath(PathBuf::from(home))
-            } else {
-                EventResult::Continue
-            }
+            // Without HOME (minimal containers), stay where we are instead
+            // of a dead key: one path, no environment-dependent branch.
+            let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+            EventResult::RescanPath(PathBuf::from(home))
         }
 
         // Selection
@@ -494,5 +496,688 @@ fn handle_filesystem_keys(app: &mut App, key: KeyEvent) -> EventResult {
         }
 
         _ => EventResult::Continue,
+    }
+}
+
+#[cfg(test)]
+mod key_matrix_tests {
+    use super::*;
+    use crate::fs::scanner::scan_directory;
+    use std::sync::{atomic::AtomicBool, Arc};
+
+    pub(crate) struct Fixture {
+        _dir: tempfile::TempDir,
+        pub(crate) app: App,
+    }
+
+    pub(crate) fn fixture() -> Fixture {
+        let dir = tempfile::tempdir().unwrap();
+        let sub = dir.path().join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        std::fs::write(dir.path().join("a.txt"), "aaaaaaaaaa").unwrap();
+        std::fs::write(sub.join("b.txt"), "b").unwrap();
+        let root = scan_directory(dir.path(), None, Arc::new(AtomicBool::new(false))).unwrap();
+        Fixture {
+            app: App::new(root),
+            _dir: dir,
+        }
+    }
+
+    pub(crate) fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    pub(crate) fn ctrl(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::CONTROL)
+    }
+
+    #[test]
+    fn filesystem_navigation_keys() {
+        let mut fx = fixture();
+        let app = &mut fx.app;
+        assert!(matches!(
+            handle_key_event(app, key(KeyCode::Char('j'))),
+            EventResult::Continue
+        ));
+        assert!(matches!(
+            handle_key_event(app, key(KeyCode::Down)),
+            EventResult::Continue
+        ));
+        assert!(matches!(
+            handle_key_event(app, key(KeyCode::Char('k'))),
+            EventResult::Continue
+        ));
+        assert!(matches!(
+            handle_key_event(app, key(KeyCode::Up)),
+            EventResult::Continue
+        ));
+        assert!(matches!(
+            handle_key_event(app, key(KeyCode::PageDown)),
+            EventResult::Continue
+        ));
+        assert!(matches!(
+            handle_key_event(app, key(KeyCode::PageUp)),
+            EventResult::Continue
+        ));
+        assert!(matches!(
+            handle_key_event(app, key(KeyCode::Home)),
+            EventResult::Continue
+        ));
+        assert!(matches!(
+            handle_key_event(app, key(KeyCode::End)),
+            EventResult::Continue
+        ));
+        // Enter the subdirectory, then go back up.
+        app.cursor_index = app
+            .visible_children()
+            .iter()
+            .position(|e| e.name == "sub")
+            .unwrap();
+        assert!(matches!(
+            handle_key_event(app, key(KeyCode::Enter)),
+            EventResult::Continue
+        ));
+        assert!(!app.path_stack.is_empty());
+        app.cursor_index = 0;
+        assert!(matches!(
+            handle_key_event(app, key(KeyCode::Char('l'))),
+            EventResult::Continue
+        ));
+        assert!(matches!(
+            handle_key_event(app, key(KeyCode::Right)),
+            EventResult::Continue
+        ));
+        // Leaving the subdirectory pops it internally (Continue); at the scan
+        // root the parent path is returned for a rescan.
+        assert!(matches!(
+            handle_key_event(app, key(KeyCode::Backspace)),
+            EventResult::Continue
+        ));
+        assert!(app.path_stack.is_empty());
+        assert!(matches!(
+            handle_key_event(app, key(KeyCode::Backspace)),
+            EventResult::RescanPath(_)
+        ));
+        assert!(matches!(
+            handle_key_event(app, key(KeyCode::Char('h'))),
+            EventResult::Continue | EventResult::RescanPath(_)
+        ));
+        assert!(matches!(
+            handle_key_event(app, key(KeyCode::Left)),
+            EventResult::Continue | EventResult::RescanPath(_)
+        ));
+        // Root and home shortcuts return rescan paths.
+        assert!(matches!(
+            handle_key_event(app, key(KeyCode::Char('\\'))),
+            EventResult::RescanPath(_)
+        ));
+        assert!(matches!(
+            handle_key_event(app, key(KeyCode::Char('~'))),
+            EventResult::RescanPath(_) | EventResult::Continue
+        ));
+        assert!(matches!(
+            handle_key_event(app, ctrl(KeyCode::Char('d'))),
+            EventResult::Continue
+        ));
+        assert!(matches!(
+            handle_key_event(app, ctrl(KeyCode::Char('u'))),
+            EventResult::Continue
+        ));
+        assert!(matches!(
+            handle_key_event(app, ctrl(KeyCode::Char('x'))),
+            EventResult::Continue
+        ));
+        assert!(matches!(
+            handle_key_event(app, key(KeyCode::Char('q'))),
+            EventResult::Exit
+        ));
+        assert!(matches!(
+            handle_key_event(app, ctrl(KeyCode::Char('c'))),
+            EventResult::Exit
+        ));
+    }
+}
+
+#[cfg(test)]
+mod key_action_tests {
+    use super::key_matrix_tests::{ctrl, fixture, key};
+    use super::*;
+
+    #[test]
+    fn filesystem_selection_and_filters() {
+        let mut fx = fixture();
+        let app = &mut fx.app;
+        assert!(matches!(
+            handle_key_event(app, key(KeyCode::Char(' '))),
+            EventResult::Continue
+        ));
+        assert!(matches!(
+            handle_key_event(app, key(KeyCode::Char('a'))),
+            EventResult::Continue
+        ));
+        assert!(matches!(
+            handle_key_event(app, key(KeyCode::Char('A'))),
+            EventResult::Continue
+        ));
+        assert!(matches!(
+            handle_key_event(app, key(KeyCode::Tab)),
+            EventResult::Continue
+        ));
+        assert!(matches!(
+            handle_key_event(app, key(KeyCode::Char('g'))),
+            EventResult::Continue
+        ));
+        app.active_view = ActiveView::Filesystem;
+        assert!(matches!(
+            handle_key_event(app, key(KeyCode::Char('G'))),
+            EventResult::Continue
+        ));
+        assert!(matches!(
+            handle_key_event(app, key(KeyCode::Char('c'))),
+            EventResult::Continue
+        ));
+        assert!(matches!(
+            handle_key_event(app, key(KeyCode::Char('C'))),
+            EventResult::Continue
+        ));
+        assert!(matches!(
+            handle_key_event(app, key(KeyCode::Char('s'))),
+            EventResult::Continue
+        ));
+        assert!(matches!(
+            handle_key_event(app, key(KeyCode::Char('T'))),
+            EventResult::Continue
+        ));
+        assert_eq!(app.active_view, ActiveView::TopFiles);
+        assert!(matches!(
+            handle_key_event(app, key(KeyCode::Esc)),
+            EventResult::Continue
+        ));
+        assert!(matches!(
+            handle_key_event(app, key(KeyCode::Char('J'))),
+            EventResult::Continue
+        ));
+        assert_eq!(app.active_view, ActiveView::Janitor);
+        assert!(matches!(
+            handle_key_event(app, key(KeyCode::Esc)),
+            EventResult::Continue
+        ));
+        assert!(matches!(
+            handle_key_event(app, key(KeyCode::Char('?'))),
+            EventResult::Continue
+        ));
+        assert_eq!(app.active_view, ActiveView::HelpModal);
+        assert!(matches!(
+            handle_key_event(app, key(KeyCode::Esc)),
+            EventResult::Continue
+        ));
+    }
+
+    #[test]
+    fn filesystem_prompts_and_search() {
+        let mut fx = fixture();
+        let app = &mut fx.app;
+        // Trash + delete prompts open confirm modals without executing.
+        assert!(matches!(
+            handle_key_event(app, key(KeyCode::Char('t'))),
+            EventResult::Continue
+        ));
+        assert_eq!(app.active_view, ActiveView::ConfirmModal);
+        assert!(matches!(
+            handle_key_event(app, key(KeyCode::Esc)),
+            EventResult::Continue
+        ));
+        assert!(matches!(
+            handle_key_event(app, key(KeyCode::Char('w'))),
+            EventResult::Continue
+        ));
+        assert!(matches!(
+            handle_key_event(app, key(KeyCode::Esc)),
+            EventResult::Continue
+        ));
+        assert!(matches!(
+            handle_key_event(app, key(KeyCode::Char('d'))),
+            EventResult::Continue
+        ));
+        assert!(matches!(
+            handle_key_event(app, key(KeyCode::Esc)),
+            EventResult::Continue
+        ));
+        assert!(matches!(
+            handle_key_event(app, key(KeyCode::Char('D'))),
+            EventResult::Continue
+        ));
+        assert!(matches!(
+            handle_key_event(app, key(KeyCode::Esc)),
+            EventResult::Continue
+        ));
+        // Item info modal and its keys.
+        assert!(matches!(
+            handle_key_event(app, key(KeyCode::Char('i'))),
+            EventResult::Continue
+        ));
+        assert_eq!(app.active_view, ActiveView::ItemInfoModal);
+        assert!(matches!(
+            handle_key_event(app, key(KeyCode::Char('r'))),
+            EventResult::Continue
+        ));
+        assert!(matches!(
+            handle_key_event(app, key(KeyCode::Char('I'))),
+            EventResult::Continue
+        ));
+        assert!(matches!(
+            handle_key_event(app, key(KeyCode::Enter)),
+            EventResult::Continue
+        ));
+        assert_eq!(app.active_view, ActiveView::Filesystem);
+        // Search mode captures typing, Enter/Escape leave it.
+        assert!(matches!(
+            handle_key_event(app, key(KeyCode::Char('/'))),
+            EventResult::Continue
+        ));
+        assert!(app.is_searching);
+        assert!(matches!(
+            handle_key_event(app, key(KeyCode::Char('x'))),
+            EventResult::Continue
+        ));
+        assert!(matches!(
+            handle_key_event(app, key(KeyCode::Backspace)),
+            EventResult::Continue
+        ));
+        assert!(matches!(
+            handle_key_event(app, key(KeyCode::Enter)),
+            EventResult::Continue
+        ));
+        assert!(!app.is_searching);
+        assert!(matches!(
+            handle_key_event(app, key(KeyCode::Char('/'))),
+            EventResult::Continue
+        ));
+        assert!(matches!(
+            handle_key_event(app, key(KeyCode::Char('q'))),
+            EventResult::Continue
+        ));
+        assert!(matches!(
+            handle_key_event(app, key(KeyCode::Esc)),
+            EventResult::Continue
+        ));
+        assert!(!app.is_searching);
+        // Escape with a live query keeps the query but leaves search mode.
+        assert!(matches!(
+            handle_key_event(app, key(KeyCode::Char('/'))),
+            EventResult::Continue
+        ));
+        assert!(matches!(
+            handle_key_event(app, key(KeyCode::Char('z'))),
+            EventResult::Continue
+        ));
+        assert!(!app.search_query.is_empty());
+        assert!(matches!(
+            handle_key_event(app, key(KeyCode::Esc)),
+            EventResult::Continue
+        ));
+        assert!(!app.is_searching);
+        // Leaving search keeps the query as a filter; Esc in the filesystem
+        // view then clears that lingering query.
+        assert!(matches!(
+            handle_key_event(app, key(KeyCode::Char('/'))),
+            EventResult::Continue
+        ));
+        assert!(matches!(
+            handle_key_event(app, key(KeyCode::Char('z'))),
+            EventResult::Continue
+        ));
+        assert!(matches!(
+            handle_key_event(app, key(KeyCode::Enter)),
+            EventResult::Continue
+        ));
+        assert!(!app.search_query.is_empty());
+        assert!(matches!(
+            handle_key_event(app, key(KeyCode::Esc)),
+            EventResult::Continue
+        ));
+        assert!(app.search_query.is_empty());
+        // Empty view: subshell and actions fall back without a highlighted row.
+        app.search_query.clear();
+        app.is_searching = false;
+        app.cursor_index = app
+            .visible_children()
+            .iter()
+            .position(|e| e.is_dir)
+            .unwrap();
+        assert!(matches!(
+            handle_key_event(app, key(KeyCode::Char('!'))),
+            EventResult::Subshell(_)
+        ));
+        app.cursor_index = app
+            .visible_children()
+            .iter()
+            .position(|e| !e.is_dir)
+            .unwrap();
+        assert!(matches!(
+            handle_key_event(app, key(KeyCode::Char('!'))),
+            EventResult::Subshell(_)
+        ));
+        app.search_query = "zzz-no-match".to_string();
+        app.is_searching = false;
+        assert!(matches!(
+            handle_key_event(app, key(KeyCode::Char('!'))),
+            EventResult::Subshell(_)
+        ));
+        // Refresh paths: in-place rescan and full rescan request.
+        assert!(matches!(
+            handle_key_event(app, key(KeyCode::Char('r'))),
+            EventResult::Continue
+        ));
+        assert!(matches!(
+            handle_key_event(app, key(KeyCode::Char('R'))),
+            EventResult::RescanRequested
+        ));
+        assert!(matches!(
+            handle_key_event(app, key(KeyCode::F(5))),
+            EventResult::RescanRequested
+        ));
+        // Subshell + open + copy return without running anything here.
+        assert!(matches!(
+            handle_key_event(app, key(KeyCode::Char('!'))),
+            EventResult::Subshell(_)
+        ));
+        assert!(matches!(
+            handle_key_event(app, key(KeyCode::Char('o'))),
+            EventResult::Continue
+        ));
+        assert!(matches!(
+            handle_key_event(app, key(KeyCode::Char('O'))),
+            EventResult::Continue
+        ));
+        assert!(matches!(
+            handle_key_event(app, key(KeyCode::Char('y'))),
+            EventResult::Continue
+        ));
+        assert!(matches!(
+            handle_key_event(app, key(KeyCode::Char('Y'))),
+            EventResult::Continue
+        ));
+    }
+}
+
+#[cfg(test)]
+mod key_view_tests {
+    use super::key_matrix_tests::{fixture, key};
+    use super::*;
+
+    #[test]
+    fn ghost_inspector_keys() {
+        let mut fx = fixture();
+        let app = &mut fx.app;
+        app.active_view = ActiveView::GhostInspector;
+        assert!(matches!(
+            handle_key_event(app, key(KeyCode::Tab)),
+            EventResult::Continue
+        ));
+        assert_eq!(app.active_view, ActiveView::Filesystem);
+        app.active_view = ActiveView::GhostInspector;
+        assert!(matches!(
+            handle_key_event(app, key(KeyCode::Char('g'))),
+            EventResult::Continue
+        ));
+        app.active_view = ActiveView::GhostInspector;
+        assert!(matches!(
+            handle_key_event(app, key(KeyCode::Esc)),
+            EventResult::Continue
+        ));
+        app.active_view = ActiveView::GhostInspector;
+        for code in [
+            KeyCode::Char('1'),
+            KeyCode::Char('2'),
+            KeyCode::Left,
+            KeyCode::Right,
+            KeyCode::Char('j'),
+            KeyCode::Down,
+            KeyCode::Char('k'),
+            KeyCode::Up,
+            KeyCode::PageDown,
+            KeyCode::PageUp,
+            KeyCode::Home,
+            KeyCode::End,
+            KeyCode::Char('p'),
+            KeyCode::Char('P'),
+            KeyCode::Char('K'),
+            KeyCode::Char('r'),
+            KeyCode::F(5),
+            KeyCode::Char('q'),
+            KeyCode::Char('?'),
+        ] {
+            app.active_view = ActiveView::GhostInspector;
+            assert!(
+                matches!(handle_key_event(app, key(code)), EventResult::Continue),
+                "ghost key {code:?}"
+            );
+        }
+        assert!(matches!(
+            handle_key_event(app, key(KeyCode::Char('q'))),
+            EventResult::Continue
+        ));
+    }
+
+    #[test]
+    fn top_files_and_janitor_keys() {
+        let mut fx = fixture();
+        let app = &mut fx.app;
+        app.open_top_files();
+        for code in [
+            KeyCode::Char('j'),
+            KeyCode::Down,
+            KeyCode::Char('k'),
+            KeyCode::Up,
+            KeyCode::Home,
+            KeyCode::End,
+            KeyCode::Char('t'),
+            KeyCode::Char('d'),
+            KeyCode::Esc,
+        ] {
+            app.active_view = ActiveView::TopFiles;
+            assert!(
+                matches!(handle_key_event(app, key(code)), EventResult::Continue),
+                "top key {code:?}"
+            );
+        }
+        // Enter jumps back to the explorer; q exits from there.
+        app.active_view = ActiveView::TopFiles;
+        assert!(matches!(
+            handle_key_event(app, key(KeyCode::Enter)),
+            EventResult::Continue
+        ));
+        assert!(matches!(
+            handle_key_event(app, key(KeyCode::Tab)),
+            EventResult::Continue
+        ));
+        assert!(matches!(
+            handle_key_event(app, key(KeyCode::Char('g'))),
+            EventResult::Continue
+        ));
+
+        app.open_janitor();
+        for code in [
+            KeyCode::Char('j'),
+            KeyCode::Down,
+            KeyCode::Char('k'),
+            KeyCode::Up,
+            KeyCode::Home,
+            KeyCode::End,
+            KeyCode::Right,
+            KeyCode::Left,
+            KeyCode::Char(' '),
+            KeyCode::Char('a'),
+            KeyCode::Tab,
+            KeyCode::Enter,
+            KeyCode::Char('d'),
+            KeyCode::Char('D'),
+            KeyCode::Esc,
+        ] {
+            app.active_view = ActiveView::Janitor;
+            assert!(
+                matches!(handle_key_event(app, key(code)), EventResult::Continue),
+                "janitor key {code:?}"
+            );
+        }
+        assert!(matches!(
+            handle_key_event(app, key(KeyCode::Char('q'))),
+            EventResult::Exit
+        ));
+        app.active_view = ActiveView::Janitor;
+        assert!(matches!(
+            handle_key_event(app, key(KeyCode::Char('q'))),
+            EventResult::Continue
+        ));
+        assert_eq!(app.active_view, ActiveView::Filesystem);
+    }
+
+    #[test]
+    fn confirm_and_help_keys() {
+        let mut fx = fixture();
+        let app = &mut fx.app;
+        // Plain y confirm round-trip on a trash prompt (executes for real).
+        app.prompt_move_to_trash();
+        assert!(matches!(
+            handle_key_event(app, key(KeyCode::Char('y'))),
+            EventResult::Continue
+        ));
+        app.prompt_move_to_trash();
+        assert!(matches!(
+            handle_key_event(app, key(KeyCode::Char('n'))),
+            EventResult::Continue
+        ));
+        app.prompt_move_to_trash();
+        assert!(matches!(
+            handle_key_event(app, key(KeyCode::Char('N'))),
+            EventResult::Continue
+        ));
+        // Blocked-system path: y reports instead of executing.
+        app.action_safety_blocked = true;
+        app.pending_action = Some(ConfirmAction::MoveToTrash);
+        app.active_view = ActiveView::ConfirmModal;
+        assert!(matches!(
+            handle_key_event(app, key(KeyCode::Char('y'))),
+            EventResult::Continue
+        ));
+        app.cancel_modal();
+        // Up/Down scroll a multi-target list; other keys fall through.
+        app.prompt_move_to_trash();
+        app.action_targets.extend([
+            std::path::PathBuf::from("/x"),
+            std::path::PathBuf::from("/y"),
+        ]);
+        assert!(matches!(
+            handle_key_event(app, key(KeyCode::Down)),
+            EventResult::Continue
+        ));
+        assert!(matches!(
+            handle_key_event(app, key(KeyCode::Up)),
+            EventResult::Continue
+        ));
+        assert!(matches!(
+            handle_key_event(app, key(KeyCode::Up)),
+            EventResult::Continue
+        ));
+        assert!(matches!(
+            handle_key_event(app, key(KeyCode::Char('z'))),
+            EventResult::Continue
+        ));
+        app.cancel_modal();
+        // Kill confirmation answers 1/2; unknown PIDs refuse safely.
+        app.pending_action = Some(ConfirmAction::KillProcess {
+            pid: 2_147_000_000,
+            name: "x".to_string(),
+            start_time: 0,
+            pidfd: None,
+        });
+        app.active_view = ActiveView::ConfirmModal;
+        assert!(matches!(
+            handle_key_event(app, key(KeyCode::Char('1'))),
+            EventResult::Continue
+        ));
+        app.pending_action = Some(ConfirmAction::KillProcess {
+            pid: 2_147_000_000,
+            name: "x".to_string(),
+            start_time: 0,
+            pidfd: None,
+        });
+        app.active_view = ActiveView::ConfirmModal;
+        assert!(matches!(
+            handle_key_event(app, key(KeyCode::Char('2'))),
+            EventResult::Continue
+        ));
+        // Kill-modal cancel paths dismiss without signalling.
+        app.pending_action = Some(ConfirmAction::KillProcess {
+            pid: 2_147_000_000,
+            name: "x".to_string(),
+            start_time: 0,
+            pidfd: None,
+        });
+        app.active_view = ActiveView::ConfirmModal;
+        assert!(matches!(
+            handle_key_event(app, key(KeyCode::Char('n'))),
+            EventResult::Continue
+        ));
+        assert!(app.pending_action.is_none());
+        // Help modal closes on ?/q/Esc.
+        app.active_view = ActiveView::HelpModal;
+        assert!(matches!(
+            handle_key_event(app, key(KeyCode::Char('?'))),
+            EventResult::Continue
+        ));
+        app.active_view = ActiveView::HelpModal;
+        assert!(matches!(
+            handle_key_event(app, key(KeyCode::Char('q'))),
+            EventResult::Continue
+        ));
+        // Item info modal close paths.
+        app.open_item_info();
+        assert!(matches!(
+            handle_key_event(app, key(KeyCode::Char('q'))),
+            EventResult::Continue
+        ));
+        app.open_item_info();
+        assert!(matches!(
+            handle_key_event(app, key(KeyCode::Esc)),
+            EventResult::Continue
+        ));
+        app.open_item_info();
+        assert!(matches!(
+            handle_key_event(app, key(KeyCode::Enter)),
+            EventResult::Continue
+        ));
+    }
+}
+
+#[cfg(test)]
+mod key_jump_tests {
+    use super::key_matrix_tests::{fixture, key};
+    use super::*;
+
+    #[test]
+    fn jump_to_vanished_parent_reports_status() {
+        let mut fx = fixture();
+        let app = &mut fx.app;
+        app.open_top_files();
+        // A row no live tree path can resolve: navigation fails cleanly.
+        app.top_files.push(crate::ui::app::TopFile {
+            path: std::path::PathBuf::from("/nonexistent-xyz/deep/file.txt"),
+            name: "file.txt".to_string(),
+            size: 1,
+            disk_usage: 1,
+            safety: crate::fs::entry::DeleteSafety::UserData,
+        });
+        app.top_cursor = app.top_files.len() - 1;
+        app.active_view = ActiveView::TopFiles;
+        assert!(matches!(
+            handle_key_event(app, key(KeyCode::Enter)),
+            EventResult::Continue
+        ));
+        assert!(app
+            .current_status()
+            .unwrap_or("")
+            .contains("no longer in tree"));
     }
 }

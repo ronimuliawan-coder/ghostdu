@@ -1320,3 +1320,102 @@ fn replacement_between_scan_and_confirmation_or_selection_is_rejected() {
         .unwrap()
         .contains("Target changed since scan"));
 }
+
+/// PATH-controlled desktop/clipboard tests. This binary is its own process, so
+/// mutating PATH here cannot affect siblings or the lib test binary.
+mod desktop_handoff_tests {
+    use ghostdu::ui::{handle_key_event, ActiveView, App, EventResult};
+    use std::os::unix::fs::PermissionsExt;
+
+    fn test_app() -> (tempfile::TempDir, App) {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "x").unwrap();
+        let root = ghostdu::fs::scan_directory(
+            dir.path(),
+            None,
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        )
+        .unwrap();
+        let app = App::new(root);
+        (dir, app)
+    }
+
+    fn key(code: crossterm::event::KeyCode) -> crossterm::event::KeyEvent {
+        crossterm::event::KeyEvent::new(code, crossterm::event::KeyModifiers::NONE)
+    }
+
+    fn fake_tool(dir: &std::path::Path, name: &str) {
+        // Consume stdin like a real clipboard tool: a bare `exit 0` can win
+        // the race against our write (especially under ptrace), breaking the
+        // pipe deterministically. Pure shell builtins only: the test PATH
+        // contains nothing else.
+        let path = dir.join(name);
+        std::fs::write(
+            &path,
+            "#!/bin/sh\nwhile IFS= read -r line; do :; done\nexit 0\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    struct SavedPath(Option<std::ffi::OsString>);
+    impl SavedPath {
+        fn set(new: &std::path::Path) -> Self {
+            let saved = std::env::var_os("PATH");
+            // SAFETY: integration binary is single-purpose here; restored on drop.
+            unsafe { std::env::set_var("PATH", new) };
+            SavedPath(saved)
+        }
+        fn empty() -> Self {
+            Self::set(std::path::Path::new("/nonexistent-xyz"))
+        }
+    }
+    impl Drop for SavedPath {
+        fn drop(&mut self) {
+            if let Some(ref saved) = self.0 {
+                // SAFETY: restoring the exact previous value.
+                unsafe { std::env::set_var("PATH", saved) };
+            }
+        }
+    }
+
+    #[test]
+    fn open_and_copy_both_arms() {
+        let (_dir, mut app) = test_app();
+        let tools = tempfile::tempdir().unwrap();
+        fake_tool(tools.path(), "xdg-open");
+        fake_tool(tools.path(), "wl-copy");
+        {
+            let _path = SavedPath::set(tools.path());
+            assert!(matches!(
+                handle_key_event(&mut app, key(crossterm::event::KeyCode::Char('o'))),
+                EventResult::Continue
+            ));
+            assert!(app.current_status().unwrap_or("").contains("Opened"));
+            // Give the reaper thread a moment; no zombie may remain.
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            assert!(matches!(
+                handle_key_event(&mut app, key(crossterm::event::KeyCode::Char('y'))),
+                EventResult::Continue
+            ));
+            assert!(app.current_status().unwrap_or("").contains("Copied"));
+        }
+        {
+            let _path = SavedPath::empty();
+            assert!(matches!(
+                handle_key_event(&mut app, key(crossterm::event::KeyCode::Char('o'))),
+                EventResult::Continue
+            ));
+            assert!(app.current_status().unwrap_or("").contains("Cannot open"));
+            assert!(matches!(
+                handle_key_event(&mut app, key(crossterm::event::KeyCode::Char('y'))),
+                EventResult::Continue
+            ));
+            assert!(app
+                .current_status()
+                .unwrap_or("")
+                .contains("No clipboard tool"));
+        }
+        assert_eq!(app.active_view, ActiveView::Filesystem);
+    }
+}
