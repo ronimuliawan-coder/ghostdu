@@ -2328,7 +2328,7 @@ mod reconciliation_tests {
         let init_uid = std::fs::metadata("/proc/1")
             .map(|meta| std::os::unix::fs::MetadataExt::uid(&meta))
             .ok();
-        if euid != 0 && init_uid != Some(euid) {
+        if euid != 0 && init_uid.is_some_and(|uid| uid != euid) {
             let init_start = crate::ghost::proc_start_time(1).expect("init has stat");
             let init_fd = rustix::process::Pid::from_raw(1)
                 .and_then(|t| {
