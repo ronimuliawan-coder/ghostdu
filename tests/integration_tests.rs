@@ -802,6 +802,20 @@ fn test_export_envelope_carries_version() {
 }
 
 #[test]
+fn test_export_envelope_rejects_unknown_version() {
+    let temp_dir = tempfile::tempdir().expect("create temp dir");
+    fs::write(temp_dir.path().join("a.txt"), "x").unwrap();
+    let stop_signal = Arc::new(AtomicBool::new(false));
+    let root = ghostdu_scanner::scan_directory(temp_dir.path(), None, stop_signal).unwrap();
+    let mut envelope = ghostdu::fs::ExportEnvelope::wrap(root);
+    envelope.format_version += 1;
+    let error = envelope.check_format_version().unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("Unsupported export format version"));
+}
+
+#[test]
 fn test_reclaimable_precomputed_aggregates_o1() {
     let temp_dir = tempfile::tempdir().expect("create temp dir");
     let base = temp_dir.path();

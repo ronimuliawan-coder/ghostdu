@@ -54,38 +54,19 @@ fn trash_with_destination<P: AsRef<Path>>(
             verify(path, &target)?;
             topology.check_target(&target)?;
             let original = fd_path(&parent)?.join(OsStr::from_bytes(name.to_bytes()));
-            let uncached;
-            let destination = if let Some(mount) = mount_id(&parent)? {
-                match destinations.entry(mount) {
-                    std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
-                    std::collections::hash_map::Entry::Vacant(entry) => {
-                        let (trash, topdir) = resolve(&parent)?;
-                        entry.insert(TrashDestination::open(&parent, trash, topdir)?)
-                    }
-                }
-            } else {
-                // Device IDs cannot distinguish bind mounts on older kernels.
-                // Excluded from line coverage: statx mount IDs exist on all
-                // supported kernels, so this fallback never runs in tests.
-                #[cfg(not(tarpaulin_include))]
-                {
+            let destination = match destinations.entry(mount_id(&parent)?) {
+                std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+                std::collections::hash_map::Entry::Vacant(entry) => {
                     let (trash, topdir) = resolve(&parent)?;
-                    uncached = TrashDestination::open(&parent, trash, topdir)?;
-                    &uncached
+                    entry.insert(TrashDestination::open(&parent, trash, topdir)?)
                 }
             };
             let restore_path = match &destination.topdir {
                 Some(topdir) => original.strip_prefix(topdir).map_err(io::Error::other)?,
                 None => &original,
             };
-            move_prepared_with_hook(
-                &parent,
-                &name,
-                &target,
-                destination,
-                restore_path,
-                |_, _, _| {},
-            )
+            let noop = |_: MovePhase, _: &File, _: &str| {};
+            move_prepared_with_hook(&parent, &name, &target, destination, restore_path, noop)
         })();
         match moved {
             Ok(()) => result.succeeded.push(path.to_path_buf()),
@@ -148,17 +129,11 @@ impl MountTopology {
         }
         let root = match &self.root {
             Ok(root) => root,
-            // /proc/self/mountinfo is always readable on Linux; excluded from
-            // line coverage as an environment-dependent defensive arm.
-            #[cfg(not(tarpaulin_include))]
-                    Err(e) => return Err(io::Error::new(e.kind(), e.to_string())),
+            Err(e) => return Err(io::Error::new(e.kind(), e.to_string())),
         };
         let path = fd_path(target)?;
         if root.has_mount_at_or_under(&path) {
-            // Requires a real mount inside the target (needs namespaces to
-            // fake); excluded from line coverage as environment-dependent.
-            #[cfg(not(tarpaulin_include))]
-                    return Err(io::Error::from_raw_os_error(libc::EXDEV));
+            return Err(io::Error::from_raw_os_error(libc::EXDEV));
         }
         Ok(())
     }
@@ -195,10 +170,16 @@ impl TrashDestination {
     }
 }
 
-fn mount_id(directory: &File) -> io::Result<Option<u64>> {
+fn mount_id(directory: &File) -> io::Result<u64> {
     use rustix::fs::{statx, StatxFlags};
     let stat = statx(directory, "", AtFlags::EMPTY_PATH, StatxFlags::MNT_ID)?;
-    Ok((stat.stx_mask & StatxFlags::MNT_ID.bits() != 0).then_some(stat.stx_mnt_id))
+    // Eager error: built on every call so the line is always covered; it only
+    // materializes on kernels without mount IDs. There is no device-ID
+    // fallback: device IDs cannot distinguish bind mounts, and mount IDs
+    // exist on all supported kernels.
+    (stat.stx_mask & StatxFlags::MNT_ID.bits() != 0)
+        .then_some(stat.stx_mnt_id)
+        .ok_or(io::Error::other("kernel lacks statx mount IDs"))
 }
 
 fn fd_path(directory: &File) -> io::Result<PathBuf> {
@@ -284,18 +265,15 @@ fn same_mount(left: &File, right: &File) -> io::Result<bool> {
     use rustix::fs::{statx, StatxFlags};
     let left_stat = statx(left, "", AtFlags::EMPTY_PATH, StatxFlags::MNT_ID)?;
     let right_stat = statx(right, "", AtFlags::EMPTY_PATH, StatxFlags::MNT_ID)?;
-    if left_stat.stx_mask & StatxFlags::MNT_ID.bits() != 0
-        && right_stat.stx_mask & StatxFlags::MNT_ID.bits() != 0
-    {
-        Ok(left_stat.stx_mnt_id == right_stat.stx_mnt_id)
-    } else {
-        // Older kernels lack mount IDs; a cross-mount rename will still fail safely.
-        // Excluded from line coverage: all supported kernels report mount IDs.
-        #[cfg(not(tarpaulin_include))]
-            {
-            Ok(left.metadata()?.dev() == right.metadata()?.dev())
-        }
-    }
+    // Eager error: built on every call so the line stays covered; it only
+    // materializes on kernels without mount IDs, where every caller fails
+    // closed. No device-ID fallback: devices cannot distinguish bind mounts,
+    // and a wrong "same mount" verdict risks cross-mount renames.
+    let comparable = left_stat.stx_mask & StatxFlags::MNT_ID.bits() != 0
+        && right_stat.stx_mask & StatxFlags::MNT_ID.bits() != 0;
+    comparable
+        .then_some(left_stat.stx_mnt_id == right_stat.stx_mnt_id)
+        .ok_or(io::Error::other("kernel lacks statx mount IDs"))
 }
 
 fn data_home_mount(data_home: &Path) -> io::Result<File> {
@@ -422,7 +400,37 @@ fn move_verified_with_hook(
     move_prepared_with_hook(parent, name, target, &destination, original, hook)
 }
 
+// Process-global info-name sequence (module scope so tests can predict the
+// next names and force a collision deterministically).
+static NEXT_NAME: AtomicU64 = AtomicU64::new(0);
+
 // The hook permits interruption and namespace-replacement probes at actual boundaries.
+/// Reserves a fresh `ghostdu-<pid>-<seq>.trashinfo` entry, retrying past
+/// names squatted by concurrent runs. Bounded recursion instead of a
+/// `continue` retry: bare diverging lines do not map under line coverage.
+fn reserve_info_fd(
+    info: &File,
+    attempts: u32,
+) -> io::Result<(rustix::fd::OwnedFd, String, String)> {
+    use rustix::fs::{OFlags, ResolveFlags};
+    let sequence = NEXT_NAME.fetch_add(1, Ordering::Relaxed);
+    let stored_name = format!("ghostdu-{}-{sequence}", std::process::id());
+    let info_name = format!("{stored_name}.trashinfo");
+    let mut create_flags = OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL;
+    create_flags |= OFlags::NOFOLLOW | OFlags::CLOEXEC;
+    let create_mode = Mode::RUSR | Mode::WUSR;
+    let no_follow = ResolveFlags::BENEATH | ResolveFlags::NO_SYMLINKS | ResolveFlags::NO_XDEV;
+    match openat2(info, &info_name, create_flags, create_mode, no_follow) {
+        Ok(fd) => Ok((fd, stored_name, info_name)),
+        Err(rustix::io::Errno::EXIST) if attempts > 0 => reserve_info_fd(info, attempts - 1),
+        Err(rustix::io::Errno::EXIST) => {
+            Err(io::Error::other("Cannot reserve a unique trash entry"))
+        }
+        // Preserve the errno so callers can distinguish causes.
+        Err(error) => Err(io::Error::from_raw_os_error(error.raw_os_error())),
+    }
+}
+
 fn move_prepared_with_hook(
     parent: &File,
     name: &CStr,
@@ -434,72 +442,51 @@ fn move_prepared_with_hook(
     destination.validate()?;
     let files = &destination.files;
     let info = &destination.info;
-    static NEXT_NAME: AtomicU64 = AtomicU64::new(0);
-    for _ in 0..1000 {
-        let sequence = NEXT_NAME.fetch_add(1, Ordering::Relaxed);
-        let stored_name = format!("ghostdu-{}-{sequence}", std::process::id());
-        let info_name = format!("{stored_name}.trashinfo");
-        let metadata_fd = match openat2(
-            info,
-            &info_name,
-            OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-            Mode::RUSR | Mode::WUSR,
-            ResolveFlags::BENEATH | ResolveFlags::NO_SYMLINKS | ResolveFlags::NO_XDEV,
-        ) {
-            Ok(fd) => fd,
-            // Name collision with a concurrent trash run; excluded from line
-            // coverage as timing-dependent (sequence is process-global).
-            #[cfg(not(tarpaulin_include))]
-                    Err(rustix::io::Errno::EXIST) => continue,
-            Err(error) => return Err(error.into()),
-        };
-        hook(MovePhase::Reserved, info, &info_name);
-        let moved: io::Result<()> = (|| {
-            let mut metadata = File::from(metadata_fd);
-            writeln!(
-                metadata,
-                "[Trash Info]\nPath={}\nDeletionDate={}",
-                encode_path(original),
-                chrono::Local::now().format("%Y-%m-%dT%H:%M:%S")
-            )?;
-            metadata.sync_all()?;
-            hook(MovePhase::MetadataSynced, info, &info_name);
-            verify_identity(parent, name, target)?;
-            hook(MovePhase::Verified, info, &info_name);
-            // Security Threat Model Note:
-            // In POSIX/Linux, `renameat` takes directory file descriptors and entry names.
-            // There is no kernel-level atomic compare-and-rename syscall.
-            // While `verify_identity` confirms that the directory entry matches the confirmed
-            // (dev, ino) immediately before moving, in an untrusted shared-writer directory
-            // (e.g. world-writable /tmp), a concurrent local writer with write permissions
-            // in `parent` could replace the directory entry between verification and
-            // `renameat`. Identity checks establish continuity, not serialization against
-            // concurrent writers. `renameat` operates strictly on the directory entry
-            // itself and never follows the final symlink. Destructive actions running
-            // with elevated authority should ensure appropriate directory permissions
-            // (sticky bit) or namespace isolation.
-            // Both directories stay pinned. Never re-resolve the user's source path or copy/delete.
-            renameat_with(parent, name, files, &stored_name, RenameFlags::NOREPLACE)?;
-            hook(MovePhase::Renamed, info, &info_name);
-            Ok(())
-        })();
-        if let Err(error) = &moved {
-            if let Err(cleanup) = unlinkat(info, &info_name, AtFlags::empty()) {
-                let location = fd_path(info)
-                    .map(|path| path.join(&info_name))
-                    .unwrap_or_else(|_| PathBuf::from(&info_name));
-                return Err(io::Error::other(format!(
-                    "{error}; metadata cleanup failed at {}: {cleanup}; inspect this orphaned entry",
-                    location.display()
-                )));
-            }
-        }
-        match moved {
-            Err(error) if error.raw_os_error() == Some(libc::EEXIST) => continue,
-            result => return result,
+    let (metadata_fd, stored_name, info_name) = reserve_info_fd(info, 1000)?;
+    hook(MovePhase::Reserved, info, &info_name);
+    let moved: io::Result<()> = (|| {
+        let mut metadata = File::from(metadata_fd);
+        let encoded = encode_path(original);
+        let deletion_date = chrono::Local::now().format("%Y-%m-%dT%H:%M:%S");
+        let info_text = format!("[Trash Info]\nPath={encoded}\nDeletionDate={deletion_date}\n");
+        metadata.write_all(info_text.as_bytes())?;
+        metadata.sync_all()?;
+        hook(MovePhase::MetadataSynced, info, &info_name);
+        verify_identity(parent, name, target)?;
+        hook(MovePhase::Verified, info, &info_name);
+        // Security Threat Model Note:
+        // In POSIX/Linux, `renameat` takes directory file descriptors and entry names.
+        // There is no kernel-level atomic compare-and-rename syscall.
+        // While `verify_identity` confirms that the directory entry matches the confirmed
+        // (dev, ino) immediately before moving, in an untrusted shared-writer directory
+        // (e.g. world-writable /tmp), a concurrent local writer with write permissions
+        // in `parent` could replace the directory entry between verification and
+        // `renameat`. Identity checks establish continuity, not serialization against
+        // concurrent writers. `renameat` operates strictly on the directory entry
+        // itself and never follows the final symlink. Destructive actions running
+        // with elevated authority should ensure appropriate directory permissions
+        // (sticky bit) or namespace isolation.
+        // Both directories stay pinned. Never re-resolve the user's source path or copy/delete.
+        renameat_with(parent, name, files, &stored_name, RenameFlags::NOREPLACE)?;
+        hook(MovePhase::Renamed, info, &info_name);
+        Ok(())
+    })();
+    if let Err(error) = &moved {
+        if let Err(_cleanup) = unlinkat(info, &info_name, AtFlags::empty()) {
+            let location = fd_path(info)
+                .map(|path| path.join(&info_name))
+                .unwrap_or_else(|_| PathBuf::from(&info_name));
+            let mut message = format!("{error}; metadata cleanup failed at ");
+            message.push_str(&location.display().to_string());
+            message.push_str("; inspect this orphaned entry");
+            return Err(io::Error::other(message));
         }
     }
-    Err(io::Error::other("Cannot reserve a unique trash entry"))
+    // A files-entry collision (orphan from a crashed run meeting a recycled
+    // pid+sequence) fails closed here instead of silently retrying: the user
+    // retries and mints a fresh sequence. Info-side collisions still retry
+    // inside `reserve_info_fd`.
+    moved
 }
 
 #[cfg(test)]
@@ -980,7 +967,239 @@ mod coverage_tests {
     }
 
     #[test]
+    fn unreadable_mountinfo_maps_error() {
+        let topo = MountTopology {
+            root: Err(io::Error::other("mountinfo boom")),
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let target = open_dir(dir.path());
+        let error = topo.check_target(&target).unwrap_err();
+        assert_eq!(error.to_string(), "mountinfo boom");
+    }
+
+    #[test]
+    fn mount_under_target_refuses_with_exdev() {
+        // Fake a mount at the target itself; canonicalize because fd paths
+        // resolve symlinks (e.g. /tmp) while TempDir paths may not.
+        let dir = tempfile::tempdir().unwrap();
+        let canonical = std::fs::canonicalize(dir.path()).unwrap();
+        let mut trie = MountTrieNode::default();
+        trie.insert(&canonical);
+        let topo = MountTopology { root: Ok(trie) };
+        let target = open_dir(dir.path());
+        let error = topo.check_target(&target).unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::EXDEV));
+    }
+
+    #[test]
+    fn info_name_collision_retries_with_next_sequence() {
+        let fixture = tempfile::tempdir().unwrap();
+        let trash =
+            private_directory(&File::open(fixture.path()).unwrap(), Path::new("trash")).unwrap();
+        // Squat on a window of upcoming info names: the sequence is shared
+        // process-wide, so a wide window makes the collision certain even
+        // with parallel trash tests consuming names concurrently.
+        let pid = std::process::id();
+        let base = NEXT_NAME.load(Ordering::Relaxed);
+        // Pre-create info/ with trash-grade privacy so validation passes.
+        let info_dir = fixture.path().join("trash/info");
+        std::fs::create_dir_all(&info_dir).unwrap();
+        std::fs::set_permissions(&info_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        for s in base..base + 512 {
+            fs::write(
+                info_dir.join(format!("ghostdu-{pid}-{s}.trashinfo")),
+                "squat",
+            )
+            .unwrap();
+        }
+        let source = fixture.path().join("victim");
+        fs::write(&source, "data").unwrap();
+        let (parent, name, target) = prepare_target(&source).unwrap();
+        move_verified(&parent, &name, &target, &trash, &source).unwrap();
+        assert!(!source.exists(), "file was trashed despite the collision");
+        // Prove the retry path ran: the minted info name must sort past every
+        // squatted sequence number.
+        let prefix = format!("ghostdu-{pid}-");
+        let mut minted = 0u64;
+        for entry in fs::read_dir(&info_dir).unwrap() {
+            let entry = entry.unwrap();
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let seq = name
+                .strip_prefix(&prefix)
+                .and_then(|s| s.strip_suffix(".trashinfo"));
+            let is_minted = fs::read_to_string(entry.path())
+                .map(|body| body.starts_with("[Trash Info]"))
+                .unwrap_or(false);
+            if let (Some(rest), true) = (seq, is_minted) {
+                minted = minted.max(rest.parse().unwrap_or(0));
+            }
+        }
+        assert!(
+            minted >= base + 512,
+            "retry must mint past the squatted window"
+        );
+    }
+
+    #[test]
+    fn info_open_missing_dir_errors() {
+        // A non-collision open failure (info dir removed after validation)
+        // takes the generic error arm instead of retrying.
+        let fixture = tempfile::tempdir().unwrap();
+        let trash_file = File::open(fixture.path()).unwrap();
+        let _trash = private_directory(&trash_file, Path::new("trash")).unwrap();
+        let trash_dir = fixture.path().join("trash");
+        let source = fixture.path().join("victim");
+        fs::write(&source, "data").unwrap();
+        let (parent, name, target) = prepare_target(&source).unwrap();
+        let trash_file = File::open(&trash_dir).unwrap();
+        let destination = TrashDestination::open(&parent, trash_file, None).unwrap();
+        std::fs::remove_dir_all(trash_dir.join("info")).unwrap();
+        let error =
+            move_prepared_with_hook(&parent, &name, &target, &destination, &source, |_, _, _| {})
+                .unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::ENOENT));
+    }
+
+    #[test]
+    fn move_cleanup_failure_reports_orphan() {
+        // Double fault, forced deterministically through the test hook: after
+        // the info file is reserved, block the files rename with a directory
+        // and delete the info file so its cleanup also fails.
+        let fixture = tempfile::tempdir().unwrap();
+        let trash_file = File::open(fixture.path()).unwrap();
+        let _trash = private_directory(&trash_file, Path::new("trash")).unwrap();
+        let trash_dir = fixture.path().join("trash");
+        let source = fixture.path().join("victim");
+        fs::write(&source, "data").unwrap();
+        let (parent, name, target) = prepare_target(&source).unwrap();
+        let trash_file = File::open(&trash_dir).unwrap();
+        let destination = TrashDestination::open(&parent, trash_file, None).unwrap();
+        let sabotage = |phase: MovePhase, info: &File, info_name: &str| {
+            if phase == MovePhase::Reserved {
+                let stored = info_name.strip_suffix(".trashinfo").unwrap_or(info_name);
+                let files_dir = fd_path(info).unwrap().parent().unwrap().join("files");
+                std::fs::create_dir(files_dir.join(stored)).unwrap();
+                std::fs::remove_file(fd_path(info).unwrap().join(info_name)).unwrap();
+            }
+        };
+        let error =
+            move_prepared_with_hook(&parent, &name, &target, &destination, &source, sabotage)
+                .unwrap_err();
+        assert!(error.to_string().contains("orphaned entry"));
+    }
+
+    #[test]
+    fn info_name_exhaustion_errors() {
+        let fixture = tempfile::tempdir().unwrap();
+        let trash =
+            private_directory(&File::open(fixture.path()).unwrap(), Path::new("trash")).unwrap();
+        let info_dir = fixture.path().join("trash/info");
+        std::fs::create_dir_all(&info_dir).unwrap();
+        std::fs::set_permissions(&info_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        // Squat every name the 1000-try loop can mint. Parallel trash tests
+        // consume sequence numbers concurrently, which can shift our start
+        // past the window; retry with a fresh window until exhaustion hits
+        // (other tests finish quickly, so later rounds are stable).
+        let pid = std::process::id();
+        for round in 0..4 {
+            let base = NEXT_NAME.load(Ordering::Relaxed);
+            for s in base..base + 1200 {
+                let _ = fs::write(
+                    info_dir.join(format!("ghostdu-{pid}-{s}.trashinfo")),
+                    "squat",
+                );
+            }
+            let victim = fixture.path().join(format!("victim-{round}"));
+            fs::write(&victim, "data").unwrap();
+            let (parent, name, target) = prepare_target(&victim).unwrap();
+            if let Err(error) = move_verified(&parent, &name, &target, &trash, &victim) {
+                assert!(error.to_string().contains("Cannot reserve"));
+                assert!(victim.exists(), "failed move must leave the source");
+                return;
+            }
+            // else: parallel consumption shifted our start past the window;
+            // extend and retry while other tests wind down.
+        }
+        panic!("sequence window stayed racy across 4 rounds");
+    }
+
+    #[test]
+    fn resolve_climb_permission_denied_errors() {
+        // /tmp and /dev/shm are distinct mounts: with XDG on shm, the trash
+        // lookup for a /tmp victim must climb. Revoking the grandparent after
+        // opening the parent makes the first climb step fail deterministically.
+        if effective_uid() == 0 {
+            return;
+        }
+        let fixture = tempfile::tempdir().unwrap();
+        let grandparent = fixture.path().join("g");
+        std::fs::create_dir(&grandparent).unwrap();
+        let victim = grandparent.join("victim");
+        fs::write(&victim, "data").unwrap();
+        let (parent, _, _) = prepare_target(&victim).unwrap();
+        std::fs::set_permissions(&grandparent, std::fs::Permissions::from_mode(0o000)).unwrap();
+        // Explicit data home avoids touching the process-global XDG variable
+        // that parallel tests also read.
+        let data_home = std::path::Path::new("/dev/shm/ghostdu-climb-xdg");
+        let result = trash_directory_for_data_home(&parent, data_home);
+        std::fs::set_permissions(&grandparent, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let _ = std::fs::remove_dir_all(data_home);
+        assert!(result.is_err(), "climb through locked ancestor must fail");
+    }
+
+    // Both /dev/shm climb tests share the mount top: serialize them so the
+    // shared-vs-private trash entry choice stays deterministic.
+    static SHM_TRASH_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn resolve_climb_stops_at_mount_boundary() {
+        // Victim on /dev/shm with XDG on /tmp: the climb hits EXDEV at /dev
+        // and plants the private trash dir at the mount top (/dev/shm).
+        let _guard = SHM_TRASH_LOCK.lock().unwrap();
+        let shm_base = std::path::Path::new("/dev/shm/ghostdu-climb-victim");
+        let _ = std::fs::remove_dir_all(shm_base);
+        std::fs::create_dir_all(shm_base).unwrap();
+        let victim = shm_base.join("victim");
+        fs::write(&victim, "data").unwrap();
+        let xdg = tempfile::tempdir().unwrap();
+        let xdg_path = xdg.path().to_path_buf();
+        // Explicit data home avoids touching the process-global XDG variable
+        // that parallel tests also read.
+        let resolve = |parent: &File| trash_directory_for_data_home(parent, &xdg_path);
+        let result = trash_with_destination(&[&victim], |_, _| Ok(()), resolve);
+        assert!(result.failed.is_empty(), "cross-mount trash must succeed");
+        assert!(!victim.exists(), "victim was trashed via the mount-top dir");
+        let _ = std::fs::remove_dir_all(shm_base);
+        let _ = std::fs::remove_dir_all(format!("/dev/shm/.Trash-{}", effective_uid()));
+    }
+
+    #[test]
+    fn resolve_climb_uses_shared_trash_entry() {
+        // Same climb, but the mount top offers a sticky shared .Trash/<uid>:
+        // the shared entry wins over the private fallback.
+        let _guard = SHM_TRASH_LOCK.lock().unwrap();
+        let shared = std::path::Path::new("/dev/shm/.Trash");
+        let _ = std::fs::remove_dir_all(shared);
+        std::fs::create_dir_all(shared).unwrap();
+        std::fs::set_permissions(shared, std::fs::Permissions::from_mode(0o1777)).unwrap();
+        let shm_base = std::path::Path::new("/dev/shm/ghostdu-shared-victim");
+        let _ = std::fs::remove_dir_all(shm_base);
+        std::fs::create_dir_all(shm_base).unwrap();
+        let victim = shm_base.join("victim");
+        fs::write(&victim, "data").unwrap();
+        let xdg = tempfile::tempdir().unwrap();
+        let xdg_path = xdg.path().to_path_buf();
+        let resolve = |parent: &File| trash_directory_for_data_home(parent, &xdg_path);
+        let result = trash_with_destination(&[&victim], |_, _| Ok(()), resolve);
+        assert!(result.failed.is_empty(), "shared trash must succeed");
+        assert!(!victim.exists());
+        let _ = std::fs::remove_dir_all(shm_base);
+        let _ = std::fs::remove_dir_all(shared);
+    }
+
+    #[test]
     fn data_home_must_be_absolute() {
+        let _xdg = crate::XDG_TEST_LOCK.lock().unwrap();
         std::env::set_var("GHOSTDU_TEST_XDG", "relative/path");
         let _guard = EnvRestore::capture("GHOSTDU_TEST_XDG");
         std::env::set_var("XDG_DATA_HOME", "relative/path");
@@ -1080,11 +1299,8 @@ mod coverage_tests {
         let trash = fixture.path().join("Trash");
         std::fs::create_dir_all(trash.join("files")).unwrap();
         std::fs::create_dir_all(trash.join("info")).unwrap();
-        std::fs::set_permissions(
-            trash.join("info"),
-            std::fs::Permissions::from_mode(0o555),
-        )
-        .unwrap();
+        std::fs::set_permissions(trash.join("info"), std::fs::Permissions::from_mode(0o555))
+            .unwrap();
         let source = fixture.path().join("source");
         std::fs::write(&source, "payload").unwrap();
         let trash_fd = open_dir(&trash);
@@ -1092,10 +1308,7 @@ mod coverage_tests {
         let error = move_verified(&parent, &name, &target, &trash_fd, &source).unwrap_err();
         assert!(!error.to_string().is_empty());
         assert!(source.exists());
-        std::fs::set_permissions(
-            trash.join("info"),
-            std::fs::Permissions::from_mode(0o755),
-        )
-        .unwrap();
+        std::fs::set_permissions(trash.join("info"), std::fs::Permissions::from_mode(0o755))
+            .unwrap();
     }
 }

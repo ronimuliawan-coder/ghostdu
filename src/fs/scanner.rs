@@ -170,7 +170,7 @@ fn scan_dir_recursive(
             // cannot be triggered deterministically in-process. Excluded from
             // line coverage; the sibling metadata race is stress-tested.
             #[cfg(not(tarpaulin_include))]
-                    Err(_) => {
+            Err(_) => {
                 parent_entry.has_err = true;
                 continue;
             }
@@ -603,8 +603,7 @@ mod race_tests {
                     let _ = std::fs::remove_file(victim.join(format!("f{i}")));
                 }
             });
-            let root =
-                scan_directory(dir.path(), None, Arc::new(AtomicBool::new(false))).unwrap();
+            let root = scan_directory(dir.path(), None, Arc::new(AtomicBool::new(false))).unwrap();
             churn.join().unwrap();
             // Whatever survived the race is counted exactly once.
             let mut seen = std::collections::HashSet::new();
