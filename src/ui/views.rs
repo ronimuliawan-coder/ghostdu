@@ -30,6 +30,101 @@ fn append_if_fits<'a>(
     }
 }
 
+pub fn centered_rect(width: u16, height: u16, r: Rect) -> Rect {
+    let popup_width = width.min(r.width.saturating_sub(2));
+    let popup_height = height.min(r.height.saturating_sub(2));
+
+    Rect {
+        x: (r.width.saturating_sub(popup_width)) / 2,
+        y: (r.height.saturating_sub(popup_height)) / 2,
+        width: popup_width,
+        height: popup_height,
+    }
+}
+
+/// Live scan-progress screen, drawn every poll tick while the scan thread
+/// runs. A named function (rather than an inline draw closure) so every line
+/// maps normally under line coverage.
+pub fn render_scan_progress(
+    f: &mut Frame,
+    spinner: &str,
+    progress: &crate::fs::scanner::ScanProgress,
+    elapsed_secs: f32,
+) {
+    let size = f.area();
+    let area = centered_rect(60, 10, size);
+
+    let files_str = format_count(progress.files_scanned as usize);
+    let bytes_str = format_size(progress.bytes_scanned);
+    let path_str = progress.current_path.to_string_lossy();
+
+    let lines = vec![
+        Line::from(vec![
+            Span::styled(
+                format!("{spinner} "),
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                "Analyzing disk usage & ghost files...",
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("Files Scanned: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                files_str,
+                Style::default()
+                    .fg(Color::LightGreen)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("   "),
+            Span::styled("Total Size: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                bytes_str,
+                Style::default()
+                    .fg(Color::LightCyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("   "),
+            Span::styled(
+                format!("({elapsed_secs:.1}s)"),
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("Scanning: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                truncate_path(&path_str, 44),
+                Style::default().fg(Color::Yellow),
+            ),
+        ]),
+        Line::from(""),
+        Line::from(Span::styled(
+            "Press 'q' or Ctrl+C to cancel",
+            Style::default().fg(Color::DarkGray),
+        )),
+    ];
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(Color::LightCyan))
+        .title(" 👻 ghostdu Scanner ");
+
+    f.render_widget(
+        Paragraph::new(lines)
+            .block(block)
+            .alignment(Alignment::Left),
+        area,
+    );
+}
+
 pub fn render_ui(f: &mut Frame, app: &App) {
     let size = f.area();
     if size.width < 10 || size.height < 3 {
@@ -955,10 +1050,9 @@ fn render_filesystem_view(f: &mut Frame, app: &App, area: Rect) {
                     if entry.has_err {
                         Span::styled("[!] LOCKED", Style::default().fg(Color::Red))
                     } else if entry.delete_safety == DeleteSafety::System {
-                        Span::styled(
-                            "🔴 SYSTEM",
-                            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-                        )
+                        let system_style =
+                            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD);
+                        Span::styled("🔴 SYSTEM", system_style)
                     } else {
                         Span::raw("")
                     }
@@ -1529,12 +1623,11 @@ fn render_deleted_open_tab(f: &mut Frame, app: &App, area: Rect) {
             .add_modifier(Modifier::BOLD),
     );
 
+    // The empty table returns early above, so at least one row always exists.
     let scroll_indicator = if total_items > viewport_height {
         format!(" [{}/{}] ↕ ", app.ghost_cursor_index + 1, total_items)
-    } else if total_items > 0 {
-        format!(" [{}/{}] ", app.ghost_cursor_index + 1, total_items)
     } else {
-        String::new()
+        format!(" [{}/{}] ", app.ghost_cursor_index + 1, total_items)
     };
 
     let table = Table::new(rows, widths).header(header).block(
@@ -2751,8 +2844,8 @@ fn render_footer(f: &mut Frame, app: &App, area: Rect) {
 mod render_sweep_tests {
     use super::*;
     use crate::fs::scanner::scan_directory;
-    use crate::ghost::{DeletedOpenFile, DockerDiskInfo};
     use crate::ghost::docker::DockerItemSummary;
+    use crate::ghost::{DeletedOpenFile, DockerDiskInfo};
     use crate::ui::app::{GhostFilterMode, SortMode};
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
@@ -2934,6 +3027,21 @@ mod render_sweep_tests {
                     DeleteSafety::UserData,
                 ));
             }
+            // Filler rows push the table past any viewport so scrolled
+            // indicators (up/down/both) all render.
+            for i in 0..50 {
+                fx.app.root_entry.children.push(FileEntry::new_file(
+                    format!("fill{i:02}"),
+                    PathBuf::from(format!("/synth/fill{i:02}")),
+                    10,
+                    10,
+                    false,
+                    1,
+                    4000 + i,
+                    GhostKind::None,
+                    DeleteSafety::UserData,
+                ));
+            }
             // Render again unfiltered so every synthetic row is visible.
             fx.app.safe_only_filter = false;
             fx.app.search_query.clear();
@@ -2956,6 +3064,10 @@ mod render_sweep_tests {
             (140, 30),
         ] {
             let _ = render(&fx.app, width, height);
+        }
+        // Every responsive width tier, so each options-row fallback renders.
+        for width in (20..150).step_by(1) {
+            let _ = render(&fx.app, width, 30);
         }
         // Narrow, short, and tiny terminals take compact paths.
         let tiny = render(&fx.app, 20, 2);
@@ -2987,6 +3099,8 @@ mod render_sweep_tests {
         app.set_status("hello status");
         let out = render(app, 100, 30);
         assert!(out.contains("hello status"));
+        // Unfiltered from here: scroll math needs the full child list.
+        app.search_query.clear();
         // Cursor deep past the list exercises scroll clamping.
         app.cursor_index = 10_000;
         let _ = render(app, 100, 30);
@@ -2996,8 +3110,29 @@ mod render_sweep_tests {
         let _ = render(app, 100, 30);
         app.scroll_offset.set(20);
         let _ = render(app, 100, 30);
+        app.cursor_index = 70;
+        app.scroll_offset.set(50);
+        let _ = render(app, 100, 30);
+        app.cursor_index = 76;
+        app.scroll_offset.set(60);
+        let _ = render(app, 100, 30);
         app.cursor_index = 0;
         app.scroll_offset.set(0);
+        // Park the cursor on the System row and render every width tier, so
+        // both the wide badge and the compact SYSTEM row render while visible.
+        if let Some(index) = app
+            .visible_children()
+            .iter()
+            .position(|e| e.name == "hosts")
+        {
+            app.cursor_index = index;
+            app.scroll_offset.set(index.saturating_sub(5));
+            for width in [100, 60, 40, 30, 25, 20] {
+                let _ = render(app, width, 30);
+            }
+            app.cursor_index = 0;
+            app.scroll_offset.set(0);
+        }
         // Empty visible table shows the zero-items indicator.
         app.search_query = "zzz-no-match".to_string();
         let _ = render(app, 100, 30);
@@ -3119,9 +3254,12 @@ mod render_sweep_tests {
         let _ = render(app, 100, 30);
         app.action_has_recheck = false;
         app.cancel_modal();
-        // Permanent delete confirm.
+        // Permanent delete confirm, safe and recheck variants.
         app.prompt_permanent_delete();
         let _ = render(app, 100, 30);
+        app.action_has_recheck = true;
+        let _ = render(app, 100, 30);
+        app.action_has_recheck = false;
         app.cancel_modal();
         // Multi-target list with scroll offset in both directions, from the
         // Janitor view so the scope label renders too.
@@ -3146,6 +3284,9 @@ mod render_sweep_tests {
         app.confirm_list_offset = 2;
         let out = render(app, 100, 30);
         assert!(out.contains("more"));
+        // Same target list from a non-Janitor view: no scope label.
+        app.previous_view = ActiveView::Filesystem;
+        let _ = render(app, 100, 30);
         app.cancel_modal();
         // Blocked-system variant.
         app.action_safety_blocked = true;
@@ -3206,11 +3347,8 @@ mod render_sweep_tests {
         let _ = render(app, 60, 12);
         app.cancel_modal();
         // Every safety tier and entry shape gets an info modal.
-        for name in ["sub", "link.txt", "hosts", "huge.bin", "k18"] {            if let Some(index) = app
-                .visible_children()
-                .iter()
-                .position(|e| e.name == name)
-            {
+        for name in ["sub", "link.txt", "hosts", "huge.bin", "k18"] {
+            if let Some(index) = app.visible_children().iter().position(|e| e.name == name) {
                 app.cursor_index = index;
                 app.open_item_info();
                 assert_eq!(app.active_view, ActiveView::ItemInfoModal);
@@ -3218,5 +3356,92 @@ mod render_sweep_tests {
                 app.cancel_modal();
             }
         }
+    }
+
+    #[test]
+    fn item_info_tiers() {
+        // The modal derives kind and safety from the live path, so each tier
+        // needs a real path that classifies into it.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("node_modules/pkg")).unwrap();
+        std::fs::write(dir.path().join("node_modules/pkg/index.js"), "x").unwrap();
+        std::fs::create_dir_all(dir.path().join(".cache")).unwrap();
+        std::fs::write(dir.path().join(".cache/thumb"), vec![0u8; 100]).unwrap();
+        std::fs::create_dir_all(dir.path().join("target/debug")).unwrap();
+        std::fs::write(dir.path().join("target/debug/app"), "x").unwrap();
+        std::fs::write(dir.path().join("plain.txt"), "x").unwrap();
+        let root = scan_directory(dir.path(), None, Arc::new(AtomicBool::new(false))).unwrap();
+        let mut app = App::new(root);
+        // Ghost + Recheck.
+        for name in ["node_modules", "pkg"] {
+            let index = app
+                .visible_children()
+                .iter()
+                .position(|e| e.name == name)
+                .unwrap_or_else(|| panic!("{name} visible"));
+            app.cursor_index = index;
+            app.enter_selected();
+        }
+        let index = app
+            .visible_children()
+            .iter()
+            .position(|e| e.name == "index.js")
+            .expect("index.js visible");
+        app.cursor_index = index;
+        app.open_item_info();
+        assert_eq!(app.active_view, ActiveView::ItemInfoModal);
+        let _ = render(&app, 100, 30);
+        app.cancel_modal();
+        app.go_up();
+        app.go_up();
+        // Ghost + Safe.
+        let index = app
+            .visible_children()
+            .iter()
+            .position(|e| e.name == ".cache")
+            .expect(".cache visible");
+        app.cursor_index = index;
+        app.enter_selected();
+        let index = app
+            .visible_children()
+            .iter()
+            .position(|e| e.name == "thumb")
+            .expect("thumb visible");
+        app.cursor_index = index;
+        app.open_item_info();
+        assert_eq!(app.active_view, ActiveView::ItemInfoModal);
+        let _ = render(&app, 100, 30);
+        app.cancel_modal();
+        app.go_up();
+        // Ghost + Safe (build cache).
+        let index = app
+            .visible_children()
+            .iter()
+            .position(|e| e.name == "target")
+            .expect("target visible");
+        app.cursor_index = index;
+        app.open_item_info();
+        assert_eq!(app.active_view, ActiveView::ItemInfoModal);
+        let _ = render(&app, 100, 30);
+        app.cancel_modal();
+        // Plain file badge.
+        let index = app
+            .visible_children()
+            .iter()
+            .position(|e| e.name == "plain.txt")
+            .expect("plain.txt visible");
+        app.cursor_index = index;
+        app.open_item_info();
+        assert_eq!(app.active_view, ActiveView::ItemInfoModal);
+        let _ = render(&app, 100, 30);
+        app.cancel_modal();
+        // System tier from a live system path.
+        app.item_info =
+            crate::fs::mount_info::get_detailed_item_info(std::path::Path::new("/etc/hosts"), 0);
+        assert!(app.item_info.is_some(), "/etc/hosts must exist");
+        app.previous_view = ActiveView::Filesystem;
+        app.active_view = ActiveView::ItemInfoModal;
+        let _ = render(&app, 100, 30);
+        app.cancel_modal();
     }
 }

@@ -457,6 +457,14 @@ mod tests {
             GhostKind::DockerBuildkit
         );
         assert_eq!(
+            classify_path(&PathBuf::from("/var/lib/docker/network/files/local-kv.db")),
+            GhostKind::DockerUser
+        );
+        assert_eq!(
+            classify_path(&PathBuf::from("/var/run/docker.sock")),
+            GhostKind::DockerUser
+        );
+        assert_eq!(
             classify_path(&PathBuf::from("/home/ron/.local/share/docker")),
             GhostKind::DockerUser
         );

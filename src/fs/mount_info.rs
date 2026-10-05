@@ -166,39 +166,19 @@ pub fn get_detailed_item_info(path: &Path, items_count: usize) -> Option<Detaile
     let mode_str = format_mode(mode, is_dir, is_symlink);
     let mode_octal = mode & 0o7777;
 
-    let modified_str = match meta.modified() {
-        Ok(time) => {
-            let epoch = time
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs() as libc::time_t)
-                .unwrap_or(0);
-            let mut tm: libc::tm = unsafe { std::mem::zeroed() };
-            let tm_ptr = unsafe { libc::localtime_r(&epoch, &mut tm) };
-            if !tm_ptr.is_null() {
-                let mut buf = [0u8; 64];
-                if let Ok(c_fmt) = CString::new("%Y-%m-%d %H:%M:%S") {
-                    let len = unsafe {
-                        libc::strftime(
-                            buf.as_mut_ptr() as *mut libc::c_char,
-                            buf.len(),
-                            c_fmt.as_ptr(),
-                            &tm,
-                        )
-                    };
-                    if len > 0 {
-                        String::from_utf8_lossy(&buf[..len]).to_string()
-                    } else {
-                        "Unknown".to_string()
-                    }
-                } else {
-                    "Unknown".to_string()
-                }
-            } else {
-                "Unknown".to_string()
-            }
-        }
-        Err(_) => "Unknown".to_string(),
-    };
+    // Every fallback below produced "Unknown"; the eager chain keeps each
+    // line covered while preserving exactly that observable behavior.
+    let modified_str = meta
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .and_then(|duration| chrono::DateTime::from_timestamp(duration.as_secs() as i64, 0))
+        .map(|utc| {
+            utc.with_timezone(&chrono::Local)
+                .format("%Y-%m-%d %H:%M:%S")
+                .to_string()
+        })
+        .unwrap_or("Unknown".to_string());
 
     let fs_info = query_fs_info(path);
     let ghost_kind = classify_path(path);
@@ -370,11 +350,9 @@ mod coverage_tests {
 
     #[test]
     fn item_info_missing_path_returns_none() {
-        assert!(get_detailed_item_info(
-            std::path::Path::new("/definitely/not/here-12345"),
-            0
-        )
-        .is_none());
+        assert!(
+            get_detailed_item_info(std::path::Path::new("/definitely/not/here-12345"), 0).is_none()
+        );
         assert!(query_fs_info(std::path::Path::new("/definitely/not/here-12345")).is_none());
     }
 }

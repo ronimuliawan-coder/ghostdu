@@ -639,7 +639,7 @@ mod key_matrix_tests {
 
 #[cfg(test)]
 mod key_action_tests {
-    use super::key_matrix_tests::{ctrl, fixture, key};
+    use super::key_matrix_tests::{fixture, key};
     use super::*;
 
     #[test]
