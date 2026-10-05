@@ -221,6 +221,14 @@ fn run_interactive(
 type SubshellRunner<B> =
     dyn Fn(&mut Terminal<B>, &std::path::Path) -> Result<(), Box<dyn std::error::Error>>;
 
+/// How one main-loop iteration ends: quit the session or rescan from root.
+/// Compared at the bottom of the loop, so no diverging statement is needed.
+#[derive(PartialEq)]
+enum MainFlow {
+    Quit,
+    Rescan,
+}
+
 /// Interactive scan/browse loop. The event source and subshell runner are
 /// injected so headless tests can drive every arm with scripted events;
 /// production passes the live crossterm globals (see `run_interactive`).
@@ -300,13 +308,13 @@ fn run_app<B: ratatui::backend::Backend>(
             app.set_status("⚡ Rescanned entire tree from root");
         }
 
-        let rescanned = loop {
+        let flow = loop {
             terminal.draw(|f| render_ui(f, &app))?;
 
             if poll(Duration::from_millis(100))? {
                 if let Event::Key(key) = read()? {
                     match handle_key_event(&mut app, key) {
-                        EventResult::Exit => return Ok(()),
+                        EventResult::Exit => break MainFlow::Quit,
                         // Empty by design: most keys only mutate app state
                         // inside `handle_key_event`. Single-expression arm
                         // lines do not map under line coverage (same as the
@@ -316,11 +324,11 @@ fn run_app<B: ratatui::backend::Backend>(
                         EventResult::RescanRequested => {
                             saved_current_path = Some(app.current_dir_entry().path.clone());
                             target_path = app.root_entry.path.clone();
-                            break true;
+                            break MainFlow::Rescan;
                         }
                         EventResult::RescanPath(new_path) => {
                             target_path = new_path;
-                            break true;
+                            break MainFlow::Rescan;
                         }
                         EventResult::Subshell(dir) => {
                             if let Err(error) = subshell(terminal, &dir) {
@@ -335,9 +343,9 @@ fn run_app<B: ratatui::backend::Backend>(
                 }
             }
         };
-        // The inner loop exits only through a rescan break (every other exit
-        // returns from the session); the assertion documents the invariant.
-        assert!(rescanned);
+        if flow == MainFlow::Quit {
+            return Ok(());
+        }
     }
 }
 

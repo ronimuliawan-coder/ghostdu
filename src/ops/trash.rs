@@ -1200,8 +1200,7 @@ mod coverage_tests {
     #[test]
     fn data_home_must_be_absolute() {
         let _xdg = crate::XDG_TEST_LOCK.lock().unwrap();
-        std::env::set_var("GHOSTDU_TEST_XDG", "relative/path");
-        let _guard = EnvRestore::capture("GHOSTDU_TEST_XDG");
+        let _guard = EnvRestore::capture("XDG_DATA_HOME");
         std::env::set_var("XDG_DATA_HOME", "relative/path");
         assert!(data_home_path().is_err());
     }

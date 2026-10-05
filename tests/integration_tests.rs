@@ -1389,6 +1389,10 @@ mod desktop_handoff_tests {
             if let Some(ref saved) = self.0 {
                 // SAFETY: restoring the exact previous value.
                 unsafe { std::env::set_var("PATH", saved) };
+            } else {
+                // PATH was initially absent: remove the replacement instead
+                // of leaving a pointer to the deleted tool directory behind.
+                unsafe { std::env::remove_var("PATH") };
             }
         }
     }
