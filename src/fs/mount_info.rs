@@ -56,8 +56,6 @@ pub fn query_fs_info(path: &Path) -> Option<FsMountInfo> {
     })
 }
 
-/// Unescapes octal sequences (e.g. \040 -> ' ', \011 -> '\t', \012 -> '\n', \134 -> '\')
-/// used by Linux /proc/mounts and mntent for paths containing whitespace or special characters.
 /// Usage percentage that stays defined for zero-sized filesystems.
 fn usage_percent(used_bytes: u64, total_bytes: u64) -> f64 {
     if total_bytes > 0 {
@@ -67,6 +65,8 @@ fn usage_percent(used_bytes: u64, total_bytes: u64) -> f64 {
     }
 }
 
+/// Unescapes octal sequences (e.g. \040 -> ' ', \011 -> '\t', \012 -> '\n', \134 -> '\')
+/// used by Linux /proc/mounts and mntent for paths containing whitespace or special characters.
 pub fn unescape_mount_path(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut chars = s.chars().peekable();

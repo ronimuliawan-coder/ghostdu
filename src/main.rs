@@ -929,16 +929,17 @@ mod pty_session_tests {
                 }
             });
         }
+    }
 
-        fn teardown(self) {
-            drop(self.master);
+    // Best-effort teardown on scope exit: Drop also runs while unwinding, so
+    // a failed assertion mid-session can never leave the developer terminal
+    // in raw mode or on the alternate screen. No asserts or panics here.
+    impl Drop for PtySession {
+        fn drop(&mut self) {
+            drop(self.master.take());
             let _ = disable_raw_mode();
             use std::os::unix::io::AsFd;
-            assert_eq!(
-                unsafe { libc::dup2(self.saved_stdin.as_fd().as_raw_fd(), 0) },
-                0,
-                "stdin restore"
-            );
+            let _ = unsafe { libc::dup2(self.saved_stdin.as_fd().as_raw_fd(), 0) };
         }
     }
 
@@ -1020,8 +1021,6 @@ mod pty_session_tests {
             &run_subshell,
         );
         assert!(result.is_ok(), "session exits on q: {result:?}");
-
-        session.teardown();
     }
 }
 
