@@ -1175,12 +1175,19 @@ mod coverage_tests {
         // and plants the private trash dir at the mount top (/dev/shm).
         let _guard = SHM_TRASH_LOCK.lock().unwrap();
         let shm_base = std::path::Path::new("/dev/shm/ghostdu-climb-victim");
+        // Never delete host data: the guards below remove these paths, so
+        // skip when another run or user left them behind.
+        if shm_base.exists() {
+            eprintln!("skipping: /dev/shm/ghostdu-climb-victim already exists on this host");
+            return;
+        }
         let _cleanup_base = DropGuard::remove_all(shm_base);
-        let _cleanup_private = DropGuard::remove_all(&std::path::PathBuf::from(format!(
-            "/dev/shm/.Trash-{}",
-            effective_uid()
-        )));
-        let _ = std::fs::remove_dir_all(shm_base);
+        let private = std::path::PathBuf::from(format!("/dev/shm/.Trash-{}", effective_uid()));
+        if private.exists() {
+            eprintln!("skipping: private trash entry already exists on this host");
+            return;
+        }
+        let _cleanup_private = DropGuard::remove_all(&private);
         std::fs::create_dir_all(shm_base).unwrap();
         let victim = shm_base.join("victim");
         fs::write(&victim, "data").unwrap();
@@ -1207,8 +1214,12 @@ mod coverage_tests {
             return;
         }
         let _cleanup_shared = DropGuard::remove_all(shared);
-        let _cleanup_base =
-            DropGuard::remove_all(std::path::Path::new("/dev/shm/ghostdu-shared-victim"));
+        let shm_base = std::path::Path::new("/dev/shm/ghostdu-shared-victim");
+        if shm_base.exists() {
+            eprintln!("skipping: ghostdu-shared-victim already exists on this host");
+            return;
+        }
+        let _cleanup_base = DropGuard::remove_all(shm_base);
         std::fs::create_dir_all(shared).unwrap();
         std::fs::set_permissions(shared, std::fs::Permissions::from_mode(0o1777)).unwrap();
         let shm_base = std::path::Path::new("/dev/shm/ghostdu-shared-victim");
