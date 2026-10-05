@@ -553,12 +553,11 @@ fn run_headless_summary(
         let avail = format_size(fs.avail_bytes);
         println!("     Capacity: {total} | Used: {used} [{bar_filled}{bar_empty}] {percent:.1}% | Free Space: {avail}");
     }
-    println!(
-        "  📊 TOTAL DISK USAGE: {} (Apparent: {})",
-        format_size(root_entry.disk_usage),
-        format_size(root_entry.size)
-    );
-    println!("  📦 TOTAL ITEMS: {}", format_count(root_entry.items_count));
+    let disk = format_size(root_entry.disk_usage);
+    let apparent = format_size(root_entry.size);
+    let items = format_count(root_entry.items_count);
+    println!("  📊 TOTAL DISK USAGE: {disk} (Apparent: {apparent})");
+    println!("  📦 TOTAL ITEMS: {items}");
     println!("{SECTION_RULE}");
     println!(
         "{:<4} {:<40} {:<12} {:<18} {:<12}",
@@ -835,6 +834,19 @@ mod cli_tests {
 
     #[test]
     fn run_subshell_reports_unstartable_shell() {
+        // run_subshell touches the real terminal state: skip when a
+        // controlling terminal exists, or this test leaves an interactive
+        // shell in raw mode on the alternate screen. Headless CI always runs
+        // it, which is also where the coverage gate measures it.
+        if std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("/dev/tty")
+            .is_ok()
+        {
+            eprintln!("skipping: controlling terminal present");
+            return;
+        }
         use ratatui::backend::TestBackend;
         let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).unwrap();
