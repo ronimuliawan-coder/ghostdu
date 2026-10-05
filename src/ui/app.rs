@@ -2133,19 +2133,12 @@ mod reconciliation_tests {
         // Bounded heap: never more rows than the limit.
         assert_eq!(app.top_files.len(), 50);
         // Executing from the leaderboard rebuilds the snapshot in place.
-        let _xdg = crate::XDG_TEST_LOCK.lock().unwrap();
-        let saved_xdg = std::env::var_os("XDG_DATA_HOME");
-        unsafe { std::env::set_var("XDG_DATA_HOME", dir.path().join("xdg")) };
+        let _xdg = crate::XdgGuard::set(&dir.path().join("xdg"));
         let trashed = app.top_files[0].path.clone();
         app.top_file_action(true);
         app.execute_pending_action();
         assert_eq!(app.active_view, ActiveView::TopFiles);
         assert!(!app.top_files.iter().any(|f| f.path == trashed));
-        if let Some(saved) = saved_xdg {
-            unsafe { std::env::set_var("XDG_DATA_HOME", saved) };
-        } else {
-            unsafe { std::env::remove_var("XDG_DATA_HOME") };
-        }
     }
 
     #[test]
@@ -2327,7 +2320,15 @@ mod reconciliation_tests {
         // Signalling an unkillable instance reports the kernel error. PID 1
         // belongs to root: as non-root the signal is denied (EPERM) without
         // affecting anything; skip entirely when running as root.
-        if unsafe { libc::geteuid() } != 0 {
+        // In rootless containers PID 1 can share our UID: tini-style inits
+        // forward SIGTERM (killing the container) while handler-less PID 1
+        // silently drops it (breaking the assertion below). Only proceed
+        // when PID 1 belongs to a different user, where EPERM is certain.
+        let euid = unsafe { libc::geteuid() };
+        let init_uid = std::fs::metadata("/proc/1")
+            .map(|meta| std::os::unix::fs::MetadataExt::uid(&meta))
+            .ok();
+        if euid != 0 && init_uid != Some(euid) {
             let init_start = crate::ghost::proc_start_time(1).expect("init has stat");
             let init_fd = rustix::process::Pid::from_raw(1)
                 .and_then(|t| {
@@ -2916,9 +2917,7 @@ mod execution_tests {
         std::fs::write(dir.path().join("trash-me.txt"), "x").unwrap();
         std::fs::write(dir.path().join("delete-me.txt"), "x").unwrap();
         // Scope trash into the fixture so nothing touches the real wastebin.
-        let _xdg = crate::XDG_TEST_LOCK.lock().unwrap();
-        let saved_xdg = std::env::var_os("XDG_DATA_HOME");
-        unsafe { std::env::set_var("XDG_DATA_HOME", dir.path().join("xdg")) };
+        let _xdg = crate::XdgGuard::set(&dir.path().join("xdg"));
         let mut app = App::new(scanned(dir.path()));
         // Trash flow succeeds end to end.
         app.cursor_index = app
@@ -2943,11 +2942,6 @@ mod execution_tests {
         assert!(!dir.path().join("delete-me.txt").exists());
         // Empty confirmation restores the view without acting.
         app.execute_pending_action();
-        if let Some(saved) = saved_xdg {
-            unsafe { std::env::set_var("XDG_DATA_HOME", saved) };
-        } else {
-            unsafe { std::env::remove_var("XDG_DATA_HOME") };
-        }
     }
 
     #[test]
@@ -3076,15 +3070,28 @@ mod refresh_lookup_tests {
         app.previous_view = ActiveView::Filesystem;
         app.active_view = ActiveView::ConfirmModal;
         // Make the rescan fail with a non-NotFound error: lock the root.
+        // Root ignores permission bits, so skip there; restore through a
+        // drop guard so a failed assertion never breaks TempDir cleanup.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        struct Restore<'a>(&'a std::path::Path);
+        impl Drop for Restore<'_> {
+            fn drop(&mut self) {
+                use std::os::unix::fs::PermissionsExt;
+                if let Ok(mut perms) = std::fs::metadata(self.0).map(|m| m.permissions()) {
+                    perms.set_mode(0o755);
+                    let _ = std::fs::set_permissions(self.0, perms);
+                }
+            }
+        }
+        let _restore = Restore(dir.path());
         use std::os::unix::fs::PermissionsExt;
         let mut perms = std::fs::metadata(dir.path()).unwrap().permissions();
         perms.set_mode(0o000);
         std::fs::set_permissions(dir.path(), perms).unwrap();
         app.execute_pending_action();
         assert!(app.root_entry.has_err);
-        let mut perms = std::fs::metadata(dir.path()).unwrap().permissions();
-        perms.set_mode(0o755);
-        std::fs::set_permissions(dir.path(), perms).unwrap();
     }
 
     #[test]
@@ -3189,9 +3196,7 @@ mod coverage_gap_tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("trash-me.txt"), "x").unwrap();
         std::fs::write(dir.path().join("app.log"), vec![0u8; 1000]).unwrap();
-        let _xdg = crate::XDG_TEST_LOCK.lock().unwrap();
-        let saved_xdg = std::env::var_os("XDG_DATA_HOME");
-        unsafe { std::env::set_var("XDG_DATA_HOME", dir.path().join("xdg")) };
+        let _xdg = crate::XdgGuard::set(&dir.path().join("xdg"));
         let mut app = App::new(
             crate::fs::scanner::scan_directory(dir.path(), None, Arc::new(AtomicBool::new(false)))
                 .unwrap(),
@@ -3210,11 +3215,6 @@ mod coverage_gap_tests {
         app.execute_pending_action();
         assert!(!dir.path().join("trash-me.txt").exists());
         assert!(app.cursor_index < app.visible_children().len().max(1));
-        if let Some(saved) = saved_xdg {
-            unsafe { std::env::set_var("XDG_DATA_HOME", saved) };
-        } else {
-            unsafe { std::env::remove_var("XDG_DATA_HOME") };
-        }
     }
 
     #[test]

@@ -512,10 +512,11 @@ mod coverage_tests {
 
     #[test]
     fn progress_channel_sends_periodic_updates() {
-        // 12k files take ~150ms locally (throttle is 50ms), so at least one
-        // periodic update must arrive on any realistic machine.
+        // Periodic updates need the scan to outlast the 50ms throttle, which
+        // depends on wall-clock speed: 48k files take ~600ms locally, so even
+        // a machine an order of magnitude faster still emits several updates.
         let dir = tempfile::tempdir().unwrap();
-        for d in 0..60 {
+        for d in 0..240 {
             let sub = dir.path().join(format!("d{d}"));
             std::fs::create_dir(&sub).unwrap();
             for i in 0..200 {

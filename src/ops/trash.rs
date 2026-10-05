@@ -1151,12 +1151,35 @@ mod coverage_tests {
     // shared-vs-private trash entry choice stays deterministic.
     static SHM_TRASH_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+    /// Removes a fixture directory on drop, including on assertion failure,
+    /// so shared locations never litter the host after a failed test.
+    struct DropGuard {
+        path: std::path::PathBuf,
+    }
+    impl DropGuard {
+        fn remove_all(path: &Path) -> Self {
+            Self {
+                path: path.to_path_buf(),
+            }
+        }
+    }
+    impl Drop for DropGuard {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+
     #[test]
     fn resolve_climb_stops_at_mount_boundary() {
         // Victim on /dev/shm with XDG on /tmp: the climb hits EXDEV at /dev
         // and plants the private trash dir at the mount top (/dev/shm).
         let _guard = SHM_TRASH_LOCK.lock().unwrap();
         let shm_base = std::path::Path::new("/dev/shm/ghostdu-climb-victim");
+        let _cleanup_base = DropGuard::remove_all(shm_base);
+        let _cleanup_private = DropGuard::remove_all(&std::path::PathBuf::from(format!(
+            "/dev/shm/.Trash-{}",
+            effective_uid()
+        )));
         let _ = std::fs::remove_dir_all(shm_base);
         std::fs::create_dir_all(shm_base).unwrap();
         let victim = shm_base.join("victim");
@@ -1169,8 +1192,6 @@ mod coverage_tests {
         let result = trash_with_destination(&[&victim], |_, _| Ok(()), resolve);
         assert!(result.failed.is_empty(), "cross-mount trash must succeed");
         assert!(!victim.exists(), "victim was trashed via the mount-top dir");
-        let _ = std::fs::remove_dir_all(shm_base);
-        let _ = std::fs::remove_dir_all(format!("/dev/shm/.Trash-{}", effective_uid()));
     }
 
     #[test]
@@ -1179,11 +1200,18 @@ mod coverage_tests {
         // the shared entry wins over the private fallback.
         let _guard = SHM_TRASH_LOCK.lock().unwrap();
         let shared = std::path::Path::new("/dev/shm/.Trash");
-        let _ = std::fs::remove_dir_all(shared);
+        // Never delete host data: skip if someone else owns this location.
+        // The check runs before any cleanup guard is armed.
+        if shared.exists() {
+            eprintln!("skipping: /dev/shm/.Trash already exists on this host");
+            return;
+        }
+        let _cleanup_shared = DropGuard::remove_all(shared);
+        let _cleanup_base =
+            DropGuard::remove_all(std::path::Path::new("/dev/shm/ghostdu-shared-victim"));
         std::fs::create_dir_all(shared).unwrap();
         std::fs::set_permissions(shared, std::fs::Permissions::from_mode(0o1777)).unwrap();
         let shm_base = std::path::Path::new("/dev/shm/ghostdu-shared-victim");
-        let _ = std::fs::remove_dir_all(shm_base);
         std::fs::create_dir_all(shm_base).unwrap();
         let victim = shm_base.join("victim");
         fs::write(&victim, "data").unwrap();
@@ -1193,38 +1221,12 @@ mod coverage_tests {
         let result = trash_with_destination(&[&victim], |_, _| Ok(()), resolve);
         assert!(result.failed.is_empty(), "shared trash must succeed");
         assert!(!victim.exists());
-        let _ = std::fs::remove_dir_all(shm_base);
-        let _ = std::fs::remove_dir_all(shared);
     }
 
     #[test]
     fn data_home_must_be_absolute() {
-        let _xdg = crate::XDG_TEST_LOCK.lock().unwrap();
-        let _guard = EnvRestore::capture("XDG_DATA_HOME");
-        std::env::set_var("XDG_DATA_HOME", "relative/path");
+        let _xdg = crate::XdgGuard::set(std::path::Path::new("relative/path"));
         assert!(data_home_path().is_err());
-    }
-
-    struct EnvRestore {
-        key: &'static str,
-        saved: Option<std::ffi::OsString>,
-    }
-    impl EnvRestore {
-        fn capture(key: &'static str) -> Self {
-            Self {
-                key,
-                saved: std::env::var_os(key),
-            }
-        }
-    }
-    impl Drop for EnvRestore {
-        fn drop(&mut self) {
-            if let Some(ref saved) = self.saved {
-                unsafe { std::env::set_var(self.key, saved) };
-            } else {
-                unsafe { std::env::remove_var(self.key) };
-            }
-        }
     }
 
     #[test]

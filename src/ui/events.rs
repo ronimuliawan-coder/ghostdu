@@ -1075,9 +1075,7 @@ mod key_view_tests {
         let app = &mut fx.app;
         // Scope trash into the fixture: y on a trash prompt executes for
         // real, and must never reach the developer's wastebin.
-        let _xdg = crate::XDG_TEST_LOCK.lock().unwrap();
-        let saved_xdg = std::env::var_os("XDG_DATA_HOME");
-        unsafe { std::env::set_var("XDG_DATA_HOME", app.root_entry.path.join("xdg")) };
+        let _xdg = crate::XdgGuard::set(&app.root_entry.path.join("xdg"));
         // Plain y confirm round-trip on a trash prompt (executes for real).
         app.prompt_move_to_trash();
         assert!(matches!(
@@ -1192,11 +1190,6 @@ mod key_view_tests {
         // The y-confirmed trash above landed inside the fixture-scoped XDG
         // home, never the developer's wastebin.
         assert!(app.root_entry.path.join("xdg").exists());
-        if let Some(saved) = saved_xdg {
-            unsafe { std::env::set_var("XDG_DATA_HOME", saved) };
-        } else {
-            unsafe { std::env::remove_var("XDG_DATA_HOME") };
-        }
     }
 }
 
