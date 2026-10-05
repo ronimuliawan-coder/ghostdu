@@ -535,11 +535,28 @@ mod coverage_tests {
 
     #[test]
     fn unreadable_subtree_marks_error() {
+        // Root ignores permission bits: 0o000 never blocks read_dir there.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
         let dir = tempfile::tempdir().unwrap();
         let sub = dir.path().join("locked");
         std::fs::create_dir(&sub).unwrap();
         std::fs::write(sub.join("secret.txt"), "x").unwrap();
         std::fs::write(dir.path().join("ok.txt"), "x").unwrap();
+        // Drop guard: a failed assertion below must not skip the restore,
+        // or TempDir cleanup fails and litters /tmp.
+        struct Restore<'a>(&'a Path);
+        impl Drop for Restore<'_> {
+            fn drop(&mut self) {
+                use std::os::unix::fs::PermissionsExt;
+                if let Ok(mut perms) = std::fs::metadata(self.0).map(|m| m.permissions()) {
+                    perms.set_mode(0o755);
+                    let _ = std::fs::set_permissions(self.0, perms);
+                }
+            }
+        }
+        let _restore = Restore(&sub);
         // Remove all permissions: directory reads fail as non-root.
         let mut perms = std::fs::metadata(&sub).unwrap().permissions();
         use std::os::unix::fs::PermissionsExt;
@@ -548,10 +565,6 @@ mod coverage_tests {
         let root = scan_directory(dir.path(), None, stop()).unwrap();
         let locked = root.children.iter().find(|e| e.name == "locked").unwrap();
         assert!(locked.has_err);
-        // Restore so TempDir cleanup succeeds.
-        let mut perms = std::fs::metadata(&sub).unwrap().permissions();
-        perms.set_mode(0o755);
-        std::fs::set_permissions(&sub, perms).unwrap();
     }
 
     #[test]

@@ -530,15 +530,15 @@ mod socket_tests {
             Duration::from_secs(1),
         )
         .is_err());
-        // Present but unlistened path refuses connections.
+        // Present but unlistened path refuses connections. Dropping the
+        // listener keeps its socket file on disk, so the call travels past
+        // the existence check into the refused connection.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("dead.sock");
-        std::os::unix::net::UnixListener::bind(&path).unwrap();
-        drop(path);
-        std::fs::remove_file(dir.path().join("dead.sock")).unwrap();
-        let dangling = dir.path().join("dangling.sock");
-        std::os::unix::fs::symlink("/nonexistent-xyz", &dangling).unwrap();
-        assert!(send_to_docker_socket(&dangling, "GET", "/x", Duration::from_secs(1)).is_err());
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        drop(listener);
+        let error = send_to_docker_socket(&path, "GET", "/x", Duration::from_secs(1)).unwrap_err();
+        assert!(error.contains("Cannot connect to docker socket"));
         // Garbage bytes are not HTTP.
         assert!(round_trip(b"not http at all").is_err());
     }
@@ -589,7 +589,7 @@ mod socket_tests {
                 {"Id": "neg-id", "Size": -5, "Containers": 0}
             ],
             "Containers": [{"Id": "c1", "SizeRw": 10}],
-            "Volumes": [{"Name": "v1", "UsageData": {"Size": 30}}, {"Name": "v2"}],
+            "Volumes": [{"Name": "v1", "UsageData": {"Size": 30}}, {"Name": "v2"}, {"Name": "v3", "UsageData": {"Size": 50, "RefCount": 2}}],
             "BuildCache": [{"ID": "bc1", "Size": 40, "Reclaimable": true, "Description": "layer"}]
         }"#;
         let info = parse_docker_df_json(body).unwrap();
@@ -601,7 +601,7 @@ mod socket_tests {
             .iter()
             .any(|i| i.id_or_name == "abc123def456"[..12]));
         assert!(info.items.iter().any(|i| i.details.contains("containers")));
-        assert_eq!(info.volumes_count, 2);
+        assert_eq!(info.volumes_count, 3);
         assert_eq!(info.build_cache_reclaimable_size, 40);
         assert!(parse_docker_df_json("not json").is_err());
         // Missing-socket error branch without requiring a daemon.

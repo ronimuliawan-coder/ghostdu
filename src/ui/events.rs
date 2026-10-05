@@ -350,9 +350,12 @@ fn handle_filesystem_keys(app: &mut App, key: KeyEvent) -> EventResult {
         KeyCode::Char('\\') => EventResult::RescanPath(PathBuf::from("/")),
         KeyCode::Char('~') => {
             // Without HOME (minimal containers), stay where we are instead
-            // of a dead key: one path, no environment-dependent branch.
-            let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-            EventResult::RescanPath(PathBuf::from(home))
+            // of a dead key: fall back to the current view directory, which
+            // unlike the process working directory is always the scanned tree.
+            let home = std::env::var("HOME")
+                .map(PathBuf::from)
+                .unwrap_or_else(|_| app.current_dir_entry().path.clone());
+            EventResult::RescanPath(home)
         }
 
         // Selection
@@ -530,6 +533,26 @@ mod key_matrix_tests {
         KeyEvent::new(code, KeyModifiers::CONTROL)
     }
 
+    /// Shadow `xdg-open` and the clipboard tools with fakes that consume
+    /// stdin and exit 0, so unit tests never open real applications or
+    /// clobber the developer clipboard. The directory is intentionally
+    /// leaked: deleting it would race concurrent spawns resolving the same
+    /// names. It is prepended, so every other tool still resolves normally.
+    pub(crate) fn fake_desktop_tools() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = Box::leak(Box::new(tempfile::tempdir().unwrap()));
+        for tool in ["xdg-open", "wl-copy", "xclip", "xsel"] {
+            let path = dir.path().join(tool);
+            std::fs::write(&path, "#!/bin/sh\ncat > /dev/null\nexit 0\n").unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let mut paths = vec![dir.path().to_path_buf()];
+        if let Some(old) = std::env::var_os("PATH") {
+            paths.extend(std::env::split_paths(&old));
+        }
+        unsafe { std::env::set_var("PATH", std::env::join_paths(paths).unwrap()) };
+    }
+
     #[test]
     fn filesystem_navigation_keys() {
         let mut fx = fixture();
@@ -639,7 +662,7 @@ mod key_matrix_tests {
 
 #[cfg(test)]
 mod key_action_tests {
-    use super::key_matrix_tests::{fixture, key};
+    use super::key_matrix_tests::{fake_desktop_tools, fixture, key};
     use super::*;
 
     #[test]
@@ -714,6 +737,7 @@ mod key_action_tests {
 
     #[test]
     fn filesystem_prompts_and_search() {
+        fake_desktop_tools();
         let mut fx = fixture();
         let app = &mut fx.app;
         // Trash + delete prompts open confirm modals without executing.
@@ -876,7 +900,8 @@ mod key_action_tests {
             handle_key_event(app, key(KeyCode::F(5))),
             EventResult::RescanRequested
         ));
-        // Subshell + open + copy return without running anything here.
+        // Subshell + open + copy return without side effects here: fake
+        // desktop tools shadow the real ones (see fake_desktop_tools).
         assert!(matches!(
             handle_key_event(app, key(KeyCode::Char('!'))),
             EventResult::Subshell(_)
@@ -910,6 +935,18 @@ mod key_view_tests {
         let mut fx = fixture();
         let app = &mut fx.app;
         app.active_view = ActiveView::GhostInspector;
+        // Deterministic kill target: the live table depends on whatever
+        // /proc holds mid-run, so pin a fabricated row at index zero.
+        app.deleted_open_files.clear();
+        app.deleted_open_files.push(crate::ghost::DeletedOpenFile {
+            pid: 424242,
+            process_name: "testproc".to_string(),
+            original_path: "/tmp/gone".to_string(),
+            size: 4096,
+            fd: "3".to_string(),
+            start_time: Some(999),
+        });
+        app.ghost_cursor_index = 0;
         assert!(matches!(
             handle_key_event(app, key(KeyCode::Tab)),
             EventResult::Continue
@@ -1036,6 +1073,11 @@ mod key_view_tests {
     fn confirm_and_help_keys() {
         let mut fx = fixture();
         let app = &mut fx.app;
+        // Scope trash into the fixture: y on a trash prompt executes for
+        // real, and must never reach the developer's wastebin.
+        let _xdg = crate::XDG_TEST_LOCK.lock().unwrap();
+        let saved_xdg = std::env::var_os("XDG_DATA_HOME");
+        unsafe { std::env::set_var("XDG_DATA_HOME", app.root_entry.path.join("xdg")) };
         // Plain y confirm round-trip on a trash prompt (executes for real).
         app.prompt_move_to_trash();
         assert!(matches!(
@@ -1147,6 +1189,14 @@ mod key_view_tests {
             handle_key_event(app, key(KeyCode::Enter)),
             EventResult::Continue
         ));
+        // The y-confirmed trash above landed inside the fixture-scoped XDG
+        // home, never the developer's wastebin.
+        assert!(app.root_entry.path.join("xdg").exists());
+        if let Some(saved) = saved_xdg {
+            unsafe { std::env::set_var("XDG_DATA_HOME", saved) };
+        } else {
+            unsafe { std::env::remove_var("XDG_DATA_HOME") };
+        }
     }
 }
 
