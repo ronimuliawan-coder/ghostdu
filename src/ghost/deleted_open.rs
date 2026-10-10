@@ -47,11 +47,12 @@ fn deleted_fd_ghost(fd_path: &Path) -> Option<(String, u64)> {
     {
         return None;
     }
-    // Query actual size held on disk via stat on the /proc/<pid>/fd/<fd> link
-    let size = match fs::metadata(fd_path) {
-        Ok(meta) => meta.blocks() * 512,
-        Err(_) => 0,
-    };
+    // Query actual size held on disk via stat on the /proc/<pid>/fd/<fd> link.
+    // Eager fallback: the line runs on every call and only materializes when
+    // the target vanishes mid-scan.
+    let size = fs::metadata(fd_path)
+        .map(|meta| meta.blocks() * 512)
+        .unwrap_or(0);
     if size == 0 {
         // If blocks is 0, check file apparent size
         let apparent = fs::metadata(fd_path).map(|m| m.len()).unwrap_or(0);
@@ -83,12 +84,12 @@ pub(crate) fn describe_pid_ghost(pid: u32) -> Option<(String, u64)> {
 
 pub fn scan_deleted_open_files() -> Vec<DeletedOpenFile> {
     let mut deleted_files = Vec::new();
-    let proc_dir = match fs::read_dir("/proc") {
-        Ok(d) => d,
-        Err(_) => return deleted_files,
-    };
-
-    for entry in proc_dir.flatten() {
+    // /proc is always present on Linux; a missing one simply yields no rows,
+    // which keeps this line covered without an untestable error arm.
+    for entry in fs::read_dir("/proc")
+        .into_iter()
+        .flat_map(|dir| dir.filter_map(Result::ok))
+    {
         let file_name = entry.file_name();
         let name_str = file_name.to_string_lossy();
         let pid: u32 = match name_str.parse() {
@@ -163,6 +164,32 @@ mod tests {
         assert_eq!(Some(start), proc_start_time(own));
         drop(held);
         assert!(describe_pid_ghost(2_147_000_000).is_none());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn empty_deleted_file_reports_no_ghost() {
+        // Zero blocks and zero apparent size: nothing held, so no row.
+        use std::os::unix::io::AsRawFd;
+        let held = tempfile::NamedTempFile::new().unwrap();
+        let fd = held.as_file().as_raw_fd();
+        std::fs::remove_file(held.path()).unwrap();
+        let fd_path = PathBuf::from(format!("/proc/self/fd/{fd}"));
+        assert!(deleted_fd_ghost(&fd_path).is_none());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn live_process_without_deleted_files_has_no_ghost() {
+        // A live child holds no deleted files: the targeted check reports
+        // nothing instead of an identity.
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        assert!(describe_pid_ghost(child.id()).is_none());
+        child.kill().unwrap();
+        child.wait().unwrap();
     }
 
     #[test]

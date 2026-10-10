@@ -76,3 +76,28 @@ pub(crate) fn verify_confirmed(
         })?
         .verify(target)
 }
+
+#[cfg(test)]
+mod coverage_tests {
+    use super::*;
+
+    #[test]
+    fn identity_guards_reject_zero_ids_and_missing_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("f.txt");
+        std::fs::write(&path, "x").unwrap();
+        let identity = TargetIdentity::capture(&path).unwrap();
+        let meta = std::fs::metadata(&path).unwrap();
+        use std::os::unix::fs::MetadataExt;
+        assert!(identity.matches_ids(meta.dev(), meta.ino(), false, false));
+        assert!(!identity.matches_ids(0, 0, false, false));
+        assert!(!identity.matches_ids(meta.dev(), meta.ino(), true, false));
+
+        let empty: TargetIdentities = HashMap::new();
+        let file = std::fs::File::open(&path).unwrap();
+        assert!(verify_confirmed(&empty, &path, &file).is_err());
+        let mut full = TargetIdentities::new();
+        full.insert(path.clone(), identity);
+        assert!(verify_confirmed(&full, &path, &file).is_ok());
+    }
+}

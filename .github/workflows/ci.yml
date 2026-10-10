@@ -36,3 +36,31 @@ jobs:
 
       - name: Build release binary
         run: cargo build --release --verbose
+
+  coverage:
+    name: Coverage gate (100%)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-tarpaulin
+        run: cargo install cargo-tarpaulin --locked
+
+      # The live-pty session hangs under ptrace instrumentation, so it is
+      # skipped here; scripted driver tests cover the same arms, and the pty
+      # test still runs under `cargo test` above.
+      - name: Run coverage gate
+        run: cargo tarpaulin --all-targets --fail-under 100
+        env:
+          GHOSTDU_SKIP_PTY: "1"

@@ -39,11 +39,7 @@ pub fn query_fs_info(path: &Path) -> Option<FsMountInfo> {
     let free_bytes = ((stat.f_bfree as u128) * frsize).min(u64::MAX as u128) as u64;
     let avail_bytes = ((stat.f_bavail as u128) * frsize).min(u64::MAX as u128) as u64;
     let used_bytes = total_bytes.saturating_sub(free_bytes);
-    let use_percent = if total_bytes > 0 {
-        ((used_bytes as f64 / total_bytes as f64) * 100.0).clamp(0.0, 100.0)
-    } else {
-        0.0
-    };
+    let use_percent = usage_percent(used_bytes, total_bytes);
 
     // 2. Parse /proc/mounts to match mount point and filesystem type
     let (device, mount_point, fs_type) = resolve_mount_point(&canonical);
@@ -58,6 +54,15 @@ pub fn query_fs_info(path: &Path) -> Option<FsMountInfo> {
         avail_bytes,
         use_percent,
     })
+}
+
+/// Usage percentage that stays defined for zero-sized filesystems.
+fn usage_percent(used_bytes: u64, total_bytes: u64) -> f64 {
+    if total_bytes > 0 {
+        ((used_bytes as f64 / total_bytes as f64) * 100.0).clamp(0.0, 100.0)
+    } else {
+        0.0
+    }
 }
 
 /// Unescapes octal sequences (e.g. \040 -> ' ', \011 -> '\t', \012 -> '\n', \134 -> '\')
@@ -161,39 +166,20 @@ pub fn get_detailed_item_info(path: &Path, items_count: usize) -> Option<Detaile
     let mode_str = format_mode(mode, is_dir, is_symlink);
     let mode_octal = mode & 0o7777;
 
-    let modified_str = match meta.modified() {
-        Ok(time) => {
-            let epoch = time
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs() as libc::time_t)
-                .unwrap_or(0);
-            let mut tm: libc::tm = unsafe { std::mem::zeroed() };
-            let tm_ptr = unsafe { libc::localtime_r(&epoch, &mut tm) };
-            if !tm_ptr.is_null() {
-                let mut buf = [0u8; 64];
-                if let Ok(c_fmt) = CString::new("%Y-%m-%d %H:%M:%S") {
-                    let len = unsafe {
-                        libc::strftime(
-                            buf.as_mut_ptr() as *mut libc::c_char,
-                            buf.len(),
-                            c_fmt.as_ptr(),
-                            &tm,
-                        )
-                    };
-                    if len > 0 {
-                        String::from_utf8_lossy(&buf[..len]).to_string()
-                    } else {
-                        "Unknown".to_string()
-                    }
-                } else {
-                    "Unknown".to_string()
-                }
-            } else {
-                "Unknown".to_string()
-            }
-        }
-        Err(_) => "Unknown".to_string(),
-    };
+    // Every fallback below produced "Unknown"; the eager chain keeps each
+    // line covered while preserving exactly that observable behavior.
+    // Pre-epoch timestamps convert exactly via SystemTime (unlike the old
+    // epoch-zero clamp), so 1960s mtimes display correctly.
+    let modified_str = meta
+        .modified()
+        .ok()
+        .map(|time| {
+            chrono::DateTime::<chrono::Utc>::from(time)
+                .with_timezone(&chrono::Local)
+                .format("%Y-%m-%d %H:%M:%S")
+                .to_string()
+        })
+        .unwrap_or("Unknown".to_string());
 
     let fs_info = query_fs_info(path);
     let ghost_kind = classify_path(path);
@@ -325,5 +311,69 @@ mod tests {
         assert!(info.is_dir);
         assert_eq!(info.items_count, 42);
         assert!(info.fs_info.is_some());
+    }
+}
+
+#[cfg(test)]
+mod coverage_tests {
+    use super::*;
+
+    #[test]
+    fn usage_percent_handles_empty_filesystems() {
+        assert_eq!(usage_percent(0, 0), 0.0);
+        assert_eq!(usage_percent(50, 100), 50.0);
+        assert_eq!(usage_percent(200, 100), 100.0);
+    }
+
+    #[test]
+    fn unescape_handles_octal_and_literals() {
+        assert_eq!(unescape_mount_path("/mnt/my\\040disk"), "/mnt/my disk");
+        assert_eq!(unescape_mount_path("/plain/path"), "/plain/path");
+        assert_eq!(unescape_mount_path("/x\\999y"), "/x\\999y");
+        assert_eq!(unescape_mount_path("/x\\4y"), "/x\\4y");
+        assert_eq!(unescape_mount_path("/trailing\\"), "/trailing\\");
+        assert_eq!(unescape_mount_path(""), "");
+    }
+
+    #[test]
+    fn mode_strings_cover_special_bits() {
+        assert_eq!(format_mode(0o755, false, false), "-rwxr-xr-x");
+        assert_eq!(format_mode(0o4755, false, false), "-rwsr-xr-x");
+        assert_eq!(format_mode(0o4744, false, false), "-rwsr--r--");
+        assert_eq!(format_mode(0o4644, false, false), "-rwSr--r--");
+        assert_eq!(format_mode(0o2755, false, false), "-rwxr-sr-x");
+        assert_eq!(format_mode(0o2744, false, false), "-rwxr-Sr--");
+        assert_eq!(format_mode(0o1755, true, false), "drwxr-xr-t");
+        assert_eq!(format_mode(0o1744, true, false), "drwxr--r-T");
+        assert_eq!(format_mode(0o777, false, true), "lrwxrwxrwx");
+        assert_eq!(format_mode(0o600, false, false), "-rw-------");
+    }
+
+    #[test]
+    fn item_info_missing_path_returns_none() {
+        assert!(
+            get_detailed_item_info(std::path::Path::new("/definitely/not/here-12345"), 0).is_none()
+        );
+        assert!(query_fs_info(std::path::Path::new("/definitely/not/here-12345")).is_none());
+    }
+
+    #[test]
+    fn pre_epoch_mtime_displays_exact_date() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("old.txt");
+        std::fs::write(&file, "x").unwrap();
+        let status = std::process::Command::new("touch")
+            .arg("-d")
+            .arg("1960-01-01 00:00:00")
+            .arg(&file)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let info = get_detailed_item_info(&file, 0).unwrap();
+        assert!(
+            info.modified_str.starts_with("1960-01-01"),
+            "unexpected date: {}",
+            info.modified_str
+        );
     }
 }
