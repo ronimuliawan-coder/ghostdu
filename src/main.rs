@@ -612,6 +612,12 @@ fn run_headless_summary(
     Ok(())
 }
 
+/// Serializes tests that mutate process-wide stdin or terminal mode. The pty
+/// session reroutes fd 0 for seconds at a time; a concurrent raw-mode toggle
+/// would change the pty's termios mid-session and stall its input.
+#[cfg(test)]
+static TERMINAL_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(test)]
 mod cli_tests {
     use super::*;
@@ -860,6 +866,9 @@ mod cli_tests {
             eprintln!("skipping: controlling terminal present");
             return;
         }
+        let _term = super::TERMINAL_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         use ratatui::backend::TestBackend;
         let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -1001,6 +1010,9 @@ mod pty_session_tests {
         if std::env::var("GHOSTDU_SKIP_PTY").is_ok() {
             return;
         }
+        let _term = super::TERMINAL_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         use std::time::Duration;
         let session = PtySession::open();
         let backend = TestBackend::new(100, 30);
@@ -1409,6 +1421,11 @@ mod interactive_driver_tests {
 
     #[test]
     fn panic_hook_restores_terminal_and_reraises() {
+        // The hook swap is process-global: hold the terminal lock so no
+        // concurrent raw-mode toggle can interleave with it.
+        let _term = super::TERMINAL_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let saved = std::panic::take_hook();
         install_panic_hook();
         let caught = std::panic::catch_unwind(|| panic!("hook test panic"));
