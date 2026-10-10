@@ -205,6 +205,8 @@ fn run_interactive(
         scan_options,
         &|d| crossterm::event::poll(d),
         &crossterm::event::read,
+        &|d| crossterm::event::poll(d),
+        &crossterm::event::read,
         &run_subshell,
     );
 
@@ -232,13 +234,18 @@ enum MainFlow {
 /// Interactive scan/browse loop. The event source and subshell runner are
 /// injected so headless tests can drive every arm with scripted events;
 /// production passes the live crossterm globals (see `run_interactive`).
+/// Scan and browse phases take separate sources so tests script each phase
+/// exactly, with no timing or oversupply involved.
+#[allow(clippy::too_many_arguments)]
 fn run_app<B: ratatui::backend::Backend>(
     terminal: &mut Terminal<B>,
     mut target_path: PathBuf,
     cli: &Cli,
     scan_options: &ScannerOptions,
-    poll: &dyn Fn(Duration) -> Result<bool, std::io::Error>,
-    read: &dyn Fn() -> Result<Event, std::io::Error>,
+    scan_poll: &dyn Fn(Duration) -> Result<bool, std::io::Error>,
+    scan_read: &dyn Fn() -> Result<Event, std::io::Error>,
+    main_poll: &dyn Fn(Duration) -> Result<bool, std::io::Error>,
+    main_read: &dyn Fn() -> Result<Event, std::io::Error>,
     subshell: &SubshellRunner<B>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut saved_current_path: Option<PathBuf> = None;
@@ -286,8 +293,8 @@ fn run_app<B: ratatui::backend::Backend>(
 
             terminal.draw(|f| render_scan_progress(f, spinner, &last_progress, elapsed))?;
 
-            if poll(Duration::from_millis(60))? {
-                if let Event::Key(key) = read()? {
+            if scan_poll(Duration::from_millis(60))? {
+                if let Event::Key(key) = scan_read()? {
                     if key.code == KeyCode::Char('q')
                         || (key.modifiers.contains(KeyModifiers::CONTROL)
                             && key.code == KeyCode::Char('c'))
@@ -311,8 +318,8 @@ fn run_app<B: ratatui::backend::Backend>(
         let flow = loop {
             terminal.draw(|f| render_ui(f, &app))?;
 
-            if poll(Duration::from_millis(100))? {
-                if let Event::Key(key) = read()? {
+            if main_poll(Duration::from_millis(100))? {
+                if let Event::Key(key) = main_read()? {
                     match handle_key_event(&mut app, key) {
                         EventResult::Exit => break MainFlow::Quit,
                         // Empty by design: most keys only mutate app state
@@ -827,9 +834,15 @@ mod cli_tests {
         use crate::ui::centered_rect;
         use ratatui::layout::Rect;
         let full = centered_rect(60, 10, Rect::new(0, 0, 100, 40));
-        assert_eq!((full.width, full.height), (60, 10));
+        assert_eq!((full.x, full.y, full.width, full.height), (20, 15, 60, 10));
         let tiny = centered_rect(60, 10, Rect::new(0, 0, 20, 5));
         assert!(tiny.width <= 20 && tiny.height <= 5);
+        // Non-zero origins stay centered inside the given area.
+        let offset = centered_rect(60, 10, Rect::new(10, 5, 100, 40));
+        assert_eq!(
+            (offset.x, offset.y, offset.width, offset.height),
+            (30, 20, 60, 10)
+        );
     }
 
     #[test]
@@ -1012,6 +1025,8 @@ mod pty_session_tests {
             &options,
             &|d| crossterm::event::poll(d),
             &crossterm::event::read,
+            &|d| crossterm::event::poll(d),
+            &crossterm::event::read,
             &run_subshell,
         );
         assert!(result.is_ok(), "cancelled scan exits Ok: {result:?}");
@@ -1030,6 +1045,8 @@ mod pty_session_tests {
             &options,
             &|d| crossterm::event::poll(d),
             &crossterm::event::read,
+            &|d| crossterm::event::poll(d),
+            &crossterm::event::read,
             &run_subshell,
         );
         assert!(result.is_ok(), "session exits on q: {result:?}");
@@ -1038,9 +1055,10 @@ mod pty_session_tests {
 
 /// Scripted driver for `run_app`: a TestBackend terminal plus canned events,
 /// so every loop arm is covered deterministically under any runner (including
-/// ptrace-based coverage, where real terminal devices hang). No sleeps, no
-/// timing: polls default to ready and reads fall back to a harmless Resize,
-/// so scans always complete and sessions always terminate.
+/// ptrace-based coverage, where real terminal devices hang). Scan and browse
+/// phases take separate scripts, so scripts are exact: no sleeps, no timing
+/// margins, no oversupply. An exhausted script panics loudly instead of
+/// hanging, so a scripting bug fails fast.
 #[cfg(test)]
 mod interactive_driver_tests {
     use super::*;
@@ -1090,28 +1108,62 @@ mod interactive_driver_tests {
     }
 
     struct Driver {
-        polls: RefCell<VecDeque<bool>>,
-        reads: RefCell<VecDeque<Event>>,
+        scan_polls: RefCell<VecDeque<bool>>,
+        scan_reads: RefCell<VecDeque<Event>>,
+        main_polls: RefCell<VecDeque<bool>>,
+        main_reads: RefCell<VecDeque<Event>>,
     }
 
     impl Driver {
-        fn new(false_polls: usize, reads: Vec<Event>) -> Self {
+        /// Scan scripts may be empty: surplus `false` polls simply let the
+        /// scan run (it always terminates via join), and default reads are
+        /// ignored there. Main scripts must be exact: an exhausted main
+        /// script panics loudly instead of hanging, so a scripting bug fails
+        /// fast.
+        fn new(
+            scan_polls: Vec<bool>,
+            scan_reads: Vec<Event>,
+            main_polls: Vec<bool>,
+            main_reads: Vec<Event>,
+        ) -> Self {
             Self {
-                polls: RefCell::new(vec![false; false_polls].into()),
-                reads: RefCell::new(reads.into()),
+                scan_polls: RefCell::new(scan_polls.into()),
+                scan_reads: RefCell::new(scan_reads.into()),
+                main_polls: RefCell::new(main_polls.into()),
+                main_reads: RefCell::new(main_reads.into()),
             }
         }
 
-        fn poll(&self) -> Result<bool, std::io::Error> {
-            Ok(self.polls.borrow_mut().pop_front().unwrap_or(true))
+        fn scan_poll(&self) -> Result<bool, std::io::Error> {
+            Ok(self.scan_polls.borrow_mut().pop_front().unwrap_or(false))
         }
 
-        fn read(&self) -> Result<Event, std::io::Error> {
+        fn scan_read(&self) -> Result<Event, std::io::Error> {
             Ok(self
-                .reads
+                .scan_reads
                 .borrow_mut()
                 .pop_front()
                 .unwrap_or(Event::Resize(80, 24)))
+        }
+
+        fn main_poll(&self) -> Result<bool, std::io::Error> {
+            Ok(self
+                .main_polls
+                .borrow_mut()
+                .pop_front()
+                .expect("main poll script exhausted"))
+        }
+
+        fn main_read(&self) -> Result<Event, std::io::Error> {
+            Ok(self
+                .main_reads
+                .borrow_mut()
+                .pop_front()
+                .expect("main read script exhausted"))
+        }
+
+        fn quit() -> Event {
+            key(KeyCode::Char('q'))
         }
     }
 
@@ -1134,8 +1186,10 @@ mod interactive_driver_tests {
             target,
             &cli,
             &options,
-            &|_| driver.poll(),
-            &|| driver.read(),
+            &|_| driver.scan_poll(),
+            &|| driver.scan_read(),
+            &|_| driver.main_poll(),
+            &|| driver.main_read(),
             subshell,
         )
     }
@@ -1144,7 +1198,12 @@ mod interactive_driver_tests {
     fn scan_cancel_q_quits() {
         // Slow tree so the scan is still running after two progress draws.
         let dir = fixture(1500);
-        let driver = Driver::new(2, vec![key(KeyCode::Char('q'))]);
+        let driver = Driver::new(
+            vec![false, false, true],
+            vec![key(KeyCode::Char('q'))],
+            vec![],
+            vec![],
+        );
         run(dir.path().to_path_buf(), &driver, &subshell_ok).unwrap();
     }
 
@@ -1156,23 +1215,28 @@ mod interactive_driver_tests {
             KeyCode::Char('c'),
             KeyModifiers::CONTROL,
         ));
-        let driver = Driver::new(2, vec![ctrl_c]);
+        let driver = Driver::new(vec![false, false, true], vec![ctrl_c], vec![], vec![]);
         run(dir.path().to_path_buf(), &driver, &subshell_ok).unwrap();
     }
 
     #[test]
     fn scan_poll_error_propagates() {
+        // Every fake yields the same error, so the test passes whether the
+        // scan is still running (usual) or already joined at the first check.
         let dir = fixture(20);
         let (cli, options) = test_cli(dir.path().to_path_buf());
         let mut terminal = test_terminal();
-        let driver = Driver::new(0, vec![]);
+        let boom_bool = || Err::<bool, _>(std::io::Error::other("poll boom"));
+        let boom_event = || Err::<Event, _>(std::io::Error::other("poll boom"));
         let result = run_app(
             &mut terminal,
             dir.path().to_path_buf(),
             &cli,
             &options,
-            &|_| Err::<bool, _>(std::io::Error::other("poll boom")),
-            &|| driver.read(),
+            &|_| boom_bool(),
+            &|| boom_event(),
+            &|_| boom_bool(),
+            &|| boom_event(),
             &subshell_ok,
         );
         let error = result.expect_err("poll failure must propagate");
@@ -1181,17 +1245,23 @@ mod interactive_driver_tests {
 
     #[test]
     fn scan_read_error_propagates() {
-        let dir = fixture(20);
+        // Slow tree so the scan is still running on the first poll. The main
+        // fakes yield the same error, so the test also passes if the scan
+        // wins the opening race and joins before any poll.
+        let dir = fixture(1500);
         let (cli, options) = test_cli(dir.path().to_path_buf());
         let mut terminal = test_terminal();
-        let driver = Driver::new(0, vec![]);
+        let boom_bool = || Err::<bool, _>(std::io::Error::other("read boom"));
+        let boom_event = || Err::<Event, _>(std::io::Error::other("read boom"));
         let result = run_app(
             &mut terminal,
             dir.path().to_path_buf(),
             &cli,
             &options,
-            &|_| driver.poll(),
-            &|| Err::<Event, _>(std::io::Error::other("read boom")),
+            &|_| Ok(true),
+            &|| boom_event(),
+            &|_| boom_bool(),
+            &|| boom_event(),
             &subshell_ok,
         );
         let error = result.expect_err("read failure must propagate");
@@ -1200,18 +1270,19 @@ mod interactive_driver_tests {
 
     #[test]
     fn main_read_error_propagates() {
-        // Enough leading `false` polls for the small scan to finish, so the
+        // Empty scan scripts: the small scan completes on its own, so the
         // failure lands in the main loop rather than the scan loop.
         let dir = fixture(20);
         let (cli, options) = test_cli(dir.path().to_path_buf());
         let mut terminal = test_terminal();
-        let driver = Driver::new(3000, vec![]);
         let result = run_app(
             &mut terminal,
             dir.path().to_path_buf(),
             &cli,
             &options,
-            &|_| driver.poll(),
+            &|_| Ok(false),
+            &|| panic!("scan read must not run on false polls"),
+            &|_| Ok(true),
             &|| Err::<Event, _>(std::io::Error::other("main read boom")),
             &subshell_ok,
         );
@@ -1222,7 +1293,7 @@ mod interactive_driver_tests {
     #[test]
     fn scan_missing_path_errors() {
         let dir = fixture(5);
-        let driver = Driver::new(0, vec![]);
+        let driver = Driver::new(vec![], vec![], vec![], vec![]);
         let result = run(dir.path().join("does-not-exist"), &driver, &subshell_ok);
         assert!(result.is_err(), "missing scan path must error");
     }
@@ -1230,7 +1301,12 @@ mod interactive_driver_tests {
     #[test]
     fn session_rescan_requested_then_quit() {
         let dir = fixture(20);
-        let driver = Driver::new(300, vec![key(KeyCode::Char('R')), key(KeyCode::Char('q'))]);
+        let driver = Driver::new(
+            vec![],
+            vec![],
+            vec![true, true],
+            vec![key(KeyCode::Char('R')), Driver::quit()],
+        );
         run(dir.path().to_path_buf(), &driver, &subshell_ok).unwrap();
     }
 
@@ -1243,28 +1319,49 @@ mod interactive_driver_tests {
         for i in 0..50 {
             std::fs::write(sub.join(format!("f{i:03}.bin")), [i as u8; 32]).unwrap();
         }
-        let driver = Driver::new(2000, vec![key(KeyCode::Backspace), key(KeyCode::Char('q'))]);
+        let quit = Driver::quit();
+        let driver = Driver::new(
+            vec![],
+            vec![],
+            vec![true, true],
+            vec![key(KeyCode::Backspace), quit],
+        );
         run(sub, &driver, &subshell_ok).unwrap();
     }
 
     #[test]
     fn session_continue_key_then_quit() {
         let dir = fixture(20);
-        let driver = Driver::new(300, vec![key(KeyCode::Char('r')), key(KeyCode::Char('q'))]);
+        let driver = Driver::new(
+            vec![],
+            vec![],
+            vec![true, true],
+            vec![key(KeyCode::Char('r')), Driver::quit()],
+        );
         run(dir.path().to_path_buf(), &driver, &subshell_ok).unwrap();
     }
 
     #[test]
     fn session_subshell_ok_then_quit() {
         let dir = fixture(20);
-        let driver = Driver::new(300, vec![key(KeyCode::Char('!')), key(KeyCode::Char('q'))]);
+        let driver = Driver::new(
+            vec![],
+            vec![],
+            vec![true, true],
+            vec![key(KeyCode::Char('!')), Driver::quit()],
+        );
         run(dir.path().to_path_buf(), &driver, &subshell_ok).unwrap();
     }
 
     #[test]
     fn session_subshell_error_sets_status_then_quit() {
         let dir = fixture(20);
-        let driver = Driver::new(300, vec![key(KeyCode::Char('!')), key(KeyCode::Char('q'))]);
+        let driver = Driver::new(
+            vec![],
+            vec![],
+            vec![true, true],
+            vec![key(KeyCode::Char('!')), Driver::quit()],
+        );
         let failing = |_: &mut Terminal<TestBackend>,
                        _: &std::path::Path|
          -> Result<(), Box<dyn std::error::Error>> {
@@ -1290,11 +1387,13 @@ mod interactive_driver_tests {
             Ok(())
         };
         let driver = Driver::new(
-            300,
+            vec![],
+            vec![],
+            vec![true, true, true],
             vec![
                 key(KeyCode::Char('!')),
                 key(KeyCode::Char('!')),
-                key(KeyCode::Char('q')),
+                Driver::quit(),
             ],
         );
         run(dir.path().to_path_buf(), &driver, &deleting).unwrap();
