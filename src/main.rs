@@ -1197,25 +1197,33 @@ mod interactive_driver_tests {
     #[test]
     fn scan_cancel_q_quits() {
         // Slow tree so the scan is still running after two progress draws.
+        // The main-loop script quits cleanly too, so the test passes even if
+        // the scan wins the opening race and joins before any poll.
         let dir = fixture(1500);
         let driver = Driver::new(
             vec![false, false, true],
             vec![key(KeyCode::Char('q'))],
-            vec![],
-            vec![],
+            vec![true],
+            vec![Driver::quit()],
         );
         run(dir.path().to_path_buf(), &driver, &subshell_ok).unwrap();
     }
 
     #[test]
     fn scan_cancel_ctrl_c_quits() {
-        // Second operand of the scan-loop interrupt check.
+        // Second operand of the scan-loop interrupt check. Same race cover
+        // as above: a plain quit exits the main loop if the scan finished.
         let dir = fixture(1500);
         let ctrl_c = Event::Key(crossterm::event::KeyEvent::new(
             KeyCode::Char('c'),
             KeyModifiers::CONTROL,
         ));
-        let driver = Driver::new(vec![false, false, true], vec![ctrl_c], vec![], vec![]);
+        let driver = Driver::new(
+            vec![false, false, true],
+            vec![ctrl_c],
+            vec![true],
+            vec![Driver::quit()],
+        );
         run(dir.path().to_path_buf(), &driver, &subshell_ok).unwrap();
     }
 
