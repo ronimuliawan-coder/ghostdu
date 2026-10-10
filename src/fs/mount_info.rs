@@ -168,13 +168,14 @@ pub fn get_detailed_item_info(path: &Path, items_count: usize) -> Option<Detaile
 
     // Every fallback below produced "Unknown"; the eager chain keeps each
     // line covered while preserving exactly that observable behavior.
+    // Pre-epoch timestamps convert exactly via SystemTime (unlike the old
+    // epoch-zero clamp), so 1960s mtimes display correctly.
     let modified_str = meta
         .modified()
         .ok()
-        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
-        .and_then(|duration| chrono::DateTime::from_timestamp(duration.as_secs() as i64, 0))
-        .map(|utc| {
-            utc.with_timezone(&chrono::Local)
+        .map(|time| {
+            chrono::DateTime::<chrono::Utc>::from(time)
+                .with_timezone(&chrono::Local)
                 .format("%Y-%m-%d %H:%M:%S")
                 .to_string()
         })
@@ -354,5 +355,25 @@ mod coverage_tests {
             get_detailed_item_info(std::path::Path::new("/definitely/not/here-12345"), 0).is_none()
         );
         assert!(query_fs_info(std::path::Path::new("/definitely/not/here-12345")).is_none());
+    }
+
+    #[test]
+    fn pre_epoch_mtime_displays_exact_date() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("old.txt");
+        std::fs::write(&file, "x").unwrap();
+        let status = std::process::Command::new("touch")
+            .arg("-d")
+            .arg("1960-01-01 00:00:00")
+            .arg(&file)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let info = get_detailed_item_info(&file, 0).unwrap();
+        assert!(
+            info.modified_str.starts_with("1960-01-01"),
+            "unexpected date: {}",
+            info.modified_str
+        );
     }
 }
