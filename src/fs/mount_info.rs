@@ -359,19 +359,38 @@ mod coverage_tests {
 
     #[test]
     fn pre_epoch_mtime_displays_exact_date() {
+        // Noon UTC keeps the local date on 1960-01-01 in every inhabited
+        // timezone. Set through libc (no GNU touch dependency); the expected
+        // date derives through chrono independently of the production path.
+        const NOON_1960_UTC: i64 = -315576000;
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("old.txt");
         std::fs::write(&file, "x").unwrap();
-        let status = std::process::Command::new("touch")
-            .arg("-d")
-            .arg("1960-01-01 00:00:00")
-            .arg(&file)
-            .status()
+        let c_path = std::ffi::CString::new(file.as_os_str().as_bytes()).unwrap();
+        let times = [
+            libc::timespec {
+                tv_sec: NOON_1960_UTC as libc::time_t,
+                tv_nsec: 0,
+            },
+            libc::timespec {
+                tv_sec: NOON_1960_UTC as libc::time_t,
+                tv_nsec: 0,
+            },
+        ];
+        assert_eq!(
+            unsafe { libc::utimensat(libc::AT_FDCWD, c_path.as_ptr(), times.as_ptr(), 0) },
+            0
+        );
+        let expected = chrono::DateTime::from_timestamp(NOON_1960_UTC, 0)
+            .map(|utc| {
+                utc.with_timezone(&chrono::Local)
+                    .format("%Y-%m-%d")
+                    .to_string()
+            })
             .unwrap();
-        assert!(status.success());
         let info = get_detailed_item_info(&file, 0).unwrap();
         assert!(
-            info.modified_str.starts_with("1960-01-01"),
+            info.modified_str.starts_with(&expected),
             "unexpected date: {}",
             info.modified_str
         );
