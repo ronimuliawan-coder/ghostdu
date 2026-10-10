@@ -128,6 +128,12 @@ pub fn scan_directory_with_options(
     Ok(root_entry)
 }
 
+/// Progress-send cadence: every 200 files, at most every 50 ms. Pure so
+/// tests pin every branch without depending on wall-clock scan speed.
+fn throttle_progress(total_files: u64, last: Instant, now: Instant) -> bool {
+    total_files.is_multiple_of(200) && now.saturating_duration_since(last).as_millis() >= 50
+}
+
 #[allow(clippy::too_many_arguments, clippy::only_used_in_recursion)]
 fn scan_dir_recursive(
     dir_path: &Path,
@@ -220,11 +226,13 @@ fn scan_dir_recursive(
         let total_files = files_counter.fetch_add(1, Ordering::Relaxed) + 1;
         bytes_counter.fetch_add(disk_usage, Ordering::Relaxed);
 
-        // Send throttled progress update every ~50ms or every 200 items
+        // Send throttled progress update every ~50ms or every 200 items.
+        // The cadence decision is a pure function (unit-tested below) so no
+        // test depends on wall-clock scan speed.
         if total_files.is_multiple_of(200) {
             if let Some(ref tx) = progress_tx {
                 if let Ok(mut last) = last_progress.lock() {
-                    if last.elapsed().as_millis() >= 50 {
+                    if throttle_progress(total_files, *last, Instant::now()) {
                         *last = Instant::now();
                         let _ = tx.send(ScanProgress {
                             files_scanned: total_files,
@@ -532,6 +540,17 @@ mod coverage_tests {
             }
         }
         assert!(periodic > 0, "expected throttled progress updates");
+    }
+
+    #[test]
+    fn progress_throttle_cadence_branches() {
+        use std::time::Duration;
+        let t0 = Instant::now();
+        assert!(throttle_progress(200, t0, t0 + Duration::from_millis(60)));
+        assert!(throttle_progress(400, t0, t0 + Duration::from_millis(50)));
+        assert!(!throttle_progress(199, t0, t0 + Duration::from_secs(10)));
+        assert!(!throttle_progress(200, t0, t0 + Duration::from_millis(10)));
+        assert!(!throttle_progress(200, t0, t0));
     }
 
     #[test]

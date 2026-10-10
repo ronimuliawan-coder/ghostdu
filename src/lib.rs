@@ -21,7 +21,11 @@ pub(crate) struct XdgGuard {
 #[cfg(test)]
 impl XdgGuard {
     pub(crate) fn set(path: &std::path::Path) -> Self {
-        let lock = XDG_TEST_LOCK.lock().unwrap();
+        // The () payload carries no invariant worth protecting: recover the
+        // lock so one panicking test cannot cascade into unrelated failures.
+        let lock = XDG_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let saved = std::env::var_os("XDG_DATA_HOME");
         unsafe { std::env::set_var("XDG_DATA_HOME", path) };
         Self { _lock: lock, saved }

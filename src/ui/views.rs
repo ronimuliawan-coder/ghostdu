@@ -35,8 +35,8 @@ pub fn centered_rect(width: u16, height: u16, r: Rect) -> Rect {
     let popup_height = height.min(r.height.saturating_sub(2));
 
     Rect {
-        x: (r.width.saturating_sub(popup_width)) / 2,
-        y: (r.height.saturating_sub(popup_height)) / 2,
+        x: r.x + (r.width.saturating_sub(popup_width)) / 2,
+        y: r.y + (r.height.saturating_sub(popup_height)) / 2,
         width: popup_width,
         height: popup_height,
     }
@@ -53,6 +53,9 @@ pub fn render_scan_progress(
 ) {
     let size = f.area();
     let area = centered_rect(60, 10, size);
+    // Path budget follows the actual panel: a fixed 44 overflows narrow
+    // terminals. The files line wraps harmlessly, so it stays as is.
+    let path_budget = (area.width as usize).saturating_sub(16).max(10);
 
     let files_str = format_count(progress.files_scanned as usize);
     let bytes_str = format_size(progress.bytes_scanned);
@@ -100,7 +103,7 @@ pub fn render_scan_progress(
         Line::from(vec![
             Span::styled("Scanning: ", Style::default().fg(Color::DarkGray)),
             Span::styled(
-                truncate_path(&path_str, 44),
+                truncate_path(&path_str, path_budget),
                 Style::default().fg(Color::Yellow),
             ),
         ]),
