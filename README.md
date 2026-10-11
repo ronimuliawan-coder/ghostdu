@@ -167,6 +167,13 @@ ghostdu /
 
 # Non-interactive summary report (or when piped to cat / grep)
 ghostdu --summary ~
+
+# Export a scan to a snapshot file, browse it later read-only
+ghostdu --export /tmp/before.json /var
+ghostdu --import /tmp/before.json
+
+# Compare two snapshots (growth deltas)
+ghostdu diff /tmp/before.json /tmp/after.json
 ```
 
 ---

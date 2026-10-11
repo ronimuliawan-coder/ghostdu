@@ -194,6 +194,11 @@ pub struct App {
     /// Btrfs subvolume boundaries (mount path -> subvolume name), loaded once
     /// from mountinfo. Empty on non-btrfs systems or unreadable mountinfo.
     pub btrfs_subvols: HashMap<PathBuf, String>,
+    /// Snapshot imported from `--import`: browse-only. Every destructive or
+    /// rescanning path refuses with a status message instead of touching the
+    /// live filesystem (remote dev/ino can never verify locally, and a
+    /// remote PID table must never signal local processes).
+    pub imported: bool,
 }
 
 impl App {
@@ -246,6 +251,7 @@ impl App {
             ghost_deleted_scroll_offset: Cell::new(0),
             fs_info,
             btrfs_subvols,
+            imported: false,
             item_info: None,
         }
     }
@@ -833,6 +839,10 @@ impl App {
 
     /// Prepare Move to Wastebin confirmation
     pub fn prompt_move_to_trash(&mut self) {
+        if self.imported {
+            self.set_status("Move to wastebin is disabled for imported snapshots");
+            return;
+        }
         let mut targets = Vec::new();
         let mut total_size = 0u64;
 
@@ -857,6 +867,10 @@ impl App {
 
     /// Prepare Permanent Deletion confirmation
     pub fn prompt_permanent_delete(&mut self) {
+        if self.imported {
+            self.set_status("Permanent delete is disabled for imported snapshots");
+            return;
+        }
         let mut targets = Vec::new();
         let mut total_size = 0u64;
 
@@ -1451,6 +1465,10 @@ impl App {
     /// freshly validated name, and the instance is pinned with a pidfd.
     /// Callers pass PIDs from the ghost table, never free-form input.
     pub fn prompt_kill_process(&mut self, pid: u32) {
+        if self.imported {
+            self.set_status("Process signalling is disabled for imported snapshots");
+            return;
+        }
         let recorded = self
             .deleted_open_files
             .iter()
@@ -1509,6 +1527,11 @@ impl App {
     /// `sigterm` selects SIGTERM (graceful) over SIGKILL. Kernel errors surface
     /// as status messages.
     pub fn execute_kill(&mut self, sigterm: bool) {
+        if self.imported {
+            self.set_status("Process signalling is disabled for imported snapshots");
+            self.pending_action = None;
+            return;
+        }
         let confirmed = self.pending_action.take();
         self.active_view = self.previous_view;
         let Some(ConfirmAction::KillProcess {
@@ -1899,6 +1922,10 @@ impl App {
 
     /// Refresh filesystem stats, directory tree, Docker storage, and ghost files without restarting
     pub fn refresh_all(&mut self) {
+        if self.imported {
+            self.set_status("Refresh is disabled for imported snapshots");
+            return;
+        }
         self.discard_changed_selections();
         let current_path = self.current_dir_entry().path.clone();
         let is_at_root = self.path_stack.is_empty();
@@ -3424,5 +3451,66 @@ mod age_heatmap_tests {
             .map(|e| e.name.clone())
             .collect();
         assert_eq!(names, vec!["new.txt", "mid.txt", "old.txt"]);
+    }
+}
+
+#[cfg(test)]
+mod imported_snapshot_tests {
+    use super::*;
+    use std::sync::{atomic::AtomicBool, Arc};
+
+    fn imported_app() -> (tempfile::TempDir, App) {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("f.txt"), "x").unwrap();
+        let root =
+            crate::fs::scanner::scan_directory(dir.path(), None, Arc::new(AtomicBool::new(false)))
+                .unwrap();
+        let mut app = App::new(root);
+        app.imported = true;
+        (dir, app)
+    }
+
+    #[test]
+    fn imported_prompts_refuse_with_status() {
+        let (_dir, mut app) = imported_app();
+        app.prompt_move_to_trash();
+        assert!(app
+            .current_status()
+            .unwrap_or("")
+            .contains("disabled for imported snapshots"));
+        assert!(app.pending_action.is_none());
+        app.prompt_permanent_delete();
+        assert!(app
+            .current_status()
+            .unwrap_or("")
+            .contains("disabled for imported snapshots"));
+        assert!(app.pending_action.is_none());
+        app.prompt_kill_process(424242);
+        assert!(app
+            .current_status()
+            .unwrap_or("")
+            .contains("disabled for imported snapshots"));
+        assert!(app.pending_action.is_none());
+    }
+
+    #[test]
+    fn imported_execute_and_refresh_refuse() {
+        let (_dir, mut app) = imported_app();
+        app.pending_action = Some(ConfirmAction::KillProcess {
+            pid: 424242,
+            name: "x".to_string(),
+            start_time: 0,
+            pidfd: None,
+        });
+        app.execute_kill(false);
+        assert!(app
+            .current_status()
+            .unwrap_or("")
+            .contains("disabled for imported snapshots"));
+        app.refresh_all();
+        assert!(app
+            .current_status()
+            .unwrap_or("")
+            .contains("disabled for imported snapshots"));
     }
 }
