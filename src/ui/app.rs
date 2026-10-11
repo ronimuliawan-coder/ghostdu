@@ -184,6 +184,9 @@ pub struct App {
     // Global Filesystem and Detailed Item Info
     pub fs_info: Option<FsMountInfo>,
     pub item_info: Option<DetailedItemInfo>,
+    /// Btrfs subvolume boundaries (mount path -> subvolume name), loaded once
+    /// from mountinfo. Empty on non-btrfs systems or unreadable mountinfo.
+    pub btrfs_subvols: HashMap<PathBuf, String>,
 }
 
 impl App {
@@ -191,6 +194,9 @@ impl App {
         let docker_info = fetch_docker_disk_info();
         let deleted_open_files = scan_deleted_open_files();
         let fs_info = query_fs_info(&root_entry.path);
+        let btrfs_subvols = std::fs::read("/proc/self/mountinfo")
+            .map(|topology| crate::fs::scanner::parse_btrfs_subvolumes(&topology))
+            .unwrap_or_default();
 
         Self {
             root_entry,
@@ -231,8 +237,15 @@ impl App {
             ghost_docker_scroll_offset: Cell::new(0),
             ghost_deleted_scroll_offset: Cell::new(0),
             fs_info,
+            btrfs_subvols,
             item_info: None,
         }
+    }
+
+    /// True when a snapshot-like btrfs subvolume is mounted anywhere:
+    /// deletions there may free 0 bytes while snapshots hold the extents.
+    pub fn has_snapshot_volumes(&self) -> bool {
+        crate::fs::scanner::has_snapshot_subvolumes(&self.btrfs_subvols)
     }
 
     /// Refresh Docker and deleted-open ghost file info

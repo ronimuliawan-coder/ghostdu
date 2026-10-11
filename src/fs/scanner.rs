@@ -1,7 +1,7 @@
 use crate::fs::entry::{DeleteSafety, FileEntry};
 use crate::ghost::{classify_path, classify_safety, is_virtual_fs_path};
 use crossbeam_channel::Sender;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 use std::fs;
 use std::os::unix::ffi::OsStringExt;
@@ -435,31 +435,77 @@ pub(crate) fn parse_mount_points(mountinfo: &[u8]) -> HashSet<PathBuf> {
     mountinfo
         .split(|&b| b == b'\n')
         .filter_map(|line| line.split(|&b| b == b' ').nth(4))
-        .map(|path| {
-            let mut decoded = Vec::with_capacity(path.len());
-            let mut i = 0;
-            while i < path.len() {
-                if path[i] == b'\\' && i + 3 < path.len() {
-                    let escaped = &path[i + 1..i + 4];
-                    let byte = match escaped {
-                        b"040" => Some(b' '),
-                        b"011" => Some(b'\t'),
-                        b"012" => Some(b'\n'),
-                        b"134" => Some(b'\\'),
-                        _ => None,
-                    };
-                    if let Some(byte) = byte {
-                        decoded.push(byte);
-                        i += 4;
-                        continue;
-                    }
-                }
-                decoded.push(path[i]);
-                i += 1;
-            }
-            PathBuf::from(OsString::from_vec(decoded))
-        })
+        .map(decode_mount_path)
         .collect()
+}
+
+/// Decodes mountinfo octal escapes (`\040` -> space, etc.); unknown or
+/// truncated sequences stay literal so parsing never fails on odd kernels.
+fn decode_mount_path(field: &[u8]) -> PathBuf {
+    let mut decoded = Vec::with_capacity(field.len());
+    let mut i = 0;
+    while i < field.len() {
+        if field[i] == b'\\' && i + 3 < field.len() {
+            let escaped = &field[i + 1..i + 4];
+            let byte = match escaped {
+                b"040" => Some(b' '),
+                b"011" => Some(b'\t'),
+                b"012" => Some(b'\n'),
+                b"134" => Some(b'\\'),
+                _ => None,
+            };
+            if let Some(byte) = byte {
+                decoded.push(byte);
+                i += 4;
+                continue;
+            }
+        }
+        decoded.push(field[i]);
+        i += 1;
+    }
+    PathBuf::from(OsString::from_vec(decoded))
+}
+
+/// Btrfs subvolume boundaries: mount path -> subvolume name, parsed from the
+/// `subvol=` super-option. Only `btrfs` filesystem lines are considered; all
+/// other lines (wrong fs type, missing option, malformed) are skipped.
+pub(crate) fn parse_btrfs_subvolumes(mountinfo: &[u8]) -> HashMap<PathBuf, String> {
+    let mut subvols = HashMap::new();
+    for line in mountinfo.split(|&b| b == b'\n') {
+        let fields: Vec<&[u8]> = line.split(|&b| b == b' ').collect();
+        let Some(sep) = fields.iter().position(|f| *f == b"-") else {
+            continue;
+        };
+        // Layout: [..., mount point @4, ...] - fstype source super-options.
+        if fields.len() <= 4 || fields.len() < sep + 4 || fields[sep + 1] != b"btrfs" {
+            continue;
+        }
+        let mount_point = decode_mount_path(fields[4]);
+        let name = fields[sep + 3]
+            .split(|&b| b == b',')
+            .find_map(|opt| opt.strip_prefix(b"subvol="))
+            .map(|name| String::from_utf8_lossy(name).into_owned());
+        if let Some(name) = name {
+            subvols.insert(mount_point, name);
+        }
+    }
+    subvols
+}
+
+/// True when any mounted subvolume looks like a snapshot store (Snapper,
+/// Timeshift, or explicit snapshot directories): deleting files there may
+/// free 0 bytes while snapshots reference the extents.
+pub(crate) fn has_snapshot_subvolumes(subvols: &HashMap<PathBuf, String>) -> bool {
+    subvols.iter().any(|(path, name)| {
+        let haystacks = [name.as_str(), &path.to_string_lossy()];
+        haystacks.iter().any(|h| {
+            h.contains("@snapshots")
+                || h.contains(".snapshots")
+                || h.contains("/snapshots/")
+                || h.contains("timeshift")
+                || h.contains("snapper")
+        })
+    })
 }
 
 #[cfg(test)]
@@ -594,6 +640,48 @@ mod coverage_tests {
         assert_eq!(mounts.len(), 1);
         let mounts = parse_mount_points(b"short line\n");
         assert!(mounts.is_empty());
+    }
+
+    #[test]
+    fn parse_btrfs_subvolumes_keeps_names() {
+        let table = b"30 23 0:22 / / rw,relatime shared:1 - btrfs /dev/sda1 rw,ssd,subvolid=256,subvol=/@\n\
+            35 23 0:22 /@/.snapshots /@/.snapshots rw,relatime shared:1 - btrfs /dev/sda1 rw,ssd,subvolid=267,subvol=/@/.snapshots\n\
+            40 23 0:24 / /tmp rw,nosuid,nodev shared:153 - tmpfs tmpfs rw,inode64\n\
+            41 23 0:22 /@/home /home rw,relatime shared:1 - btrfs /dev/sda1 rw,ssd,subvolid=258\n\
+            short line\n";
+        let subvols = parse_btrfs_subvolumes(table);
+        assert_eq!(subvols.get(&PathBuf::from("/")), Some(&"/@".to_string()));
+        assert_eq!(
+            subvols.get(&PathBuf::from("/@/.snapshots")),
+            Some(&"/@/.snapshots".to_string())
+        );
+        // tmpfs skipped, btrfs without subvol= skipped, short lines skipped.
+        assert_eq!(subvols.len(), 2);
+        assert!(has_snapshot_subvolumes(&subvols));
+    }
+
+    #[test]
+    fn snapshot_matcher_ignores_plain_subvolumes() {
+        let mut subvols = HashMap::new();
+        subvols.insert(PathBuf::from("/"), "/@".to_string());
+        subvols.insert(PathBuf::from("/home"), "/@/home".to_string());
+        assert!(!has_snapshot_subvolumes(&subvols));
+        assert!(!has_snapshot_subvolumes(&HashMap::new()));
+        subvols.insert(
+            PathBuf::from("/mnt/backup"),
+            "/timeshift-btrfs/snapshots/2024-01-01".to_string(),
+        );
+        assert!(has_snapshot_subvolumes(&subvols));
+    }
+
+    #[test]
+    fn parse_btrfs_subvolumes_decodes_escapes() {
+        let table = b"30 23 0:22 /my\\040vol /my\\040vol rw shared:1 - btrfs /dev/sda1 rw,subvolid=256,subvol=/myvol\n";
+        let subvols = parse_btrfs_subvolumes(table);
+        assert_eq!(
+            subvols.get(&PathBuf::from("/my vol")),
+            Some(&"/myvol".to_string())
+        );
     }
 }
 

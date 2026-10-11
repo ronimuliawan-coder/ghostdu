@@ -136,8 +136,10 @@ pub fn render_ui(f: &mut Frame, app: &App) {
     }
 
     let footer_len = if size.height >= 5 { 1 } else { 0 };
+    // Snapshot warning takes its own header line when present.
+    let snapshot_extra: u16 = u16::from(app.has_snapshot_volumes());
     let header_len = if size.height >= 22 {
-        5 // 3 lines of content + 2 border rows
+        5 + snapshot_extra // 3 lines of content + 2 border rows
     } else if size.height >= 16 {
         4 // 2 lines of content + 2 border rows
     } else if size.height >= 10 {
@@ -809,7 +811,14 @@ fn render_header(f: &mut Frame, app: &App, area: Rect, header_len: u16) {
         ])
     };
 
-    let header_widget = Paragraph::new(vec![title_line, folder_stat_line, fs_line]).block(
+    let mut header_lines = vec![title_line, folder_stat_line, fs_line];
+    if app.has_snapshot_volumes() {
+        header_lines.push(Line::from(Span::styled(
+            "⚠ snapshots present — deletion may free 0 bytes",
+            Style::default().fg(Color::Yellow),
+        )));
+    }
+    let header_widget = Paragraph::new(header_lines).block(
         Block::default()
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
@@ -943,28 +952,37 @@ fn render_filesystem_view(f: &mut Frame, app: &App, area: Rect) {
                 Style::default().fg(Color::Gray)
             };
 
+            // Btrfs subvolume boundaries get a marker in every row mode.
+            let subvol_suffix = app
+                .btrfs_subvols
+                .get(&entry.path)
+                .map(|name| format!(" ⛁{name}"))
+                .unwrap_or_default();
+
             // In narrow modes (2 & 3), embed ghost badge & safety directly into name column
             let display_name = if col_mode >= 2 {
                 if entry.ghost_kind.is_ghost() {
                     format!(
-                        "{}{} {} {}",
+                        "{}{} {} {}{}",
                         icon,
                         entry.delete_safety.glyph(),
                         entry.ghost_kind.badge(),
-                        entry.name
+                        entry.name,
+                        subvol_suffix,
                     )
                 } else if entry.delete_safety == DeleteSafety::System {
                     format!(
-                        "{}{} SYSTEM {}",
+                        "{}{} SYSTEM {}{}",
                         icon,
                         entry.delete_safety.glyph(),
-                        entry.name
+                        entry.name,
+                        subvol_suffix,
                     )
                 } else {
-                    format!("{}{}", icon, entry.name)
+                    format!("{}{}{}", icon, entry.name, subvol_suffix)
                 }
             } else {
-                format!("{}{}", icon, entry.name)
+                format!("{}{}{}", icon, entry.name, subvol_suffix)
             };
 
             let name_span = Span::styled(display_name, name_style);
@@ -3446,5 +3464,26 @@ mod render_sweep_tests {
         app.active_view = ActiveView::ItemInfoModal;
         let _ = render(&app, 100, 30);
         app.cancel_modal();
+    }
+
+    #[test]
+    fn btrfs_subvolume_badges_and_snapshot_warning() {
+        use std::path::PathBuf;
+        let mut fx = fixture();
+        let app = &mut fx.app;
+        // Fabricate mount topology: a subvolume boundary on the first
+        // visible row plus a snapshot store elsewhere.
+        let first = app.visible_children()[0].path.clone();
+        app.btrfs_subvols.insert(first, "@home".to_string());
+        app.btrfs_subvols
+            .insert(PathBuf::from("/@/.snapshots"), "/@/.snapshots".to_string());
+        assert!(app.has_snapshot_volumes());
+        let out = render(app, 100, 30);
+        assert!(out.contains("⛁@home"), "subvolume badge renders");
+        let wide = render(app, 140, 30);
+        assert!(
+            wide.contains("snapshots present"),
+            "snapshot warning renders"
+        );
     }
 }
