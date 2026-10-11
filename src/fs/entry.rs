@@ -183,7 +183,47 @@ pub struct FileEntry {
     pub ghost_kind: GhostKind,
     pub delete_safety: DeleteSafety,
     pub has_err: bool, // e.g. permission denied
+    /// Last modification time as unix seconds; 0 means unknown. Drives the
+    /// age heatmap, age sorting, and the stale-only filter.
+    pub mtime_secs: i64,
     pub children: Vec<FileEntry>,
+}
+
+/// Explorer age-heatmap tier for one mtime, evaluated against `now_secs`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgeTier {
+    Hot,
+    Active,
+    Warm,
+    Cold,
+    Unknown,
+}
+
+const DAY_SECS: i64 = 86400;
+
+/// Tier boundaries only; rendering maps tiers to glyphs and colors.
+pub fn age_tier(mtime_secs: i64, now_secs: i64) -> AgeTier {
+    if mtime_secs <= 0 {
+        return AgeTier::Unknown;
+    }
+    match now_secs.saturating_sub(mtime_secs) {
+        age if age < 7 * DAY_SECS => AgeTier::Hot,
+        age if age < 30 * DAY_SECS => AgeTier::Active,
+        age if age < 180 * DAY_SECS => AgeTier::Warm,
+        _ => AgeTier::Cold,
+    }
+}
+
+/// Compact explorer glyph per tier; unknown mtimes show nothing rather than
+/// a misleading Cold badge.
+pub fn age_glyph(tier: AgeTier) -> &'static str {
+    match tier {
+        AgeTier::Hot => "🔥",
+        AgeTier::Active => "⚡",
+        AgeTier::Warm => "💤",
+        AgeTier::Cold => "🧊",
+        AgeTier::Unknown => "",
+    }
 }
 
 impl FileEntry {
@@ -220,6 +260,7 @@ impl FileEntry {
             ghost_kind,
             delete_safety,
             has_err: false,
+            mtime_secs: 0,
             children: Vec::new(),
         }
     }
@@ -248,6 +289,7 @@ impl FileEntry {
             ghost_kind,
             delete_safety,
             has_err: false,
+            mtime_secs: 0,
             children: Vec::new(),
         }
     }
@@ -526,5 +568,26 @@ mod coverage_tests {
         assert_eq!(truncate_end_by_width("xye\u{301}zzz", 5), "xy...");
         assert_eq!(truncate_start_by_width("xye\u{301}", 2), "ye\u{301}");
         assert_eq!(truncate_start_by_width("zzzzye\u{301}", 5), "...ye\u{301}");
+    }
+
+    #[test]
+    fn age_tier_boundaries_and_glyphs() {
+        const DAY: i64 = 86400;
+        let now = 1_000_000_000;
+        assert_eq!(age_tier(now, now), AgeTier::Hot);
+        assert_eq!(age_tier(now - 6 * DAY, now), AgeTier::Hot);
+        assert_eq!(age_tier(now - 7 * DAY, now), AgeTier::Active);
+        assert_eq!(age_tier(now - 29 * DAY, now), AgeTier::Active);
+        assert_eq!(age_tier(now - 30 * DAY, now), AgeTier::Warm);
+        assert_eq!(age_tier(now - 179 * DAY, now), AgeTier::Warm);
+        assert_eq!(age_tier(now - 180 * DAY, now), AgeTier::Cold);
+        assert_eq!(age_tier(now - 400 * DAY, now), AgeTier::Cold);
+        assert_eq!(age_tier(0, now), AgeTier::Unknown);
+        assert_eq!(age_tier(-100, now), AgeTier::Unknown);
+        assert_eq!(age_glyph(AgeTier::Hot), "🔥");
+        assert_eq!(age_glyph(AgeTier::Active), "⚡");
+        assert_eq!(age_glyph(AgeTier::Warm), "💤");
+        assert_eq!(age_glyph(AgeTier::Cold), "🧊");
+        assert_eq!(age_glyph(AgeTier::Unknown), "");
     }
 }

@@ -79,6 +79,7 @@ pub fn scan_directory_with_options(
         ghost,
         safety,
     );
+    root_entry.mtime_secs = mtime_secs(&root_meta);
 
     let mount_points = if options.cross_mounts {
         HashSet::new()
@@ -251,6 +252,7 @@ fn scan_dir_recursive(
             let delete_safety = classify_safety(&path, ghost_kind);
             let mut dir_node =
                 FileEntry::new_dir(file_name, path.clone(), dev, ino, ghost_kind, delete_safety);
+            dir_node.mtime_secs = mtime_secs(&meta);
 
             // mountinfo also identifies bind mounts whose device matches the root.
             let is_cross_mount = dev != root_dev || mount_points.contains(&path);
@@ -321,6 +323,16 @@ fn scan_dir_recursive(
     parent_entry.children = sub_entries;
 }
 
+/// Unix seconds of `meta` mtime for the age heatmap; 0 (unknown) when
+/// unreadable or pre-epoch. Every line runs on the happy path by construction.
+fn mtime_secs(meta: &fs::Metadata) -> i64 {
+    meta.modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
 fn file_entry(
     path: PathBuf,
     meta: &fs::Metadata,
@@ -361,6 +373,7 @@ fn file_entry(
     // Store counted size for aggregation
     file_node.size = counted_size;
     file_node.disk_usage = counted_disk;
+    file_node.mtime_secs = mtime_secs(meta);
     // Any unselected or unseen link can retain the inode blocks.
     if meta.nlink() > 1 {
         file_node.reclaimable = 0;
@@ -401,6 +414,7 @@ pub(crate) fn rescan_entry(
         ghost,
         classify_safety(path, ghost),
     );
+    entry.mtime_secs = mtime_secs(&meta);
     let mounts = parse_mount_points(&fs::read("/proc/self/mountinfo")?);
     if meta.dev() == root_dev
         && !mounts.contains(path)

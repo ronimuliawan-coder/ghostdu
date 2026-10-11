@@ -124,7 +124,8 @@ High-impact disk consumers across modern Linux desktop and developer environment
 | `p` | Prune Docker dangling resources (in Ghost Inspector) |
 | **Search, Sort & Refresh** | |
 | `/` | Interactive live search / filter (type to match, `Esc` to clear) |
-| `s` | Cycle sort order (*Size desc*, *Size asc*, *Name*, *Item count*) |
+| `s` | Cycle sort order (*Size desc*, *Size asc*, *Name*, *Item count*, *Age oldest*, *Age newest*) |
+| `m` | Toggle Stale-only filter (🧊 items untouched ≥ 180 days) |
 | `A` | Toggle Apparent size vs Actual block disk usage |
 | `r` | Refresh current directory |
 | `R` | Rescan entire tree from root |

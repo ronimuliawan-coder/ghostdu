@@ -99,6 +99,8 @@ pub enum SortMode {
     BySizeAsc,
     ByName,
     ByItems,
+    ByAgeDesc,
+    ByAgeAsc,
 }
 
 impl SortMode {
@@ -107,7 +109,9 @@ impl SortMode {
             SortMode::BySizeDesc => SortMode::BySizeAsc,
             SortMode::BySizeAsc => SortMode::ByName,
             SortMode::ByName => SortMode::ByItems,
-            SortMode::ByItems => SortMode::BySizeDesc,
+            SortMode::ByItems => SortMode::ByAgeDesc,
+            SortMode::ByAgeDesc => SortMode::ByAgeAsc,
+            SortMode::ByAgeAsc => SortMode::BySizeDesc,
         }
     }
 
@@ -117,6 +121,8 @@ impl SortMode {
             SortMode::BySizeAsc => "Size (asc)",
             SortMode::ByName => "Name",
             SortMode::ByItems => "Item Count",
+            SortMode::ByAgeDesc => "Age (oldest)",
+            SortMode::ByAgeAsc => "Age (newest)",
         }
     }
 }
@@ -164,6 +170,7 @@ pub struct App {
     pub action_has_recheck: bool,
     pub action_has_system: bool,
     pub safe_only_filter: bool,
+    pub stale_only_filter: bool,
 
     // Ghost Inspector data
     pub docker_info: DockerDiskInfo,
@@ -223,6 +230,7 @@ impl App {
             action_has_recheck: false,
             action_has_system: false,
             safe_only_filter: false,
+            stale_only_filter: false,
             docker_info,
             deleted_open_files,
             ghost_tab_index: 0,
@@ -330,6 +338,20 @@ impl App {
                     true
                 }
             })
+            .filter(|entry| {
+                // 4. Stale-only filter (m key): proven-stale entries with a
+                // known mtime at least 180 days old. Unknown mtimes never
+                // match, so the filter only shows what it can prove.
+                if self.stale_only_filter {
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs() as i64)
+                        .unwrap_or(0);
+                    entry.mtime_secs > 0 && now.saturating_sub(entry.mtime_secs) >= 180 * 86400
+                } else {
+                    true
+                }
+            })
             .collect();
 
         // Sort items
@@ -355,6 +377,20 @@ impl App {
                 list.sort_by(|a, b| {
                     b.items_count
                         .cmp(&a.items_count)
+                        .then_with(|| a.name.cmp(&b.name))
+                });
+            }
+            SortMode::ByAgeDesc => {
+                list.sort_by(|a, b| {
+                    a.mtime_secs
+                        .cmp(&b.mtime_secs)
+                        .then_with(|| a.name.cmp(&b.name))
+                });
+            }
+            SortMode::ByAgeAsc => {
+                list.sort_by(|a, b| {
+                    b.mtime_secs
+                        .cmp(&a.mtime_secs)
                         .then_with(|| a.name.cmp(&b.name))
                 });
             }
@@ -780,6 +816,18 @@ impl App {
             self.set_status("Safe-to-Clean filter: ON (showing only 🟢 safe items)");
         } else {
             self.set_status("Safe-to-Clean filter: OFF (showing all items)");
+        }
+    }
+
+    /// Toggle filter showing only proven-stale items (mtime ≥ 180 days ago)
+    pub fn toggle_stale_filter(&mut self) {
+        self.stale_only_filter = !self.stale_only_filter;
+        self.cursor_index = 0;
+        self.scroll_offset.set(0);
+        if self.stale_only_filter {
+            self.set_status("Stale-only filter: ON (showing only 🧊 items untouched ≥ 180 days)");
+        } else {
+            self.set_status("Stale-only filter: OFF (showing all items)");
         }
     }
 
@@ -2662,8 +2710,12 @@ mod selection_limit_tests {
             GhostFilterMode::GhostOnly
         );
         assert_eq!(GhostFilterMode::GhostOnly.next(), GhostFilterMode::ShowAll);
-        assert_eq!(SortMode::ByItems.next(), SortMode::BySizeDesc);
+        assert_eq!(SortMode::ByItems.next(), SortMode::ByAgeDesc);
+        assert_eq!(SortMode::ByAgeDesc.next(), SortMode::ByAgeAsc);
+        assert_eq!(SortMode::ByAgeAsc.next(), SortMode::BySizeDesc);
         assert_eq!(SortMode::BySizeDesc.label(), "Size (desc)");
+        assert_eq!(SortMode::ByAgeDesc.label(), "Age (oldest)");
+        assert_eq!(SortMode::ByAgeAsc.label(), "Age (newest)");
         let (_dir, mut app) = app_with_files(1);
         app.refresh_ghost_info();
         assert!(app.current_status().unwrap_or("").contains("Docker"));
@@ -3279,5 +3331,98 @@ mod coverage_gap_tests {
         app.cursor_index = 999;
         app.execute_pending_action();
         assert_eq!(app.cursor_index, app.visible_children().len() - 1);
+    }
+}
+
+#[cfg(test)]
+mod age_heatmap_tests {
+    use super::*;
+    use crate::fs::entry::GhostKind;
+    use std::sync::{atomic::AtomicBool, Arc};
+
+    const DAY: i64 = 86400;
+
+    fn now_secs() -> i64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0)
+    }
+
+    fn app_with_files(count: usize) -> (tempfile::TempDir, App) {
+        let dir = tempfile::tempdir().unwrap();
+        for i in 0..count {
+            std::fs::write(dir.path().join(format!("f{i:04}")), "x").unwrap();
+        }
+        let root =
+            crate::fs::scanner::scan_directory(dir.path(), None, Arc::new(AtomicBool::new(false)))
+                .unwrap();
+        (dir, App::new(root))
+    }
+
+    fn aged_row(name: &str, days_old: i64) -> FileEntry {
+        let mut row = FileEntry::new_file(
+            name.to_string(),
+            std::path::PathBuf::from(format!("/synth/{name}")),
+            100,
+            100,
+            false,
+            1,
+            9000,
+            GhostKind::None,
+            DeleteSafety::UserData,
+        );
+        row.mtime_secs = now_secs() - days_old * DAY;
+        row
+    }
+
+    #[test]
+    fn stale_filter_shows_only_proven_stale() {
+        let (_dir, mut app) = app_with_files(2);
+        // Fresh scan: nothing is stale.
+        assert!(!app.stale_only_filter);
+        app.toggle_stale_filter();
+        assert!(app.stale_only_filter);
+        assert!(app.visible_children().is_empty());
+        // A 200-day-old row passes; unknown mtime never does.
+        app.root_entry.children.push(aged_row("old.txt", 200));
+        let mut unknown = aged_row("mystery.txt", 1);
+        unknown.mtime_secs = 0;
+        app.root_entry.children.push(unknown);
+        let visible = app.visible_children();
+        assert_eq!(visible.len(), 1);
+        assert_eq!(visible[0].name, "old.txt");
+        assert!(app
+            .current_status()
+            .unwrap_or("")
+            .contains("Stale-only filter: ON"));
+        app.toggle_stale_filter();
+        assert!(!app.stale_only_filter);
+        assert!(app
+            .current_status()
+            .unwrap_or("")
+            .contains("Stale-only filter: OFF"));
+    }
+
+    #[test]
+    fn age_sort_orders_by_mtime() {
+        let (_dir, mut app) = app_with_files(0);
+        app.root_entry.children.push(aged_row("new.txt", 1));
+        app.root_entry.children.push(aged_row("old.txt", 300));
+        app.root_entry.children.push(aged_row("mid.txt", 30));
+        app.sort_mode = SortMode::ByAgeDesc;
+        let names: Vec<_> = app
+            .visible_children()
+            .iter()
+            .map(|e| e.name.clone())
+            .collect();
+        assert_eq!(names, vec!["old.txt", "mid.txt", "new.txt"]);
+        app.sort_mode = SortMode::ByAgeAsc;
+        let names: Vec<_> = app
+            .visible_children()
+            .iter()
+            .map(|e| e.name.clone())
+            .collect();
+        assert_eq!(names, vec!["new.txt", "mid.txt", "old.txt"]);
     }
 }

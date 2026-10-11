@@ -896,6 +896,12 @@ fn render_filesystem_view(f: &mut Frame, app: &App, area: Rect) {
         3 // Ultra narrow: 3 columns
     };
 
+    // Age-heatmap clock, read once per render for stable glyphs.
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+
     let rows: Vec<Row> = visible
         .iter()
         .enumerate()
@@ -984,6 +990,11 @@ fn render_filesystem_view(f: &mut Frame, app: &App, area: Rect) {
             } else {
                 format!("{}{}{}", icon, entry.name, subvol_suffix)
             };
+
+            let display_name = format!(
+                "{display_name}{}",
+                crate::fs::entry::age_glyph(crate::fs::entry::age_tier(entry.mtime_secs, now_secs))
+            );
 
             let name_span = Span::styled(display_name, name_style);
 
@@ -2272,6 +2283,7 @@ fn render_help_modal(f: &mut Frame, screen: Rect) {
             Line::from("  s            Cycle sort order"),
             Line::from("  A            Toggle Apparent size"),
             Line::from("  c            Toggle Safe-only filter (🟢)"),
+            Line::from("  m            Toggle Stale-only filter (🧊 ≥180d)"),
             Line::from("  /            Live search / filter"),
             Line::from("  q / Ctrl+C   Quit ghostdu"),
         ];
@@ -3109,6 +3121,8 @@ mod render_sweep_tests {
             SortMode::BySizeAsc,
             SortMode::ByName,
             SortMode::ByItems,
+            SortMode::ByAgeDesc,
+            SortMode::ByAgeAsc,
         ] {
             app.sort_mode = mode;
             let _ = render(app, 100, 30);
@@ -3464,6 +3478,48 @@ mod render_sweep_tests {
         app.active_view = ActiveView::ItemInfoModal;
         let _ = render(&app, 100, 30);
         app.cancel_modal();
+    }
+
+    #[test]
+    fn age_heatmap_glyphs() {
+        use crate::fs::entry::{DeleteSafety, FileEntry, GhostKind};
+        use std::path::PathBuf;
+        let mut fx = fixture();
+        // One row per tier plus an unknown: all visible without scrolling.
+        // Margins are days wide against the same clock production reads.
+        const DAY: i64 = 86400;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        for (i, (name, days)) in [
+            ("age-hot", 1),
+            ("age-active", 10),
+            ("age-warm", 100),
+            ("age-cold", 300),
+        ]
+        .iter()
+        .enumerate()
+        {
+            let mut row = FileEntry::new_file(
+                name.to_string(),
+                PathBuf::from(format!("/synth/{name}")),
+                100,
+                100,
+                false,
+                1,
+                9200 + i as u64,
+                GhostKind::None,
+                DeleteSafety::UserData,
+            );
+            row.mtime_secs = now - days * DAY;
+            fx.app.root_entry.children.push(row);
+        }
+        let out = render(&fx.app, 100, 30);
+        assert!(out.contains("🔥"), "hot glyph renders");
+        assert!(out.contains("⚡"), "active glyph renders");
+        assert!(out.contains("💤"), "warm glyph renders");
+        assert!(out.contains("🧊"), "cold glyph renders");
     }
 
     #[test]

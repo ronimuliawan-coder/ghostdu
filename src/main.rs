@@ -105,6 +105,12 @@ enum SortArg {
     Name,
     /// Most items first
     Items,
+    /// Oldest first
+    #[value(name = "age")]
+    Age,
+    /// Newest first
+    #[value(name = "age-asc")]
+    AgeAsc,
 }
 
 /// Binary entry point. Excluded from ptrace-based line coverage: the test
@@ -396,6 +402,8 @@ fn apply_cli_display(app: &mut App, cli: &Cli) {
             SortArg::SizeAsc => SortMode::BySizeAsc,
             SortArg::Name => SortMode::ByName,
             SortArg::Items => SortMode::ByItems,
+            SortArg::Age => SortMode::ByAgeDesc,
+            SortArg::AgeAsc => SortMode::ByAgeAsc,
         };
     }
 }
@@ -670,6 +678,10 @@ mod cli_tests {
         assert!(matches!(cli.sort, Some(SortArg::Size)));
         let cli = parse(&["ghostdu", "--sort", "items"]);
         assert!(matches!(cli.sort, Some(SortArg::Items)));
+        let cli = parse(&["ghostdu", "--sort", "age"]);
+        assert!(matches!(cli.sort, Some(SortArg::Age)));
+        let cli = parse(&["ghostdu", "--sort", "age-asc"]);
+        assert!(matches!(cli.sort, Some(SortArg::AgeAsc)));
         let cli = parse(&["ghostdu", "--export", "/tmp/x.json"]);
         assert_eq!(cli.export, Some(PathBuf::from("/tmp/x.json")));
         let cli = parse(&["ghostdu", "--print-completions", "bash"]);
@@ -813,13 +825,15 @@ mod cli_tests {
             ("--hide-ghost", SortArg::Size),
             ("--hide-ghost", SortArg::SizeAsc),
             ("--hide-ghost", SortArg::Name),
+            ("--hide-ghost", SortArg::Age),
+            ("--hide-ghost", SortArg::AgeAsc),
         ] {
             let flag = flag.to_string();
             let cli = parse(&["ghostdu", &flag, "--sort", sort_name(sort)]);
             apply_cli_display(&mut app, &cli);
             assert_eq!(app.ghost_filter, GhostFilterMode::HideGhost);
         }
-        assert_eq!(app.sort_mode, SortMode::ByName);
+        assert_eq!(app.sort_mode, SortMode::ByAgeAsc);
     }
 
     fn sort_name(sort: SortArg) -> &'static str {
@@ -828,6 +842,8 @@ mod cli_tests {
             SortArg::SizeAsc => "size-asc",
             SortArg::Name => "name",
             SortArg::Items => "items",
+            SortArg::Age => "age",
+            SortArg::AgeAsc => "age-asc",
         }
     }
 
