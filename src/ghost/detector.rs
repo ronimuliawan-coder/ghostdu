@@ -457,6 +457,14 @@ mod tests {
             GhostKind::DockerBuildkit
         );
         assert_eq!(
+            classify_path(&PathBuf::from("/var/lib/docker/network/files/local-kv.db")),
+            GhostKind::DockerUser
+        );
+        assert_eq!(
+            classify_path(&PathBuf::from("/var/run/docker.sock")),
+            GhostKind::DockerUser
+        );
+        assert_eq!(
             classify_path(&PathBuf::from("/home/ron/.local/share/docker")),
             GhostKind::DockerUser
         );
@@ -618,6 +626,18 @@ mod tests {
         assert_eq!(
             classify_path(&PathBuf::from("/home/ron/documents/photo.jpg")),
             GhostKind::None
+        );
+        assert_eq!(
+            classify_path(&PathBuf::from("/home/ron/.docker/config.json")),
+            GhostKind::DockerUser
+        );
+        assert_eq!(
+            classify_path(&PathBuf::from("/home/ron/.local/state/app/log")),
+            GhostKind::LogFiles
+        );
+        assert_eq!(
+            classify_safety(&PathBuf::from("/var/log"), GhostKind::LogFiles),
+            DeleteSafety::Recheck
         );
     }
 
