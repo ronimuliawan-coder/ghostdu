@@ -258,8 +258,9 @@ impl App {
 
     /// True when a snapshot-like btrfs subvolume is mounted anywhere:
     /// deletions there may free 0 bytes while snapshots hold the extents.
+    /// Always false for imported snapshots, whose live topology is absent.
     pub fn has_snapshot_volumes(&self) -> bool {
-        crate::fs::scanner::has_snapshot_subvolumes(&self.btrfs_subvols)
+        !self.imported && crate::fs::scanner::has_snapshot_subvolumes(&self.btrfs_subvols)
     }
 
     /// Refresh Docker and deleted-open ghost file info
@@ -318,6 +319,13 @@ impl App {
             Some(self.search_query.to_lowercase())
         };
 
+        // Clock read once per call so every entry shares the same age
+        // reference (and the syscall runs once per frame, not per row).
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+
         let mut list: Vec<&FileEntry> = current
             .children
             .iter()
@@ -349,11 +357,7 @@ impl App {
                 // known mtime at least 180 days old. Unknown mtimes never
                 // match, so the filter only shows what it can prove.
                 if self.stale_only_filter {
-                    let now = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.as_secs() as i64)
-                        .unwrap_or(0);
-                    entry.mtime_secs > 0 && now.saturating_sub(entry.mtime_secs) >= 180 * 86400
+                    entry.mtime_secs > 0 && now_secs.saturating_sub(entry.mtime_secs) >= 180 * 86400
                 } else {
                     true
                 }
@@ -1231,6 +1235,10 @@ impl App {
     /// Trash or delete checked janitor rows through the standard confirmation
     /// flow. Trash contents route to permanent delete with an explanation.
     pub fn janitor_action(&mut self, to_trash: bool) {
+        if self.imported {
+            self.set_status("Destructive actions are disabled for imported snapshots");
+            return;
+        }
         let mut targets = Vec::new();
         let mut total = 0u64;
         let mut trash_only_hit = false;
@@ -1305,6 +1313,10 @@ impl App {
     /// Trash or delete the highlighted leaderboard row through the standard
     /// confirmation flow (live identity re-verified before any mutation).
     pub fn top_file_action(&mut self, to_trash: bool) {
+        if self.imported {
+            self.set_status("Destructive actions are disabled for imported snapshots");
+            return;
+        }
         let Some(top) = self.top_files.get(self.top_cursor).cloned() else {
             return;
         };
@@ -1424,6 +1436,10 @@ impl App {
 
     /// Prepare Docker Prune confirmation
     pub fn prompt_docker_prune(&mut self) {
+        if self.imported {
+            self.set_status("Docker prune is disabled for imported snapshots");
+            return;
+        }
         let total_reclaimable = self.docker_info.images_reclaimable_size
             + self.docker_info.containers_reclaimable_size
             + self.docker_info.volumes_reclaimable_size
@@ -1575,6 +1591,11 @@ impl App {
 
     /// Execute pending action after user confirms
     pub fn execute_pending_action(&mut self) {
+        if self.imported {
+            self.set_status("Destructive actions are disabled for imported snapshots");
+            self.cancel_modal();
+            return;
+        }
         if self.action_safety_blocked {
             self.set_status("⛔ BLOCKED: Cannot delete protected system file/directory!");
             self.cancel_modal();
@@ -3512,5 +3533,45 @@ mod imported_snapshot_tests {
             .current_status()
             .unwrap_or("")
             .contains("disabled for imported snapshots"));
+    }
+
+    #[test]
+    fn imported_docker_prune_and_confirmed_execute_refuse() {
+        let (_dir, mut app) = imported_app();
+        app.prompt_docker_prune();
+        assert!(app
+            .current_status()
+            .unwrap_or("")
+            .contains("disabled for imported snapshots"));
+        assert!(app.pending_action.is_none());
+        app.pending_action = Some(ConfirmAction::KillProcess {
+            pid: 424242,
+            name: "x".to_string(),
+            start_time: 0,
+            pidfd: None,
+        });
+        app.execute_pending_action();
+        assert!(app
+            .current_status()
+            .unwrap_or("")
+            .contains("disabled for imported snapshots"));
+        assert!(app.pending_action.is_none());
+    }
+
+    #[test]
+    fn imported_janitor_and_top_file_refuse() {
+        let (_dir, mut app) = imported_app();
+        app.janitor_action(true);
+        assert!(app
+            .current_status()
+            .unwrap_or("")
+            .contains("disabled for imported snapshots"));
+        assert!(app.pending_action.is_none());
+        app.top_file_action(false);
+        assert!(app
+            .current_status()
+            .unwrap_or("")
+            .contains("disabled for imported snapshots"));
+        assert!(app.pending_action.is_none());
     }
 }

@@ -310,6 +310,15 @@ fn render_header(f: &mut Frame, app: &App, area: Rect, header_len: u16) {
         if safe_reclaimable > 0 {
             append_if_fits(&mut line_spans, vec![safe_stat_span], content_width);
         }
+        // Snapshot-store warning in the compact header too: deletions may
+        // free 0 bytes while snapshots reference the extents.
+        if app.has_snapshot_volumes() {
+            append_if_fits(
+                &mut line_spans,
+                vec![Span::styled(" ⚠snap", Style::default().fg(Color::Yellow))],
+                content_width,
+            );
+        }
         append_if_fits(
             &mut line_spans,
             vec![
@@ -959,9 +968,11 @@ fn render_filesystem_view(f: &mut Frame, app: &App, area: Rect) {
             };
 
             // Btrfs subvolume boundaries get a marker in every row mode.
+            // Imported snapshots carry no live topology, so no badges there.
             let subvol_suffix = app
                 .btrfs_subvols
                 .get(&entry.path)
+                .filter(|_| !app.imported)
                 .map(|name| format!(" ⛁{name}"))
                 .unwrap_or_default();
 
@@ -3541,5 +3552,36 @@ mod render_sweep_tests {
             wide.contains("snapshots present"),
             "snapshot warning renders"
         );
+    }
+
+    #[test]
+    fn imported_snapshot_hides_topology() {
+        use std::path::PathBuf;
+        let mut fx = fixture();
+        let app = &mut fx.app;
+        let first = app.visible_children()[0].path.clone();
+        app.btrfs_subvols.insert(first, "@home".to_string());
+        app.btrfs_subvols
+            .insert(PathBuf::from("/@/.snapshots"), "/@/.snapshots".to_string());
+        app.imported = true;
+        assert!(!app.has_snapshot_volumes());
+        let out = render(app, 100, 30);
+        assert!(!out.contains("⛁"), "no subvolume badges for imports");
+        assert!(
+            !out.contains("snapshots present"),
+            "no snapshot warning for imports"
+        );
+    }
+
+    #[test]
+    fn compact_header_shows_snapshot_warning() {
+        use std::path::PathBuf;
+        let mut fx = fixture();
+        fx.app
+            .btrfs_subvols
+            .insert(PathBuf::from("/@/.snapshots"), "/@/.snapshots".to_string());
+        assert!(fx.app.has_snapshot_volumes());
+        let out = render(&fx.app, 100, 7);
+        assert!(out.contains("snap"), "compact header carries the warning");
     }
 }

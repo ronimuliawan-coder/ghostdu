@@ -313,6 +313,10 @@ fn scan_dir_recursive(
     parent_entry.disk_usage = total_disk;
     parent_entry.reclaimable = total_reclaimable;
     parent_entry.items_count = total_items + 1; // plus the directory itself
+                                                // Directory staleness follows its newest content: the directory inode
+                                                // itself only changes on entry add/remove, not on child edits.
+    let newest_child = sub_entries.iter().map(|c| c.mtime_secs).fold(0, Ord::max);
+    parent_entry.mtime_secs = parent_entry.mtime_secs.max(newest_child);
     if parent_entry.delete_safety == DeleteSafety::Safe {
         parent_entry.safe_reclaimable = total_reclaimable;
         parent_entry.safe_items = 1;
@@ -506,18 +510,23 @@ pub(crate) fn parse_btrfs_subvolumes(mountinfo: &[u8]) -> HashMap<PathBuf, Strin
     subvols
 }
 
-/// True when any mounted subvolume looks like a snapshot store (Snapper,
+/// True when any mounted subvolume is itself a snapshot store (Snapper,
 /// Timeshift, or explicit snapshot directories): deleting files there may
-/// free 0 bytes while snapshots reference the extents.
+/// free 0 bytes while snapshots reference the extents. Matches exact path
+/// components of the subvolume name only, so unrelated paths merely
+/// containing those words (e.g. `snapper-notes`) never match.
 pub(crate) fn has_snapshot_subvolumes(subvols: &HashMap<PathBuf, String>) -> bool {
-    subvols.iter().any(|(path, name)| {
-        let haystacks = [name.as_str(), &path.to_string_lossy()];
-        haystacks.iter().any(|h| {
-            h.contains("@snapshots")
-                || h.contains(".snapshots")
-                || h.contains("/snapshots/")
-                || h.contains("timeshift")
-                || h.contains("snapper")
+    use std::path::Component;
+    subvols.values().any(|name| {
+        Path::new(name).components().any(|component| {
+            matches!(
+                component,
+                Component::Normal(part)
+                    if matches!(
+                        part.to_str(),
+                        Some("@snapshots" | ".snapshots" | "snapshots" | "timeshift-btrfs")
+                    )
+            )
         })
     })
 }
@@ -546,6 +555,54 @@ mod coverage_tests {
 
     fn stop() -> Arc<AtomicBool> {
         Arc::new(AtomicBool::new(false))
+    }
+
+    #[test]
+    fn snapshot_matcher_uses_exact_path_components() {
+        let yes: HashMap<PathBuf, String> = [
+            (PathBuf::from("/@"), "@snapshots".to_string()),
+            (PathBuf::from("/t"), "timeshift-btrfs".to_string()),
+            (PathBuf::from("/@"), ".snapshots".to_string()),
+        ]
+        .into_iter()
+        .collect();
+        assert!(has_snapshot_subvolumes(&yes));
+        // Near-misses must not match: the mount path is no longer consulted
+        // and bare substrings inside a component do not count.
+        let no: HashMap<PathBuf, String> = [
+            (PathBuf::from("/snapshots-backup"), "data".to_string()),
+            (PathBuf::from("/x"), "snapper-notes".to_string()),
+            (PathBuf::from("/y"), "my-timeshift".to_string()),
+        ]
+        .into_iter()
+        .collect();
+        assert!(!has_snapshot_subvolumes(&no));
+    }
+
+    #[test]
+    fn directory_mtime_follows_newest_child() {
+        let dir = tempfile::tempdir().unwrap();
+        let sub = dir.path().join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        std::fs::write(sub.join("new.txt"), "x").unwrap();
+        // Backdate both directory inodes: the content stays newer than its
+        // containers, so aggregation must surface the file's mtime.
+        for p in [dir.path().to_path_buf(), sub.clone()] {
+            let st = std::process::Command::new("touch")
+                .arg("-d")
+                .arg("2001-01-01")
+                .arg(&p)
+                .status()
+                .unwrap();
+            assert!(st.success());
+        }
+        let root = scan_directory(dir.path(), None, stop()).unwrap();
+        assert!(
+            root.mtime_secs > 1_000_000_000,
+            "root follows its newest content, not its own inode"
+        );
+        let sub_entry = root.children.iter().find(|c| c.name == "sub").unwrap();
+        assert_eq!(sub_entry.mtime_secs, root.mtime_secs);
     }
 
     #[test]
