@@ -392,15 +392,20 @@ impl App {
             }
             SortMode::ByAgeDesc => {
                 list.sort_by(|a, b| {
-                    a.mtime_secs
-                        .cmp(&b.mtime_secs)
+                    // Unknown mtimes (0) sort after every known one: they
+                    // carry no age information, so ranking them oldest would
+                    // lie. Same rule as the stale-only filter.
+                    (a.mtime_secs <= 0)
+                        .cmp(&(b.mtime_secs <= 0))
+                        .then_with(|| a.mtime_secs.cmp(&b.mtime_secs))
                         .then_with(|| a.name.cmp(&b.name))
                 });
             }
             SortMode::ByAgeAsc => {
                 list.sort_by(|a, b| {
-                    b.mtime_secs
-                        .cmp(&a.mtime_secs)
+                    (a.mtime_secs <= 0)
+                        .cmp(&(b.mtime_secs <= 0))
+                        .then_with(|| b.mtime_secs.cmp(&a.mtime_secs))
                         .then_with(|| a.name.cmp(&b.name))
                 });
             }
@@ -1873,6 +1878,15 @@ impl App {
             entry.disk_usage = total_disk;
             entry.reclaimable = total_reclaimable;
             entry.items_count = total_items + 1;
+            // Same newest-content rule as the full scan: incremental updates
+            // must refresh ancestor staleness too, or the stale filter and
+            // age sorts keep ranking on pre-refresh timestamps.
+            let newest_child = entry
+                .children
+                .iter()
+                .map(|c| c.mtime_secs)
+                .fold(0, Ord::max);
+            entry.mtime_secs = entry.mtime_secs.max(newest_child);
             if entry.delete_safety == DeleteSafety::Safe {
                 entry.safe_reclaimable = total_reclaimable;
                 entry.safe_items = 1;
@@ -3458,20 +3472,38 @@ mod age_heatmap_tests {
         app.root_entry.children.push(aged_row("new.txt", 1));
         app.root_entry.children.push(aged_row("old.txt", 300));
         app.root_entry.children.push(aged_row("mid.txt", 30));
+        // Unknown mtimes carry no age info: last in both directions.
+        let mut unknown = aged_row("mystery.txt", 1);
+        unknown.mtime_secs = 0;
+        app.root_entry.children.push(unknown);
         app.sort_mode = SortMode::ByAgeDesc;
         let names: Vec<_> = app
             .visible_children()
             .iter()
             .map(|e| e.name.clone())
             .collect();
-        assert_eq!(names, vec!["old.txt", "mid.txt", "new.txt"]);
+        assert_eq!(names, vec!["old.txt", "mid.txt", "new.txt", "mystery.txt"]);
         app.sort_mode = SortMode::ByAgeAsc;
         let names: Vec<_> = app
             .visible_children()
             .iter()
             .map(|e| e.name.clone())
             .collect();
-        assert_eq!(names, vec!["new.txt", "mid.txt", "old.txt"]);
+        assert_eq!(names, vec!["new.txt", "mid.txt", "old.txt", "mystery.txt"]);
+    }
+
+    #[test]
+    fn subtree_refresh_updates_ancestor_mtime() {
+        let (_dir, mut app) = app_with_files(1);
+        let target = app.root_entry.children[0].path.clone();
+        // Backdate the ancestor, then refresh the child with a newer mtime:
+        // incremental updates must surface it just like a full scan.
+        app.root_entry.mtime_secs = 1;
+        let mut fresh = app.root_entry.children[0].clone();
+        let now = now_secs();
+        fresh.mtime_secs = now;
+        app.replace_subtree(&target, fresh);
+        assert_eq!(app.root_entry.mtime_secs, now);
     }
 }
 
