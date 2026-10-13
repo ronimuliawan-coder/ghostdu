@@ -159,6 +159,8 @@ impl std::fmt::Display for DiffReport {
             self.removed_count,
             crate::fs::entry::format_size(self.removed_bytes)
         ));
+        format_delta_list("Added:", &self.added, &mut out);
+        format_delta_list("Removed:", &self.removed, &mut out);
         format_delta_list("Grew:", &self.grown, &mut out);
         format_delta_list("Shrank:", &self.shrunk, &mut out);
         write!(f, "{out}")
@@ -233,6 +235,10 @@ mod tests {
         assert!(text.contains("Added 2 paths"));
         assert!(text.contains("removed 2 paths"));
         assert!(text.contains("/root/grow.txt"));
+        assert!(text.contains("Added:"), "added paths are listed");
+        assert!(text.contains("/root/new2.txt"), "largest added path shown");
+        assert!(text.contains("Removed:"), "removed paths are listed");
+        assert!(text.contains("/root/gone2.txt"), "largest removed shown");
     }
 
     #[test]

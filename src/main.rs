@@ -448,7 +448,7 @@ fn run_imported(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let root = load_snapshot(import_file)?;
     if !(io::stdout().is_terminal() && io::stdin().is_terminal() && !cli.summary) {
-        print_headless_report(&root);
+        print_headless_report(&root, false);
         return Ok(());
     }
 
@@ -649,16 +649,21 @@ fn run_headless_summary(
     let stop_signal = Arc::new(AtomicBool::new(false));
     let root_entry =
         scan_directory_with_options(&target_path, None, stop_signal, scan_options.clone())?;
-    print_headless_report(&root_entry);
+    print_headless_report(&root_entry, true);
     Ok(())
 }
 
 /// Prints the headless summary for an already-scanned or imported tree.
 /// Shared by live summaries and `--import` so both render identically.
-fn print_headless_report(root_entry: &fs::FileEntry) {
-    let docker_info = ghostdu::ghost::fetch_docker_disk_info();
-    let deleted_open = ghostdu::ghost::scan_deleted_open_files();
-    let fs_info = ghostdu::fs::query_fs_info(&root_entry.path);
+fn print_headless_report(root_entry: &fs::FileEntry, live: bool) {
+    // Imported snapshots describe another host or an earlier time: live
+    // queries would present this machine's capacity as part of the
+    // historical report, so only live scans read the local filesystem.
+    let fs_info = if live {
+        ghostdu::fs::query_fs_info(&root_entry.path)
+    } else {
+        None
+    };
 
     println!();
     println!("{SECTION_RULE}");
@@ -719,12 +724,20 @@ fn print_headless_report(root_entry: &fs::FileEntry) {
         println!("     ... and {} more items", root_entry.children.len() - 20);
     }
 
-    // Ghost & Docker Summary
-    println!();
-    print!("{}", format_docker_section(&docker_info));
+    // Ghost & Docker Summary (live scans only: imports have no host data).
+    if live {
+        println!();
+        print!(
+            "{}",
+            format_docker_section(&ghostdu::ghost::fetch_docker_disk_info())
+        );
 
-    println!();
-    print!("{}", format_ghost_section(&deleted_open));
+        println!();
+        print!(
+            "{}",
+            format_ghost_section(&ghostdu::ghost::scan_deleted_open_files())
+        );
+    }
 
     println!("{SECTION_RULE}");
 }
