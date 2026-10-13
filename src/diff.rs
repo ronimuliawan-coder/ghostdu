@@ -25,14 +25,20 @@ impl Delta {
 /// Categorized path-by-path comparison of two snapshots.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DiffReport {
-    /// Paths only in `after`, largest first (up to 10).
+    /// Largest added paths (up to 10).
     pub added: Vec<Delta>,
-    /// Paths only in `before`, largest first (up to 10).
+    /// Largest removed paths (up to 10).
     pub removed: Vec<Delta>,
     /// Paths in both that grew, largest growth first (up to 10).
     pub grown: Vec<Delta>,
     /// Paths in both that shrank, largest shrinkage first (up to 10).
     pub shrunk: Vec<Delta>,
+    /// Every added path and their bytes: the lists above keep only the top
+    /// 10, but the header reports the full totals.
+    pub added_count: usize,
+    pub added_bytes: u64,
+    pub removed_count: usize,
+    pub removed_bytes: u64,
 }
 
 fn flatten(root: &FileEntry, map: &mut HashMap<PathBuf, u64>) {
@@ -42,8 +48,9 @@ fn flatten(root: &FileEntry, map: &mut HashMap<PathBuf, u64>) {
     }
 }
 
-/// Compare two scanned trees. Unchanged paths are dropped; every list is
-/// capped at 10 entries ordered by magnitude, then path.
+/// Compare two scanned trees. Unchanged paths are dropped; every list keeps
+/// the 10 largest by magnitude (then path) via linear-time selection, and
+/// the header counts every changed path, not just the listed ones.
 pub fn diff_trees(before: &FileEntry, after: &FileEntry) -> DiffReport {
     let mut before_map = HashMap::new();
     let mut after_map = HashMap::new();
@@ -51,19 +58,23 @@ pub fn diff_trees(before: &FileEntry, after: &FileEntry) -> DiffReport {
     flatten(after, &mut after_map);
 
     let mut report = DiffReport::default();
+    let mut added = Vec::new();
+    let mut removed = Vec::new();
+    let mut grown = Vec::new();
+    let mut shrunk = Vec::new();
     for (path, &after_bytes) in &after_map {
         match before_map.get(path) {
-            None => report.added.push(Delta {
+            None => added.push(Delta {
                 path: path.clone(),
                 before_bytes: 0,
                 after_bytes,
             }),
-            Some(&before_bytes) if after_bytes > before_bytes => report.grown.push(Delta {
+            Some(&before_bytes) if after_bytes > before_bytes => grown.push(Delta {
                 path: path.clone(),
                 before_bytes,
                 after_bytes,
             }),
-            Some(&before_bytes) if after_bytes < before_bytes => report.shrunk.push(Delta {
+            Some(&before_bytes) if after_bytes < before_bytes => shrunk.push(Delta {
                 path: path.clone(),
                 before_bytes,
                 after_bytes,
@@ -73,38 +84,52 @@ pub fn diff_trees(before: &FileEntry, after: &FileEntry) -> DiffReport {
     }
     for (path, &before_bytes) in &before_map {
         if !after_map.contains_key(path) {
-            report.removed.push(Delta {
+            removed.push(Delta {
                 path: path.clone(),
                 before_bytes,
                 after_bytes: 0,
             });
         }
     }
-    report.added.sort_by(|a, b| {
+    report.added_count = added.len();
+    report.added_bytes = added.iter().map(|d| d.after_bytes).sum();
+    report.removed_count = removed.len();
+    report.removed_bytes = removed.iter().map(|d| d.before_bytes).sum();
+    top10(&mut added, |a, b| {
         b.after_bytes
             .cmp(&a.after_bytes)
             .then_with(|| a.path.cmp(&b.path))
     });
-    report.added.truncate(10);
-    report.removed.sort_by(|a, b| {
+    top10(&mut removed, |a, b| {
         b.before_bytes
             .cmp(&a.before_bytes)
             .then_with(|| a.path.cmp(&b.path))
     });
-    report.removed.truncate(10);
-    report.grown.sort_by(|a, b| {
+    top10(&mut grown, |a, b| {
         b.change()
             .cmp(&a.change())
             .then_with(|| a.path.cmp(&b.path))
     });
-    report.grown.truncate(10);
-    report.shrunk.sort_by(|a, b| {
+    top10(&mut shrunk, |a, b| {
         a.change()
             .cmp(&b.change())
             .then_with(|| a.path.cmp(&b.path))
     });
-    report.shrunk.truncate(10);
+    report.added = added;
+    report.removed = removed;
+    report.grown = grown;
+    report.shrunk = shrunk;
     report
+}
+
+/// Keep the 10 largest by `cmp`, ordered. Linear-time selection beats a full
+/// sort for snapshot-scale lists; the sort afterwards only orders the 10.
+fn top10(v: &mut Vec<Delta>, cmp: impl Fn(&Delta, &Delta) -> std::cmp::Ordering) {
+    if v.len() > 10 {
+        v.select_nth_unstable_by(10, &cmp);
+        v.truncate(10);
+    }
+    v.sort_by(cmp);
 }
 
 fn format_delta_list(title: &str, deltas: &[Delta], out: &mut String) {
@@ -126,15 +151,13 @@ fn format_delta_list(title: &str, deltas: &[Delta], out: &mut String) {
 
 impl std::fmt::Display for DiffReport {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let added_bytes: u64 = self.added.iter().map(|d| d.after_bytes).sum();
-        let removed_bytes: u64 = self.removed.iter().map(|d| d.before_bytes).sum();
         let mut out = String::new();
         out.push_str(&format!(
             "Added {} paths (+{}), removed {} paths (-{})\n",
-            self.added.len(),
-            crate::fs::entry::format_size(added_bytes),
-            self.removed.len(),
-            crate::fs::entry::format_size(removed_bytes)
+            self.added_count,
+            crate::fs::entry::format_size(self.added_bytes),
+            self.removed_count,
+            crate::fs::entry::format_size(self.removed_bytes)
         ));
         format_delta_list("Grew:", &self.grown, &mut out);
         format_delta_list("Shrank:", &self.shrunk, &mut out);
@@ -210,5 +233,22 @@ mod tests {
         assert!(text.contains("Added 2 paths"));
         assert!(text.contains("removed 2 paths"));
         assert!(text.contains("/root/grow.txt"));
+    }
+
+    #[test]
+    fn header_totals_cover_unlisted_paths() {
+        let before = tree(vec![]);
+        let after = tree(
+            (0..12u64)
+                .map(|i| file(&format!("/root/f{i:02}.txt"), 100 + i))
+                .collect(),
+        );
+        let report = diff_trees(&before, &after);
+        assert_eq!(report.added.len(), 10);
+        assert_eq!(report.added_count, 12);
+        assert_eq!(report.added_bytes, (0..12u64).map(|i| 100 + i).sum::<u64>());
+        assert_eq!(report.added[0].after_bytes, 111);
+        let text = report.to_string();
+        assert!(text.contains("Added 12 paths"));
     }
 }

@@ -184,7 +184,10 @@ pub struct FileEntry {
     pub delete_safety: DeleteSafety,
     pub has_err: bool, // e.g. permission denied
     /// Last modification time as unix seconds; 0 means unknown. Drives the
-    /// age heatmap, age sorting, and the stale-only filter.
+    /// age heatmap, age sorting, and the stale-only filter. Defaults to 0 so
+    /// pre-mtime version-1 snapshots still deserialize (their trees simply
+    /// show no age badges until rescanned).
+    #[serde(default)]
     pub mtime_secs: i64,
     pub children: Vec<FileEntry>,
 }
@@ -436,6 +439,25 @@ pub fn truncate_start_by_width(s: &str, max_width: usize) -> String {
 #[cfg(test)]
 mod coverage_tests {
     use super::*;
+
+    #[test]
+    fn legacy_snapshot_without_mtime_parses() {
+        let entry = FileEntry::new_file(
+            "f".to_string(),
+            PathBuf::from("/f"),
+            10,
+            10,
+            false,
+            1,
+            100,
+            GhostKind::None,
+            DeleteSafety::UserData,
+        );
+        let mut v = serde_json::to_value(&entry).unwrap();
+        v.as_object_mut().unwrap().remove("mtime_secs");
+        let back: FileEntry = serde_json::from_value(v).unwrap();
+        assert_eq!(back.mtime_secs, 0);
+    }
 
     #[test]
     fn every_kind_reports_labels() {
