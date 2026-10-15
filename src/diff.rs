@@ -49,8 +49,9 @@ fn flatten(root: &FileEntry, map: &mut HashMap<PathBuf, u64>) {
 }
 
 /// Compare two scanned trees. Unchanged paths are dropped; every list keeps
-/// the 10 largest by magnitude (then path) via linear-time selection, and
-/// the header counts every changed path, not just the listed ones.
+/// the 10 largest by magnitude (then path) via bounded insertion, so memory
+/// stays flat no matter how large the snapshots are. The header counts every
+/// changed path via scalar accumulators, not just the listed ones.
 pub fn diff_trees(before: &FileEntry, after: &FileEntry) -> DiffReport {
     let mut before_map = HashMap::new();
     let mut after_map = HashMap::new();
@@ -58,78 +59,89 @@ pub fn diff_trees(before: &FileEntry, after: &FileEntry) -> DiffReport {
     flatten(after, &mut after_map);
 
     let mut report = DiffReport::default();
-    let mut added = Vec::new();
-    let mut removed = Vec::new();
-    let mut grown = Vec::new();
-    let mut shrunk = Vec::new();
     for (path, &after_bytes) in &after_map {
         match before_map.get(path) {
-            None => added.push(Delta {
-                path: path.clone(),
-                before_bytes: 0,
-                after_bytes,
-            }),
-            Some(&before_bytes) if after_bytes > before_bytes => grown.push(Delta {
-                path: path.clone(),
-                before_bytes,
-                after_bytes,
-            }),
-            Some(&before_bytes) if after_bytes < before_bytes => shrunk.push(Delta {
-                path: path.clone(),
-                before_bytes,
-                after_bytes,
-            }),
+            None => {
+                report.added_count += 1;
+                report.added_bytes += after_bytes;
+                insert_top10(
+                    &mut report.added,
+                    Delta {
+                        path: path.clone(),
+                        before_bytes: 0,
+                        after_bytes,
+                    },
+                    |a, b| {
+                        b.after_bytes
+                            .cmp(&a.after_bytes)
+                            .then_with(|| a.path.cmp(&b.path))
+                    },
+                );
+            }
+            Some(&before_bytes) if after_bytes > before_bytes => insert_top10(
+                &mut report.grown,
+                Delta {
+                    path: path.clone(),
+                    before_bytes,
+                    after_bytes,
+                },
+                |a, b| {
+                    b.change()
+                        .cmp(&a.change())
+                        .then_with(|| a.path.cmp(&b.path))
+                },
+            ),
+            Some(&before_bytes) if after_bytes < before_bytes => insert_top10(
+                &mut report.shrunk,
+                Delta {
+                    path: path.clone(),
+                    before_bytes,
+                    after_bytes,
+                },
+                |a, b| {
+                    a.change()
+                        .cmp(&b.change())
+                        .then_with(|| a.path.cmp(&b.path))
+                },
+            ),
             Some(_) => {}
         }
     }
     for (path, &before_bytes) in &before_map {
         if !after_map.contains_key(path) {
-            removed.push(Delta {
-                path: path.clone(),
-                before_bytes,
-                after_bytes: 0,
-            });
+            report.removed_count += 1;
+            report.removed_bytes += before_bytes;
+            insert_top10(
+                &mut report.removed,
+                Delta {
+                    path: path.clone(),
+                    before_bytes,
+                    after_bytes: 0,
+                },
+                |a, b| {
+                    b.before_bytes
+                        .cmp(&a.before_bytes)
+                        .then_with(|| a.path.cmp(&b.path))
+                },
+            );
         }
     }
-    report.added_count = added.len();
-    report.added_bytes = added.iter().map(|d| d.after_bytes).sum();
-    report.removed_count = removed.len();
-    report.removed_bytes = removed.iter().map(|d| d.before_bytes).sum();
-    top10(&mut added, |a, b| {
-        b.after_bytes
-            .cmp(&a.after_bytes)
-            .then_with(|| a.path.cmp(&b.path))
-    });
-    top10(&mut removed, |a, b| {
-        b.before_bytes
-            .cmp(&a.before_bytes)
-            .then_with(|| a.path.cmp(&b.path))
-    });
-    top10(&mut grown, |a, b| {
-        b.change()
-            .cmp(&a.change())
-            .then_with(|| a.path.cmp(&b.path))
-    });
-    top10(&mut shrunk, |a, b| {
-        a.change()
-            .cmp(&b.change())
-            .then_with(|| a.path.cmp(&b.path))
-    });
-    report.added = added;
-    report.removed = removed;
-    report.grown = grown;
-    report.shrunk = shrunk;
     report
 }
 
-/// Keep the 10 largest by `cmp`, ordered. Linear-time selection beats a full
-/// sort for snapshot-scale lists; the sort afterwards only orders the 10.
-fn top10(v: &mut Vec<Delta>, cmp: impl Fn(&Delta, &Delta) -> std::cmp::Ordering) {
-    if v.len() > 10 {
-        v.select_nth_unstable_by(10, &cmp);
+/// Insert keeping `v` ordered by `rank` (larger first), capped at 10.
+/// Constant memory per category: entries past the top 10 are dropped on
+/// arrival instead of accumulated and truncated afterwards.
+fn insert_top10(
+    v: &mut Vec<Delta>,
+    delta: Delta,
+    rank: impl Fn(&Delta, &Delta) -> std::cmp::Ordering,
+) {
+    let pos = v.partition_point(|d| rank(d, &delta).is_lt());
+    if pos < 10 {
+        v.insert(pos, delta);
         v.truncate(10);
     }
-    v.sort_by(cmp);
 }
 
 fn format_delta_list(title: &str, deltas: &[Delta], out: &mut String) {

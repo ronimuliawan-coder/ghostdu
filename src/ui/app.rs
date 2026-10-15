@@ -1878,15 +1878,16 @@ impl App {
             entry.disk_usage = total_disk;
             entry.reclaimable = total_reclaimable;
             entry.items_count = total_items + 1;
-            // Same newest-content rule as the full scan: incremental updates
-            // must refresh ancestor staleness too, or the stale filter and
-            // age sorts keep ranking on pre-refresh timestamps.
+            // Same newest-content rule as the full scan, reseeded from the
+            // directory's own mtime: incremental updates must refresh
+            // ancestor staleness in both directions, or a replaced-older
+            // child leaves the ancestor ranked as recent.
             let newest_child = entry
                 .children
                 .iter()
                 .map(|c| c.mtime_secs)
                 .fold(0, Ord::max);
-            entry.mtime_secs = entry.mtime_secs.max(newest_child);
+            entry.mtime_secs = entry.own_mtime_secs.max(newest_child);
             if entry.delete_safety == DeleteSafety::Safe {
                 entry.safe_reclaimable = total_reclaimable;
                 entry.safe_items = 1;
@@ -3504,6 +3505,21 @@ mod age_heatmap_tests {
         fresh.mtime_secs = now;
         app.replace_subtree(&target, fresh);
         assert_eq!(app.root_entry.mtime_secs, now);
+    }
+
+    #[test]
+    fn subtree_refresh_can_make_ancestor_older() {
+        let (_dir, mut app) = app_with_files(1);
+        let target = app.root_entry.children[0].path.clone();
+        // The ancestor previously aggregated as recent; replacing its child
+        // with an older one must move the aggregate down, reseeded from the
+        // directory's own mtime rather than the stored maximum.
+        app.root_entry.own_mtime_secs = 1;
+        app.root_entry.mtime_secs = now_secs();
+        let mut older = app.root_entry.children[0].clone();
+        older.mtime_secs = 2;
+        app.replace_subtree(&target, older);
+        assert_eq!(app.root_entry.mtime_secs, 2);
     }
 }
 

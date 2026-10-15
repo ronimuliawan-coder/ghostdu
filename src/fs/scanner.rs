@@ -80,6 +80,7 @@ pub fn scan_directory_with_options(
         safety,
     );
     root_entry.mtime_secs = mtime_secs(&root_meta);
+    root_entry.own_mtime_secs = mtime_secs(&root_meta);
 
     let mount_points = if options.cross_mounts {
         HashSet::new()
@@ -253,6 +254,7 @@ fn scan_dir_recursive(
             let mut dir_node =
                 FileEntry::new_dir(file_name, path.clone(), dev, ino, ghost_kind, delete_safety);
             dir_node.mtime_secs = mtime_secs(&meta);
+            dir_node.own_mtime_secs = mtime_secs(&meta);
 
             // mountinfo also identifies bind mounts whose device matches the root.
             let is_cross_mount = dev != root_dev || mount_points.contains(&path);
@@ -316,7 +318,9 @@ fn scan_dir_recursive(
                                                 // Directory staleness follows its newest content: the directory inode
                                                 // itself only changes on entry add/remove, not on child edits.
     let newest_child = sub_entries.iter().map(|c| c.mtime_secs).fold(0, Ord::max);
-    parent_entry.mtime_secs = parent_entry.mtime_secs.max(newest_child);
+    // Reseed from the directory's own mtime (not the stored aggregate) so a
+    // full rescan recomputes the same value from scratch.
+    parent_entry.mtime_secs = parent_entry.own_mtime_secs.max(newest_child);
     if parent_entry.delete_safety == DeleteSafety::Safe {
         parent_entry.safe_reclaimable = total_reclaimable;
         parent_entry.safe_items = 1;
@@ -378,6 +382,7 @@ fn file_entry(
     file_node.size = counted_size;
     file_node.disk_usage = counted_disk;
     file_node.mtime_secs = mtime_secs(meta);
+    file_node.own_mtime_secs = mtime_secs(meta);
     // Any unselected or unseen link can retain the inode blocks.
     if meta.nlink() > 1 {
         file_node.reclaimable = 0;
@@ -419,6 +424,7 @@ pub(crate) fn rescan_entry(
         classify_safety(path, ghost),
     );
     entry.mtime_secs = mtime_secs(&meta);
+    entry.own_mtime_secs = mtime_secs(&meta);
     let mounts = parse_mount_points(&fs::read("/proc/self/mountinfo")?);
     if meta.dev() == root_dev
         && !mounts.contains(path)
