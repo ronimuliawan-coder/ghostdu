@@ -189,6 +189,12 @@ pub struct FileEntry {
     /// show no age badges until rescanned).
     #[serde(default)]
     pub mtime_secs: i64,
+    /// The entry's own inode mtime, before directory aggregation. Directories
+    /// report the newest content in `mtime_secs`, but incremental updates
+    /// must reseed from this value so the aggregate can also move older.
+    /// Defaults to 0 like `mtime_secs` for pre-mtime snapshots.
+    #[serde(default)]
+    pub own_mtime_secs: i64,
     pub children: Vec<FileEntry>,
 }
 
@@ -264,6 +270,7 @@ impl FileEntry {
             delete_safety,
             has_err: false,
             mtime_secs: 0,
+            own_mtime_secs: 0,
             children: Vec::new(),
         }
     }
@@ -293,6 +300,7 @@ impl FileEntry {
             delete_safety,
             has_err: false,
             mtime_secs: 0,
+            own_mtime_secs: 0,
             children: Vec::new(),
         }
     }
