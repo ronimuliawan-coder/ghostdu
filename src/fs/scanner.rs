@@ -1,7 +1,7 @@
 use crate::fs::entry::{DeleteSafety, FileEntry};
 use crate::ghost::{classify_path, classify_safety, is_virtual_fs_path};
 use crossbeam_channel::Sender;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 use std::fs;
 use std::os::unix::ffi::OsStringExt;
@@ -79,6 +79,8 @@ pub fn scan_directory_with_options(
         ghost,
         safety,
     );
+    root_entry.mtime_secs = mtime_secs(&root_meta);
+    root_entry.own_mtime_secs = mtime_secs(&root_meta);
 
     let mount_points = if options.cross_mounts {
         HashSet::new()
@@ -251,6 +253,8 @@ fn scan_dir_recursive(
             let delete_safety = classify_safety(&path, ghost_kind);
             let mut dir_node =
                 FileEntry::new_dir(file_name, path.clone(), dev, ino, ghost_kind, delete_safety);
+            dir_node.mtime_secs = mtime_secs(&meta);
+            dir_node.own_mtime_secs = mtime_secs(&meta);
 
             // mountinfo also identifies bind mounts whose device matches the root.
             let is_cross_mount = dev != root_dev || mount_points.contains(&path);
@@ -311,6 +315,12 @@ fn scan_dir_recursive(
     parent_entry.disk_usage = total_disk;
     parent_entry.reclaimable = total_reclaimable;
     parent_entry.items_count = total_items + 1; // plus the directory itself
+                                                // Directory staleness follows its newest content: the directory inode
+                                                // itself only changes on entry add/remove, not on child edits.
+    let newest_child = sub_entries.iter().map(|c| c.mtime_secs).fold(0, Ord::max);
+    // Reseed from the directory's own mtime (not the stored aggregate) so a
+    // full rescan recomputes the same value from scratch.
+    parent_entry.mtime_secs = parent_entry.own_mtime_secs.max(newest_child);
     if parent_entry.delete_safety == DeleteSafety::Safe {
         parent_entry.safe_reclaimable = total_reclaimable;
         parent_entry.safe_items = 1;
@@ -319,6 +329,16 @@ fn scan_dir_recursive(
         parent_entry.safe_items = total_safe_items;
     }
     parent_entry.children = sub_entries;
+}
+
+/// Unix seconds of `meta` mtime for the age heatmap; 0 (unknown) when
+/// unreadable or pre-epoch. Every line runs on the happy path by construction.
+fn mtime_secs(meta: &fs::Metadata) -> i64 {
+    meta.modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 fn file_entry(
@@ -361,6 +381,8 @@ fn file_entry(
     // Store counted size for aggregation
     file_node.size = counted_size;
     file_node.disk_usage = counted_disk;
+    file_node.mtime_secs = mtime_secs(meta);
+    file_node.own_mtime_secs = mtime_secs(meta);
     // Any unselected or unseen link can retain the inode blocks.
     if meta.nlink() > 1 {
         file_node.reclaimable = 0;
@@ -401,6 +423,8 @@ pub(crate) fn rescan_entry(
         ghost,
         classify_safety(path, ghost),
     );
+    entry.mtime_secs = mtime_secs(&meta);
+    entry.own_mtime_secs = mtime_secs(&meta);
     let mounts = parse_mount_points(&fs::read("/proc/self/mountinfo")?);
     if meta.dev() == root_dev
         && !mounts.contains(path)
@@ -435,31 +459,82 @@ pub(crate) fn parse_mount_points(mountinfo: &[u8]) -> HashSet<PathBuf> {
     mountinfo
         .split(|&b| b == b'\n')
         .filter_map(|line| line.split(|&b| b == b' ').nth(4))
-        .map(|path| {
-            let mut decoded = Vec::with_capacity(path.len());
-            let mut i = 0;
-            while i < path.len() {
-                if path[i] == b'\\' && i + 3 < path.len() {
-                    let escaped = &path[i + 1..i + 4];
-                    let byte = match escaped {
-                        b"040" => Some(b' '),
-                        b"011" => Some(b'\t'),
-                        b"012" => Some(b'\n'),
-                        b"134" => Some(b'\\'),
-                        _ => None,
-                    };
-                    if let Some(byte) = byte {
-                        decoded.push(byte);
-                        i += 4;
-                        continue;
-                    }
-                }
-                decoded.push(path[i]);
-                i += 1;
-            }
-            PathBuf::from(OsString::from_vec(decoded))
-        })
+        .map(decode_mount_path)
         .collect()
+}
+
+/// Decodes mountinfo octal escapes (`\040` -> space, etc.); unknown or
+/// truncated sequences stay literal so parsing never fails on odd kernels.
+fn decode_mount_path(field: &[u8]) -> PathBuf {
+    let mut decoded = Vec::with_capacity(field.len());
+    let mut i = 0;
+    while i < field.len() {
+        if field[i] == b'\\' && i + 3 < field.len() {
+            let escaped = &field[i + 1..i + 4];
+            let byte = match escaped {
+                b"040" => Some(b' '),
+                b"011" => Some(b'\t'),
+                b"012" => Some(b'\n'),
+                b"134" => Some(b'\\'),
+                _ => None,
+            };
+            if let Some(byte) = byte {
+                decoded.push(byte);
+                i += 4;
+                continue;
+            }
+        }
+        decoded.push(field[i]);
+        i += 1;
+    }
+    PathBuf::from(OsString::from_vec(decoded))
+}
+
+/// Btrfs subvolume boundaries: mount path -> subvolume name, parsed from the
+/// `subvol=` super-option. Only `btrfs` filesystem lines are considered; all
+/// other lines (wrong fs type, missing option, malformed) are skipped.
+pub(crate) fn parse_btrfs_subvolumes(mountinfo: &[u8]) -> HashMap<PathBuf, String> {
+    let mut subvols = HashMap::new();
+    for line in mountinfo.split(|&b| b == b'\n') {
+        let fields: Vec<&[u8]> = line.split(|&b| b == b' ').collect();
+        let Some(sep) = fields.iter().position(|f| *f == b"-") else {
+            continue;
+        };
+        // Layout: [..., mount point @4, ...] - fstype source super-options.
+        if fields.len() <= 4 || fields.len() < sep + 4 || fields[sep + 1] != b"btrfs" {
+            continue;
+        }
+        let mount_point = decode_mount_path(fields[4]);
+        let name = fields[sep + 3]
+            .split(|&b| b == b',')
+            .find_map(|opt| opt.strip_prefix(b"subvol="))
+            .map(|name| String::from_utf8_lossy(name).into_owned());
+        if let Some(name) = name {
+            subvols.insert(mount_point, name);
+        }
+    }
+    subvols
+}
+
+/// True when any mounted subvolume is itself a snapshot store (Snapper,
+/// Timeshift, or explicit snapshot directories): deleting files there may
+/// free 0 bytes while snapshots reference the extents. Matches exact path
+/// components of the subvolume name only, so unrelated paths merely
+/// containing those words (e.g. `snapper-notes`) never match.
+pub(crate) fn has_snapshot_subvolumes(subvols: &HashMap<PathBuf, String>) -> bool {
+    use std::path::Component;
+    subvols.values().any(|name| {
+        Path::new(name).components().any(|component| {
+            matches!(
+                component,
+                Component::Normal(part)
+                    if matches!(
+                        part.to_str(),
+                        Some("@snapshots" | ".snapshots" | "snapshots" | "timeshift-btrfs")
+                    )
+            )
+        })
+    })
 }
 
 #[cfg(test)]
@@ -486,6 +561,54 @@ mod coverage_tests {
 
     fn stop() -> Arc<AtomicBool> {
         Arc::new(AtomicBool::new(false))
+    }
+
+    #[test]
+    fn snapshot_matcher_uses_exact_path_components() {
+        let yes: HashMap<PathBuf, String> = [
+            (PathBuf::from("/@"), "@snapshots".to_string()),
+            (PathBuf::from("/t"), "timeshift-btrfs".to_string()),
+            (PathBuf::from("/@"), ".snapshots".to_string()),
+        ]
+        .into_iter()
+        .collect();
+        assert!(has_snapshot_subvolumes(&yes));
+        // Near-misses must not match: the mount path is no longer consulted
+        // and bare substrings inside a component do not count.
+        let no: HashMap<PathBuf, String> = [
+            (PathBuf::from("/snapshots-backup"), "data".to_string()),
+            (PathBuf::from("/x"), "snapper-notes".to_string()),
+            (PathBuf::from("/y"), "my-timeshift".to_string()),
+        ]
+        .into_iter()
+        .collect();
+        assert!(!has_snapshot_subvolumes(&no));
+    }
+
+    #[test]
+    fn directory_mtime_follows_newest_child() {
+        let dir = tempfile::tempdir().unwrap();
+        let sub = dir.path().join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        std::fs::write(sub.join("new.txt"), "x").unwrap();
+        // Backdate both directory inodes: the content stays newer than its
+        // containers, so aggregation must surface the file's mtime.
+        for p in [dir.path().to_path_buf(), sub.clone()] {
+            let st = std::process::Command::new("touch")
+                .arg("-d")
+                .arg("2001-01-01")
+                .arg(&p)
+                .status()
+                .unwrap();
+            assert!(st.success());
+        }
+        let root = scan_directory(dir.path(), None, stop()).unwrap();
+        assert!(
+            root.mtime_secs > 1_000_000_000,
+            "root follows its newest content, not its own inode"
+        );
+        let sub_entry = root.children.iter().find(|c| c.name == "sub").unwrap();
+        assert_eq!(sub_entry.mtime_secs, root.mtime_secs);
     }
 
     #[test]
@@ -594,6 +717,48 @@ mod coverage_tests {
         assert_eq!(mounts.len(), 1);
         let mounts = parse_mount_points(b"short line\n");
         assert!(mounts.is_empty());
+    }
+
+    #[test]
+    fn parse_btrfs_subvolumes_keeps_names() {
+        let table = b"30 23 0:22 / / rw,relatime shared:1 - btrfs /dev/sda1 rw,ssd,subvolid=256,subvol=/@\n\
+            35 23 0:22 /@/.snapshots /@/.snapshots rw,relatime shared:1 - btrfs /dev/sda1 rw,ssd,subvolid=267,subvol=/@/.snapshots\n\
+            40 23 0:24 / /tmp rw,nosuid,nodev shared:153 - tmpfs tmpfs rw,inode64\n\
+            41 23 0:22 /@/home /home rw,relatime shared:1 - btrfs /dev/sda1 rw,ssd,subvolid=258\n\
+            short line\n";
+        let subvols = parse_btrfs_subvolumes(table);
+        assert_eq!(subvols.get(&PathBuf::from("/")), Some(&"/@".to_string()));
+        assert_eq!(
+            subvols.get(&PathBuf::from("/@/.snapshots")),
+            Some(&"/@/.snapshots".to_string())
+        );
+        // tmpfs skipped, btrfs without subvol= skipped, short lines skipped.
+        assert_eq!(subvols.len(), 2);
+        assert!(has_snapshot_subvolumes(&subvols));
+    }
+
+    #[test]
+    fn snapshot_matcher_ignores_plain_subvolumes() {
+        let mut subvols = HashMap::new();
+        subvols.insert(PathBuf::from("/"), "/@".to_string());
+        subvols.insert(PathBuf::from("/home"), "/@/home".to_string());
+        assert!(!has_snapshot_subvolumes(&subvols));
+        assert!(!has_snapshot_subvolumes(&HashMap::new()));
+        subvols.insert(
+            PathBuf::from("/mnt/backup"),
+            "/timeshift-btrfs/snapshots/2024-01-01".to_string(),
+        );
+        assert!(has_snapshot_subvolumes(&subvols));
+    }
+
+    #[test]
+    fn parse_btrfs_subvolumes_decodes_escapes() {
+        let table = b"30 23 0:22 /my\\040vol /my\\040vol rw shared:1 - btrfs /dev/sda1 rw,subvolid=256,subvol=/myvol\n";
+        let subvols = parse_btrfs_subvolumes(table);
+        assert_eq!(
+            subvols.get(&PathBuf::from("/my vol")),
+            Some(&"/myvol".to_string())
+        );
     }
 }
 

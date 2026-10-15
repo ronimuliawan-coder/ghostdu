@@ -85,6 +85,14 @@ struct Cli {
     #[arg(long, value_name = "FILE")]
     export: Option<PathBuf>,
 
+    /// Load a snapshot FILE and browse it read-only instead of scanning
+    #[arg(long, value_name = "FILE")]
+    import: Option<PathBuf>,
+
+    /// Snapshot subcommand (compare two exports)
+    #[command(subcommand)]
+    command: Option<Commands>,
+
     /// Print shell completions for SHELL and exit
     #[arg(long, value_name = "SHELL")]
     print_completions: Option<clap_complete::Shell>,
@@ -92,6 +100,17 @@ struct Cli {
     /// Print a man page to stdout and exit
     #[arg(long)]
     print_manpage: bool,
+}
+
+#[derive(Debug, Clone, clap::Subcommand)]
+enum Commands {
+    /// Compare two snapshot files and report growth deltas
+    Diff {
+        /// Older snapshot (from --export)
+        before: PathBuf,
+        /// Newer snapshot (from --export)
+        after: PathBuf,
+    },
 }
 
 #[derive(Copy, Clone, Debug, clap::ValueEnum)]
@@ -105,6 +124,12 @@ enum SortArg {
     Name,
     /// Most items first
     Items,
+    /// Oldest first
+    #[value(name = "age")]
+    Age,
+    /// Newest first
+    #[value(name = "age-asc")]
+    AgeAsc,
 }
 
 /// Binary entry point. Excluded from ptrace-based line coverage: the test
@@ -145,6 +170,14 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         max_depth: cli.depth,
     };
 
+    if let Some(Commands::Diff { before, after }) = &cli.command {
+        return run_diff(before, after);
+    }
+
+    if let Some(ref import_file) = cli.import {
+        return run_imported(import_file, &cli, &scan_options);
+    }
+
     if let Some(ref export_file) = cli.export {
         return export_scan(target_path, &scan_options, export_file);
     }
@@ -162,7 +195,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(not(tarpaulin_include))]
     {
         install_panic_hook();
-        run_interactive(target_path, &cli, &scan_options)
+        run_interactive(target_path, &cli, &scan_options, None)
     }
     #[cfg(tarpaulin_include)]
     {
@@ -190,6 +223,7 @@ fn run_interactive(
     target_path: PathBuf,
     cli: &Cli,
     scan_options: &ScannerOptions,
+    preload: Option<fs::FileEntry>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Setup terminal
     enable_raw_mode()?;
@@ -208,6 +242,7 @@ fn run_interactive(
         &|d| crossterm::event::poll(d),
         &crossterm::event::read,
         &run_subshell,
+        preload,
     );
 
     // Cleanly restore terminal
@@ -235,7 +270,8 @@ enum MainFlow {
 /// injected so headless tests can drive every arm with scripted events;
 /// production passes the live crossterm globals (see `run_interactive`).
 /// Scan and browse phases take separate sources so tests script each phase
-/// exactly, with no timing or oversupply involved.
+/// exactly, with no timing or oversupply involved. A preloaded tree skips
+/// scanning entirely (snapshot imports); it implies the read-only flag.
 #[allow(clippy::too_many_arguments)]
 fn run_app<B: ratatui::backend::Backend>(
     terminal: &mut Terminal<B>,
@@ -247,60 +283,74 @@ fn run_app<B: ratatui::backend::Backend>(
     main_poll: &dyn Fn(Duration) -> Result<bool, std::io::Error>,
     main_read: &dyn Fn() -> Result<Event, std::io::Error>,
     subshell: &SubshellRunner<B>,
+    mut preload: Option<fs::FileEntry>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut saved_current_path: Option<PathBuf> = None;
 
     loop {
-        // Step 1: Progressive Scanning with Live Progress UI
-        let (progress_tx, progress_rx) = unbounded::<ScanProgress>();
-        let stop_signal = Arc::new(AtomicBool::new(false));
-        let stop_clone = stop_signal.clone();
+        // Step 1: Progressive Scanning with Live Progress UI. A preloaded
+        // snapshot tree skips scanning (and implies read-only); rescans
+        // afterwards always scan live.
+        let imported = preload.is_some();
+        let root_entry = match preload.take() {
+            Some(root) => root,
+            None => {
+                let (progress_tx, progress_rx) = unbounded::<ScanProgress>();
+                let stop_signal = Arc::new(AtomicBool::new(false));
+                let stop_clone = stop_signal.clone();
 
-        let scan_path = target_path.clone();
-        let thread_options = scan_options.clone();
-        let scan_handle = thread::spawn(move || {
-            scan_directory_with_options(&scan_path, Some(progress_tx), stop_clone, thread_options)
-        });
+                let scan_path = target_path.clone();
+                let thread_options = scan_options.clone();
+                let scan_handle = thread::spawn(move || {
+                    scan_directory_with_options(
+                        &scan_path,
+                        Some(progress_tx),
+                        stop_clone,
+                        thread_options,
+                    )
+                });
 
-        let mut last_progress = ScanProgress {
-            files_scanned: 0,
-            bytes_scanned: 0,
-            current_path: target_path.clone(),
-            is_finished: false,
-        };
+                let mut last_progress = ScanProgress {
+                    files_scanned: 0,
+                    bytes_scanned: 0,
+                    current_path: target_path.clone(),
+                    is_finished: false,
+                };
 
-        let scan_start = Instant::now();
-        let mut spinner_idx = 0;
-        let spinners = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+                let scan_start = Instant::now();
+                let mut spinner_idx = 0;
+                let spinners = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
-        let root_entry = loop {
-            while let Ok(prog) = progress_rx.try_recv() {
-                last_progress = prog;
-            }
+                loop {
+                    while let Ok(prog) = progress_rx.try_recv() {
+                        last_progress = prog;
+                    }
 
-            if scan_handle.is_finished() {
-                // The scanner never panics (all channel sends are best-effort),
-                // so `expect` keeps this a single covered line: the message
-                // only materializes on a cannot-happen thread panic, which the
-                // panic hook then restores the terminal for.
-                break scan_handle.join().expect("Scan thread panicked")?;
-            }
+                    if scan_handle.is_finished() {
+                        // The scanner never panics (all channel sends are best-effort),
+                        // so `expect` keeps this a single covered line: the message
+                        // only materializes on a cannot-happen thread panic, which the
+                        // panic hook then restores the terminal for.
+                        break scan_handle.join().expect("Scan thread panicked")?;
+                    }
 
-            // Draw scanning progress screen
-            let spinner = spinners[spinner_idx % spinners.len()];
-            spinner_idx += 1;
-            let elapsed = scan_start.elapsed().as_secs_f32();
+                    // Draw scanning progress screen
+                    let spinner = spinners[spinner_idx % spinners.len()];
+                    spinner_idx += 1;
+                    let elapsed = scan_start.elapsed().as_secs_f32();
 
-            terminal.draw(|f| render_scan_progress(f, spinner, &last_progress, elapsed))?;
+                    terminal.draw(|f| render_scan_progress(f, spinner, &last_progress, elapsed))?;
 
-            if scan_poll(Duration::from_millis(60))? {
-                if let Event::Key(key) = scan_read()? {
-                    if key.code == KeyCode::Char('q')
-                        || (key.modifiers.contains(KeyModifiers::CONTROL)
-                            && key.code == KeyCode::Char('c'))
-                    {
-                        stop_signal.store(true, Ordering::Relaxed);
-                        return Ok(());
+                    if scan_poll(Duration::from_millis(60))? {
+                        if let Event::Key(key) = scan_read()? {
+                            if key.code == KeyCode::Char('q')
+                                || (key.modifiers.contains(KeyModifiers::CONTROL)
+                                    && key.code == KeyCode::Char('c'))
+                            {
+                                stop_signal.store(true, Ordering::Relaxed);
+                                return Ok(());
+                            }
+                        }
                     }
                 }
             }
@@ -308,6 +358,7 @@ fn run_app<B: ratatui::backend::Backend>(
 
         // Step 2: Main interactive loop
         let mut app = App::new(root_entry);
+        app.imported = imported;
         app.scan_options = scan_options.clone();
         apply_cli_display(&mut app, cli);
         if let Some(ref saved) = saved_current_path.take() {
@@ -329,16 +380,26 @@ fn run_app<B: ratatui::backend::Backend>(
                         #[cfg(not(tarpaulin_include))]
                         EventResult::Continue => {}
                         EventResult::RescanRequested => {
-                            saved_current_path = Some(app.current_dir_entry().path.clone());
-                            target_path = app.root_entry.path.clone();
-                            break MainFlow::Rescan;
+                            if app.imported {
+                                app.set_status("Rescans are disabled for imported snapshots");
+                            } else {
+                                saved_current_path = Some(app.current_dir_entry().path.clone());
+                                target_path = app.root_entry.path.clone();
+                                break MainFlow::Rescan;
+                            }
                         }
                         EventResult::RescanPath(new_path) => {
-                            target_path = new_path;
-                            break MainFlow::Rescan;
+                            if app.imported {
+                                app.set_status("Rescans are disabled for imported snapshots");
+                            } else {
+                                target_path = new_path;
+                                break MainFlow::Rescan;
+                            }
                         }
                         EventResult::Subshell(dir) => {
-                            if let Err(error) = subshell(terminal, &dir) {
+                            if app.imported {
+                                app.set_status("Subshell is disabled for imported snapshots");
+                            } else if let Err(error) = subshell(terminal, &dir) {
                                 app.set_status(error.to_string());
                             } else if app.refresh_path(&dir) {
                                 app.set_status("Subshell exited; directory refreshed");
@@ -353,6 +414,55 @@ fn run_app<B: ratatui::backend::Backend>(
         if flow == MainFlow::Quit {
             return Ok(());
         }
+    }
+}
+
+/// Reads a snapshot file into a verified tree root. Every line runs on the
+/// happy path; failures propagate with context.
+fn load_snapshot(path: &std::path::Path) -> Result<fs::FileEntry, Box<dyn std::error::Error>> {
+    let text = std::fs::read_to_string(path)?;
+    let envelope: fs::ExportEnvelope = serde_json::from_str(&text)?;
+    envelope.check_format_version()?;
+    Ok(envelope.root)
+}
+
+/// Compares two snapshot files and prints growth deltas.
+fn run_diff(
+    before_path: &std::path::Path,
+    after_path: &std::path::Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let before = load_snapshot(before_path)?;
+    let after = load_snapshot(after_path)?;
+    let report = ghostdu::diff::diff_trees(&before, &after);
+    println!("{report}");
+    Ok(())
+}
+
+/// Browse a snapshot file read-only instead of scanning. Headless callers
+/// get the same printed summary; interactive callers get a TUI session whose
+/// destructive and rescanning paths refuse with a status message.
+fn run_imported(
+    import_file: &std::path::Path,
+    cli: &Cli,
+    scan_options: &ScannerOptions,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let root = load_snapshot(import_file)?;
+    if !(io::stdout().is_terminal() && io::stdin().is_terminal() && !cli.summary) {
+        print_headless_report(&root, false);
+        return Ok(());
+    }
+
+    // Interactive sessions need a real terminal, which ptrace-based coverage
+    // cannot provide; the pty E2E test (plain `cargo test`) covers this path.
+    #[cfg(not(tarpaulin_include))]
+    {
+        install_panic_hook();
+        let target = root.path.clone();
+        run_interactive(target, cli, scan_options, Some(root))
+    }
+    #[cfg(tarpaulin_include)]
+    {
+        Err("interactive mode requires a real terminal".into())
     }
 }
 
@@ -396,6 +506,8 @@ fn apply_cli_display(app: &mut App, cli: &Cli) {
             SortArg::SizeAsc => SortMode::BySizeAsc,
             SortArg::Name => SortMode::ByName,
             SortArg::Items => SortMode::ByItems,
+            SortArg::Age => SortMode::ByAgeDesc,
+            SortArg::AgeAsc => SortMode::ByAgeAsc,
         };
     }
 }
@@ -537,10 +649,21 @@ fn run_headless_summary(
     let stop_signal = Arc::new(AtomicBool::new(false));
     let root_entry =
         scan_directory_with_options(&target_path, None, stop_signal, scan_options.clone())?;
+    print_headless_report(&root_entry, true);
+    Ok(())
+}
 
-    let docker_info = ghostdu::ghost::fetch_docker_disk_info();
-    let deleted_open = ghostdu::ghost::scan_deleted_open_files();
-    let fs_info = ghostdu::fs::query_fs_info(&root_entry.path);
+/// Prints the headless summary for an already-scanned or imported tree.
+/// Shared by live summaries and `--import` so both render identically.
+fn print_headless_report(root_entry: &fs::FileEntry, live: bool) {
+    // Imported snapshots describe another host or an earlier time: live
+    // queries would present this machine's capacity as part of the
+    // historical report, so only live scans read the local filesystem.
+    let fs_info = if live {
+        ghostdu::fs::query_fs_info(&root_entry.path)
+    } else {
+        None
+    };
 
     println!();
     println!("{SECTION_RULE}");
@@ -601,15 +724,22 @@ fn run_headless_summary(
         println!("     ... and {} more items", root_entry.children.len() - 20);
     }
 
-    // Ghost & Docker Summary
-    println!();
-    print!("{}", format_docker_section(&docker_info));
+    // Ghost & Docker Summary (live scans only: imports have no host data).
+    if live {
+        println!();
+        print!(
+            "{}",
+            format_docker_section(&ghostdu::ghost::fetch_docker_disk_info())
+        );
 
-    println!();
-    print!("{}", format_ghost_section(&deleted_open));
+        println!();
+        print!(
+            "{}",
+            format_ghost_section(&ghostdu::ghost::scan_deleted_open_files())
+        );
+    }
 
     println!("{SECTION_RULE}");
-    Ok(())
 }
 
 /// Serializes tests that mutate process-wide stdin or terminal mode. The pty
@@ -670,6 +800,10 @@ mod cli_tests {
         assert!(matches!(cli.sort, Some(SortArg::Size)));
         let cli = parse(&["ghostdu", "--sort", "items"]);
         assert!(matches!(cli.sort, Some(SortArg::Items)));
+        let cli = parse(&["ghostdu", "--sort", "age"]);
+        assert!(matches!(cli.sort, Some(SortArg::Age)));
+        let cli = parse(&["ghostdu", "--sort", "age-asc"]);
+        assert!(matches!(cli.sort, Some(SortArg::AgeAsc)));
         let cli = parse(&["ghostdu", "--export", "/tmp/x.json"]);
         assert_eq!(cli.export, Some(PathBuf::from("/tmp/x.json")));
         let cli = parse(&["ghostdu", "--print-completions", "bash"]);
@@ -712,6 +846,46 @@ mod cli_tests {
             "/definitely/not/here-12345/tree.json",
             &path,
         ]);
+        assert!(run(cli).is_err());
+    }
+
+    #[test]
+    fn diff_subcommand_compares_two_exports() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("same.txt"), "x").unwrap();
+        std::fs::write(dir.path().join("grown.txt"), "x").unwrap();
+        let path = dir.path().to_string_lossy().into_owned();
+        let before = dir.path().join("before.json");
+        let after = dir.path().join("after.json");
+        let before_str = before.to_string_lossy().into_owned();
+        let after_str = after.to_string_lossy().into_owned();
+        run(parse(&["ghostdu", "--export", &before_str, &path])).unwrap();
+        std::fs::write(dir.path().join("grown.txt"), vec![0u8; 5000]).unwrap();
+        std::fs::write(dir.path().join("new.txt"), "x").unwrap();
+        run(parse(&["ghostdu", "--export", &after_str, &path])).unwrap();
+        let cli = parse(&["ghostdu", "diff", &before_str, &after_str]);
+        assert!(run(cli).is_ok());
+        // Missing files and bad versions fail closed with an error.
+        let cli = parse(&["ghostdu", "diff", "/definitely/not/here.json", &after_str]);
+        assert!(run(cli).is_err());
+        std::fs::write(&before, "not json at all").unwrap();
+        let cli = parse(&["ghostdu", "diff", &before_str, &after_str]);
+        assert!(run(cli).is_err());
+    }
+
+    #[test]
+    fn import_headless_prints_loaded_tree() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("f.txt"), "x").unwrap();
+        let path = dir.path().to_string_lossy().into_owned();
+        let snapshot = dir.path().join("snap.json");
+        let snapshot_str = snapshot.to_string_lossy().into_owned();
+        run(parse(&["ghostdu", "--export", &snapshot_str, &path])).unwrap();
+        // Headless in tests (piped stdout): prints the loaded tree.
+        let cli = parse(&["ghostdu", "--import", &snapshot_str]);
+        assert!(run(cli).is_ok());
+        // Unknown versions and missing files fail closed.
+        let cli = parse(&["ghostdu", "--import", "/definitely/not/here.json"]);
         assert!(run(cli).is_err());
     }
 
@@ -813,13 +987,15 @@ mod cli_tests {
             ("--hide-ghost", SortArg::Size),
             ("--hide-ghost", SortArg::SizeAsc),
             ("--hide-ghost", SortArg::Name),
+            ("--hide-ghost", SortArg::Age),
+            ("--hide-ghost", SortArg::AgeAsc),
         ] {
             let flag = flag.to_string();
             let cli = parse(&["ghostdu", &flag, "--sort", sort_name(sort)]);
             apply_cli_display(&mut app, &cli);
             assert_eq!(app.ghost_filter, GhostFilterMode::HideGhost);
         }
-        assert_eq!(app.sort_mode, SortMode::ByName);
+        assert_eq!(app.sort_mode, SortMode::ByAgeAsc);
     }
 
     fn sort_name(sort: SortArg) -> &'static str {
@@ -828,6 +1004,8 @@ mod cli_tests {
             SortArg::SizeAsc => "size-asc",
             SortArg::Name => "name",
             SortArg::Items => "items",
+            SortArg::Age => "age",
+            SortArg::AgeAsc => "age-asc",
         }
     }
 
@@ -991,6 +1169,8 @@ mod pty_session_tests {
                 apparent_size: false,
                 sort: None,
                 export: None,
+                import: None,
+                command: None,
                 print_completions: None,
                 print_manpage: false,
             },
@@ -1040,6 +1220,7 @@ mod pty_session_tests {
             &|d| crossterm::event::poll(d),
             &crossterm::event::read,
             &run_subshell,
+            None,
         );
         assert!(result.is_ok(), "cancelled scan exits Ok: {result:?}");
 
@@ -1060,6 +1241,7 @@ mod pty_session_tests {
             &|d| crossterm::event::poll(d),
             &crossterm::event::read,
             &run_subshell,
+            None,
         );
         assert!(result.is_ok(), "session exits on q: {result:?}");
     }
@@ -1092,6 +1274,8 @@ mod interactive_driver_tests {
                 apparent_size: false,
                 sort: None,
                 export: None,
+                import: None,
+                command: None,
                 print_completions: None,
                 print_manpage: false,
             },
@@ -1203,6 +1387,7 @@ mod interactive_driver_tests {
             &|_| driver.main_poll(),
             &|| driver.main_read(),
             subshell,
+            None,
         )
     }
 
@@ -1258,6 +1443,7 @@ mod interactive_driver_tests {
             &|_| boom_bool(),
             &|| boom_event(),
             &subshell_ok,
+            None,
         );
         let error = result.expect_err("poll failure must propagate");
         assert!(error.to_string().contains("poll boom"), "{error}");
@@ -1283,6 +1469,7 @@ mod interactive_driver_tests {
             &|_| boom_bool(),
             &|| boom_event(),
             &subshell_ok,
+            None,
         );
         let error = result.expect_err("read failure must propagate");
         assert!(error.to_string().contains("read boom"), "{error}");
@@ -1305,6 +1492,7 @@ mod interactive_driver_tests {
             &|_| Ok(true),
             &|| Err::<Event, _>(std::io::Error::other("main read boom")),
             &subshell_ok,
+            None,
         );
         let error = result.expect_err("main-loop read failure must propagate");
         assert!(error.to_string().contains("main read boom"), "{error}");
@@ -1431,5 +1619,54 @@ mod interactive_driver_tests {
         let caught = std::panic::catch_unwind(|| panic!("hook test panic"));
         std::panic::set_hook(saved);
         assert!(caught.is_err(), "panic must still propagate after the hook");
+    }
+
+    #[test]
+    fn imported_session_refuses_mutations() {
+        // Snapshot browse through run_app with a preloaded tree: the scan
+        // phase is skipped (its fakes panic if touched), and every mutating
+        // arm refuses with a status while the target path stays put. Exact
+        // per-phase script, like the rest. The subtree is scanned directly
+        // so Backspace takes RescanPath (at a scanned root, going up leaves
+        // the tree); one level down it would merely pop back (Continue).
+        let dir = tempfile::tempdir().unwrap();
+        let sub = dir.path().join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        std::fs::write(sub.join("f.txt"), "x").unwrap();
+        let (cli, options) = test_cli(sub.clone());
+        let root = ghostdu::fs::scan_directory(
+            &sub,
+            None,
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        )
+        .unwrap();
+        let mut terminal = test_terminal();
+        let driver = Driver::new(
+            vec![],
+            vec![],
+            vec![true; 5],
+            vec![
+                key(KeyCode::Char('r')),
+                key(KeyCode::Char('R')),
+                key(KeyCode::Backspace),
+                key(KeyCode::Char('!')),
+                Driver::quit(),
+            ],
+        );
+        let result = run_app(
+            &mut terminal,
+            sub.clone(),
+            &cli,
+            &options,
+            &|_| panic!("scan must not run for a preloaded tree"),
+            &|| panic!("scan must not run for a preloaded tree"),
+            &|_| driver.main_poll(),
+            &|| driver.main_read(),
+            &subshell_ok,
+            Some(root),
+        );
+        // A rescan would hit the panicking scan fakes above, so Ok proves
+        // every mutating arm refused instead of rescanning.
+        assert!(result.is_ok());
     }
 }

@@ -396,6 +396,10 @@ fn handle_filesystem_keys(app: &mut App, key: KeyEvent) -> EventResult {
             app.toggle_safe_filter();
             EventResult::Continue
         }
+        KeyCode::Char('m') | KeyCode::Char('M') => {
+            app.toggle_stale_filter();
+            EventResult::Continue
+        }
 
         // Sorting & Searching
         KeyCode::Char('s') => {
@@ -657,6 +661,23 @@ mod key_matrix_tests {
             handle_key_event(app, ctrl(KeyCode::Char('c'))),
             EventResult::Exit
         ));
+    }
+
+    #[test]
+    fn stale_filter_key_toggles() {
+        let mut fx = fixture();
+        let app = &mut fx.app;
+        assert!(!app.stale_only_filter);
+        assert!(matches!(
+            handle_key_event(app, key(KeyCode::Char('m'))),
+            EventResult::Continue
+        ));
+        assert!(app.stale_only_filter);
+        assert!(matches!(
+            handle_key_event(app, key(KeyCode::Char('M'))),
+            EventResult::Continue
+        ));
+        assert!(!app.stale_only_filter);
     }
 }
 
