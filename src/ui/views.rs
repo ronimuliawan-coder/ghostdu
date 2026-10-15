@@ -136,8 +136,10 @@ pub fn render_ui(f: &mut Frame, app: &App) {
     }
 
     let footer_len = if size.height >= 5 { 1 } else { 0 };
+    // Snapshot warning takes its own header line when present.
+    let snapshot_extra: u16 = u16::from(app.has_snapshot_volumes());
     let header_len = if size.height >= 22 {
-        5 // 3 lines of content + 2 border rows
+        5 + snapshot_extra // 3 lines of content + 2 border rows
     } else if size.height >= 16 {
         4 // 2 lines of content + 2 border rows
     } else if size.height >= 10 {
@@ -307,6 +309,15 @@ fn render_header(f: &mut Frame, app: &App, area: Rect, header_len: u16) {
         ));
         if safe_reclaimable > 0 {
             append_if_fits(&mut line_spans, vec![safe_stat_span], content_width);
+        }
+        // Snapshot-store warning in the compact header too: deletions may
+        // free 0 bytes while snapshots reference the extents.
+        if app.has_snapshot_volumes() {
+            append_if_fits(
+                &mut line_spans,
+                vec![Span::styled(" ⚠snap", Style::default().fg(Color::Yellow))],
+                content_width,
+            );
         }
         append_if_fits(
             &mut line_spans,
@@ -809,7 +820,14 @@ fn render_header(f: &mut Frame, app: &App, area: Rect, header_len: u16) {
         ])
     };
 
-    let header_widget = Paragraph::new(vec![title_line, folder_stat_line, fs_line]).block(
+    let mut header_lines = vec![title_line, folder_stat_line, fs_line];
+    if app.has_snapshot_volumes() {
+        header_lines.push(Line::from(Span::styled(
+            "⚠ snapshots present — deletion may free 0 bytes",
+            Style::default().fg(Color::Yellow),
+        )));
+    }
+    let header_widget = Paragraph::new(header_lines).block(
         Block::default()
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
@@ -887,6 +905,12 @@ fn render_filesystem_view(f: &mut Frame, app: &App, area: Rect) {
         3 // Ultra narrow: 3 columns
     };
 
+    // Age-heatmap clock, read once per render for stable glyphs.
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+
     let rows: Vec<Row> = visible
         .iter()
         .enumerate()
@@ -943,29 +967,45 @@ fn render_filesystem_view(f: &mut Frame, app: &App, area: Rect) {
                 Style::default().fg(Color::Gray)
             };
 
+            // Btrfs subvolume boundaries get a marker in every row mode.
+            // Imported snapshots carry no live topology, so no badges there.
+            let subvol_suffix = app
+                .btrfs_subvols
+                .get(&entry.path)
+                .filter(|_| !app.imported)
+                .map(|name| format!(" ⛁{name}"))
+                .unwrap_or_default();
+
             // In narrow modes (2 & 3), embed ghost badge & safety directly into name column
             let display_name = if col_mode >= 2 {
                 if entry.ghost_kind.is_ghost() {
                     format!(
-                        "{}{} {} {}",
+                        "{}{} {} {}{}",
                         icon,
                         entry.delete_safety.glyph(),
                         entry.ghost_kind.badge(),
-                        entry.name
+                        entry.name,
+                        subvol_suffix,
                     )
                 } else if entry.delete_safety == DeleteSafety::System {
                     format!(
-                        "{}{} SYSTEM {}",
+                        "{}{} SYSTEM {}{}",
                         icon,
                         entry.delete_safety.glyph(),
-                        entry.name
+                        entry.name,
+                        subvol_suffix,
                     )
                 } else {
-                    format!("{}{}", icon, entry.name)
+                    format!("{}{}{}", icon, entry.name, subvol_suffix)
                 }
             } else {
-                format!("{}{}", icon, entry.name)
+                format!("{}{}{}", icon, entry.name, subvol_suffix)
             };
+
+            let display_name = format!(
+                "{display_name}{}",
+                crate::fs::entry::age_glyph(crate::fs::entry::age_tier(entry.mtime_secs, now_secs))
+            );
 
             let name_span = Span::styled(display_name, name_style);
 
@@ -2254,6 +2294,7 @@ fn render_help_modal(f: &mut Frame, screen: Rect) {
             Line::from("  s            Cycle sort order"),
             Line::from("  A            Toggle Apparent size"),
             Line::from("  c            Toggle Safe-only filter (🟢)"),
+            Line::from("  m            Toggle Stale-only filter (🧊 ≥180d)"),
             Line::from("  /            Live search / filter"),
             Line::from("  q / Ctrl+C   Quit ghostdu"),
         ];
@@ -3091,6 +3132,8 @@ mod render_sweep_tests {
             SortMode::BySizeAsc,
             SortMode::ByName,
             SortMode::ByItems,
+            SortMode::ByAgeDesc,
+            SortMode::ByAgeAsc,
         ] {
             app.sort_mode = mode;
             let _ = render(app, 100, 30);
@@ -3446,5 +3489,99 @@ mod render_sweep_tests {
         app.active_view = ActiveView::ItemInfoModal;
         let _ = render(&app, 100, 30);
         app.cancel_modal();
+    }
+
+    #[test]
+    fn age_heatmap_glyphs() {
+        use crate::fs::entry::{DeleteSafety, FileEntry, GhostKind};
+        use std::path::PathBuf;
+        let mut fx = fixture();
+        // One row per tier plus an unknown: all visible without scrolling.
+        // Margins are days wide against the same clock production reads.
+        const DAY: i64 = 86400;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        for (i, (name, days)) in [
+            ("age-hot", 1),
+            ("age-active", 10),
+            ("age-warm", 100),
+            ("age-cold", 300),
+        ]
+        .iter()
+        .enumerate()
+        {
+            let mut row = FileEntry::new_file(
+                name.to_string(),
+                PathBuf::from(format!("/synth/{name}")),
+                100,
+                100,
+                false,
+                1,
+                9200 + i as u64,
+                GhostKind::None,
+                DeleteSafety::UserData,
+            );
+            row.mtime_secs = now - days * DAY;
+            fx.app.root_entry.children.push(row);
+        }
+        let out = render(&fx.app, 100, 30);
+        assert!(out.contains("🔥"), "hot glyph renders");
+        assert!(out.contains("⚡"), "active glyph renders");
+        assert!(out.contains("💤"), "warm glyph renders");
+        assert!(out.contains("🧊"), "cold glyph renders");
+    }
+
+    #[test]
+    fn btrfs_subvolume_badges_and_snapshot_warning() {
+        use std::path::PathBuf;
+        let mut fx = fixture();
+        let app = &mut fx.app;
+        // Fabricate mount topology: a subvolume boundary on the first
+        // visible row plus a snapshot store elsewhere.
+        let first = app.visible_children()[0].path.clone();
+        app.btrfs_subvols.insert(first, "@home".to_string());
+        app.btrfs_subvols
+            .insert(PathBuf::from("/@/.snapshots"), "/@/.snapshots".to_string());
+        assert!(app.has_snapshot_volumes());
+        let out = render(app, 100, 30);
+        assert!(out.contains("⛁@home"), "subvolume badge renders");
+        let wide = render(app, 140, 30);
+        assert!(
+            wide.contains("snapshots present"),
+            "snapshot warning renders"
+        );
+    }
+
+    #[test]
+    fn imported_snapshot_hides_topology() {
+        use std::path::PathBuf;
+        let mut fx = fixture();
+        let app = &mut fx.app;
+        let first = app.visible_children()[0].path.clone();
+        app.btrfs_subvols.insert(first, "@home".to_string());
+        app.btrfs_subvols
+            .insert(PathBuf::from("/@/.snapshots"), "/@/.snapshots".to_string());
+        app.imported = true;
+        assert!(!app.has_snapshot_volumes());
+        let out = render(app, 100, 30);
+        assert!(!out.contains("⛁"), "no subvolume badges for imports");
+        assert!(
+            !out.contains("snapshots present"),
+            "no snapshot warning for imports"
+        );
+    }
+
+    #[test]
+    fn compact_header_shows_snapshot_warning() {
+        use std::path::PathBuf;
+        let mut fx = fixture();
+        fx.app
+            .btrfs_subvols
+            .insert(PathBuf::from("/@/.snapshots"), "/@/.snapshots".to_string());
+        assert!(fx.app.has_snapshot_volumes());
+        let out = render(&fx.app, 100, 7);
+        assert!(out.contains("snap"), "compact header carries the warning");
     }
 }

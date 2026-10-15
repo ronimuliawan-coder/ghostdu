@@ -99,6 +99,8 @@ pub enum SortMode {
     BySizeAsc,
     ByName,
     ByItems,
+    ByAgeDesc,
+    ByAgeAsc,
 }
 
 impl SortMode {
@@ -107,7 +109,9 @@ impl SortMode {
             SortMode::BySizeDesc => SortMode::BySizeAsc,
             SortMode::BySizeAsc => SortMode::ByName,
             SortMode::ByName => SortMode::ByItems,
-            SortMode::ByItems => SortMode::BySizeDesc,
+            SortMode::ByItems => SortMode::ByAgeDesc,
+            SortMode::ByAgeDesc => SortMode::ByAgeAsc,
+            SortMode::ByAgeAsc => SortMode::BySizeDesc,
         }
     }
 
@@ -117,6 +121,8 @@ impl SortMode {
             SortMode::BySizeAsc => "Size (asc)",
             SortMode::ByName => "Name",
             SortMode::ByItems => "Item Count",
+            SortMode::ByAgeDesc => "Age (oldest)",
+            SortMode::ByAgeAsc => "Age (newest)",
         }
     }
 }
@@ -164,6 +170,7 @@ pub struct App {
     pub action_has_recheck: bool,
     pub action_has_system: bool,
     pub safe_only_filter: bool,
+    pub stale_only_filter: bool,
 
     // Ghost Inspector data
     pub docker_info: DockerDiskInfo,
@@ -184,6 +191,14 @@ pub struct App {
     // Global Filesystem and Detailed Item Info
     pub fs_info: Option<FsMountInfo>,
     pub item_info: Option<DetailedItemInfo>,
+    /// Btrfs subvolume boundaries (mount path -> subvolume name), loaded once
+    /// from mountinfo. Empty on non-btrfs systems or unreadable mountinfo.
+    pub btrfs_subvols: HashMap<PathBuf, String>,
+    /// Snapshot imported from `--import`: browse-only. Every destructive or
+    /// rescanning path refuses with a status message instead of touching the
+    /// live filesystem (remote dev/ino can never verify locally, and a
+    /// remote PID table must never signal local processes).
+    pub imported: bool,
 }
 
 impl App {
@@ -191,6 +206,9 @@ impl App {
         let docker_info = fetch_docker_disk_info();
         let deleted_open_files = scan_deleted_open_files();
         let fs_info = query_fs_info(&root_entry.path);
+        let btrfs_subvols = std::fs::read("/proc/self/mountinfo")
+            .map(|topology| crate::fs::scanner::parse_btrfs_subvolumes(&topology))
+            .unwrap_or_default();
 
         Self {
             root_entry,
@@ -217,6 +235,7 @@ impl App {
             action_has_recheck: false,
             action_has_system: false,
             safe_only_filter: false,
+            stale_only_filter: false,
             docker_info,
             deleted_open_files,
             ghost_tab_index: 0,
@@ -231,8 +250,17 @@ impl App {
             ghost_docker_scroll_offset: Cell::new(0),
             ghost_deleted_scroll_offset: Cell::new(0),
             fs_info,
+            btrfs_subvols,
+            imported: false,
             item_info: None,
         }
+    }
+
+    /// True when a snapshot-like btrfs subvolume is mounted anywhere:
+    /// deletions there may free 0 bytes while snapshots hold the extents.
+    /// Always false for imported snapshots, whose live topology is absent.
+    pub fn has_snapshot_volumes(&self) -> bool {
+        !self.imported && crate::fs::scanner::has_snapshot_subvolumes(&self.btrfs_subvols)
     }
 
     /// Refresh Docker and deleted-open ghost file info
@@ -291,6 +319,13 @@ impl App {
             Some(self.search_query.to_lowercase())
         };
 
+        // Clock read once per call so every entry shares the same age
+        // reference (and the syscall runs once per frame, not per row).
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+
         let mut list: Vec<&FileEntry> = current
             .children
             .iter()
@@ -313,6 +348,16 @@ impl App {
                 // 3. Safe-to-clean filter (c key)
                 if self.safe_only_filter {
                     entry.delete_safety.is_safe()
+                } else {
+                    true
+                }
+            })
+            .filter(|entry| {
+                // 4. Stale-only filter (m key): proven-stale entries with a
+                // known mtime at least 180 days old. Unknown mtimes never
+                // match, so the filter only shows what it can prove.
+                if self.stale_only_filter {
+                    entry.mtime_secs > 0 && now_secs.saturating_sub(entry.mtime_secs) >= 180 * 86400
                 } else {
                     true
                 }
@@ -342,6 +387,25 @@ impl App {
                 list.sort_by(|a, b| {
                     b.items_count
                         .cmp(&a.items_count)
+                        .then_with(|| a.name.cmp(&b.name))
+                });
+            }
+            SortMode::ByAgeDesc => {
+                list.sort_by(|a, b| {
+                    // Unknown mtimes (0) sort after every known one: they
+                    // carry no age information, so ranking them oldest would
+                    // lie. Same rule as the stale-only filter.
+                    (a.mtime_secs <= 0)
+                        .cmp(&(b.mtime_secs <= 0))
+                        .then_with(|| a.mtime_secs.cmp(&b.mtime_secs))
+                        .then_with(|| a.name.cmp(&b.name))
+                });
+            }
+            SortMode::ByAgeAsc => {
+                list.sort_by(|a, b| {
+                    (a.mtime_secs <= 0)
+                        .cmp(&(b.mtime_secs <= 0))
+                        .then_with(|| b.mtime_secs.cmp(&a.mtime_secs))
                         .then_with(|| a.name.cmp(&b.name))
                 });
             }
@@ -770,8 +834,24 @@ impl App {
         }
     }
 
+    /// Toggle filter showing only proven-stale items (mtime ≥ 180 days ago)
+    pub fn toggle_stale_filter(&mut self) {
+        self.stale_only_filter = !self.stale_only_filter;
+        self.cursor_index = 0;
+        self.scroll_offset.set(0);
+        if self.stale_only_filter {
+            self.set_status("Stale-only filter: ON (showing only 🧊 items untouched ≥ 180 days)");
+        } else {
+            self.set_status("Stale-only filter: OFF (showing all items)");
+        }
+    }
+
     /// Prepare Move to Wastebin confirmation
     pub fn prompt_move_to_trash(&mut self) {
+        if self.imported {
+            self.set_status("Move to wastebin is disabled for imported snapshots");
+            return;
+        }
         let mut targets = Vec::new();
         let mut total_size = 0u64;
 
@@ -796,6 +876,10 @@ impl App {
 
     /// Prepare Permanent Deletion confirmation
     pub fn prompt_permanent_delete(&mut self) {
+        if self.imported {
+            self.set_status("Permanent delete is disabled for imported snapshots");
+            return;
+        }
         let mut targets = Vec::new();
         let mut total_size = 0u64;
 
@@ -1156,6 +1240,10 @@ impl App {
     /// Trash or delete checked janitor rows through the standard confirmation
     /// flow. Trash contents route to permanent delete with an explanation.
     pub fn janitor_action(&mut self, to_trash: bool) {
+        if self.imported {
+            self.set_status("Destructive actions are disabled for imported snapshots");
+            return;
+        }
         let mut targets = Vec::new();
         let mut total = 0u64;
         let mut trash_only_hit = false;
@@ -1230,6 +1318,10 @@ impl App {
     /// Trash or delete the highlighted leaderboard row through the standard
     /// confirmation flow (live identity re-verified before any mutation).
     pub fn top_file_action(&mut self, to_trash: bool) {
+        if self.imported {
+            self.set_status("Destructive actions are disabled for imported snapshots");
+            return;
+        }
         let Some(top) = self.top_files.get(self.top_cursor).cloned() else {
             return;
         };
@@ -1349,6 +1441,10 @@ impl App {
 
     /// Prepare Docker Prune confirmation
     pub fn prompt_docker_prune(&mut self) {
+        if self.imported {
+            self.set_status("Docker prune is disabled for imported snapshots");
+            return;
+        }
         let total_reclaimable = self.docker_info.images_reclaimable_size
             + self.docker_info.containers_reclaimable_size
             + self.docker_info.volumes_reclaimable_size
@@ -1390,6 +1486,10 @@ impl App {
     /// freshly validated name, and the instance is pinned with a pidfd.
     /// Callers pass PIDs from the ghost table, never free-form input.
     pub fn prompt_kill_process(&mut self, pid: u32) {
+        if self.imported {
+            self.set_status("Process signalling is disabled for imported snapshots");
+            return;
+        }
         let recorded = self
             .deleted_open_files
             .iter()
@@ -1448,6 +1548,11 @@ impl App {
     /// `sigterm` selects SIGTERM (graceful) over SIGKILL. Kernel errors surface
     /// as status messages.
     pub fn execute_kill(&mut self, sigterm: bool) {
+        if self.imported {
+            self.set_status("Process signalling is disabled for imported snapshots");
+            self.pending_action = None;
+            return;
+        }
         let confirmed = self.pending_action.take();
         self.active_view = self.previous_view;
         let Some(ConfirmAction::KillProcess {
@@ -1491,6 +1596,11 @@ impl App {
 
     /// Execute pending action after user confirms
     pub fn execute_pending_action(&mut self) {
+        if self.imported {
+            self.set_status("Destructive actions are disabled for imported snapshots");
+            self.cancel_modal();
+            return;
+        }
         if self.action_safety_blocked {
             self.set_status("⛔ BLOCKED: Cannot delete protected system file/directory!");
             self.cancel_modal();
@@ -1768,6 +1878,16 @@ impl App {
             entry.disk_usage = total_disk;
             entry.reclaimable = total_reclaimable;
             entry.items_count = total_items + 1;
+            // Same newest-content rule as the full scan, reseeded from the
+            // directory's own mtime: incremental updates must refresh
+            // ancestor staleness in both directions, or a replaced-older
+            // child leaves the ancestor ranked as recent.
+            let newest_child = entry
+                .children
+                .iter()
+                .map(|c| c.mtime_secs)
+                .fold(0, Ord::max);
+            entry.mtime_secs = entry.own_mtime_secs.max(newest_child);
             if entry.delete_safety == DeleteSafety::Safe {
                 entry.safe_reclaimable = total_reclaimable;
                 entry.safe_items = 1;
@@ -1838,6 +1958,10 @@ impl App {
 
     /// Refresh filesystem stats, directory tree, Docker storage, and ghost files without restarting
     pub fn refresh_all(&mut self) {
+        if self.imported {
+            self.set_status("Refresh is disabled for imported snapshots");
+            return;
+        }
         self.discard_changed_selections();
         let current_path = self.current_dir_entry().path.clone();
         let is_at_root = self.path_stack.is_empty();
@@ -2649,8 +2773,12 @@ mod selection_limit_tests {
             GhostFilterMode::GhostOnly
         );
         assert_eq!(GhostFilterMode::GhostOnly.next(), GhostFilterMode::ShowAll);
-        assert_eq!(SortMode::ByItems.next(), SortMode::BySizeDesc);
+        assert_eq!(SortMode::ByItems.next(), SortMode::ByAgeDesc);
+        assert_eq!(SortMode::ByAgeDesc.next(), SortMode::ByAgeAsc);
+        assert_eq!(SortMode::ByAgeAsc.next(), SortMode::BySizeDesc);
         assert_eq!(SortMode::BySizeDesc.label(), "Size (desc)");
+        assert_eq!(SortMode::ByAgeDesc.label(), "Age (oldest)");
+        assert_eq!(SortMode::ByAgeAsc.label(), "Age (newest)");
         let (_dir, mut app) = app_with_files(1);
         app.refresh_ghost_info();
         assert!(app.current_status().unwrap_or("").contains("Docker"));
@@ -3266,5 +3394,232 @@ mod coverage_gap_tests {
         app.cursor_index = 999;
         app.execute_pending_action();
         assert_eq!(app.cursor_index, app.visible_children().len() - 1);
+    }
+}
+
+#[cfg(test)]
+mod age_heatmap_tests {
+    use super::*;
+    use crate::fs::entry::GhostKind;
+    use std::sync::{atomic::AtomicBool, Arc};
+
+    const DAY: i64 = 86400;
+
+    fn now_secs() -> i64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0)
+    }
+
+    fn app_with_files(count: usize) -> (tempfile::TempDir, App) {
+        let dir = tempfile::tempdir().unwrap();
+        for i in 0..count {
+            std::fs::write(dir.path().join(format!("f{i:04}")), "x").unwrap();
+        }
+        let root =
+            crate::fs::scanner::scan_directory(dir.path(), None, Arc::new(AtomicBool::new(false)))
+                .unwrap();
+        (dir, App::new(root))
+    }
+
+    fn aged_row(name: &str, days_old: i64) -> FileEntry {
+        let mut row = FileEntry::new_file(
+            name.to_string(),
+            std::path::PathBuf::from(format!("/synth/{name}")),
+            100,
+            100,
+            false,
+            1,
+            9000,
+            GhostKind::None,
+            DeleteSafety::UserData,
+        );
+        row.mtime_secs = now_secs() - days_old * DAY;
+        row
+    }
+
+    #[test]
+    fn stale_filter_shows_only_proven_stale() {
+        let (_dir, mut app) = app_with_files(2);
+        // Fresh scan: nothing is stale.
+        assert!(!app.stale_only_filter);
+        app.toggle_stale_filter();
+        assert!(app.stale_only_filter);
+        assert!(app.visible_children().is_empty());
+        // A 200-day-old row passes; unknown mtime never does.
+        app.root_entry.children.push(aged_row("old.txt", 200));
+        let mut unknown = aged_row("mystery.txt", 1);
+        unknown.mtime_secs = 0;
+        app.root_entry.children.push(unknown);
+        let visible = app.visible_children();
+        assert_eq!(visible.len(), 1);
+        assert_eq!(visible[0].name, "old.txt");
+        assert!(app
+            .current_status()
+            .unwrap_or("")
+            .contains("Stale-only filter: ON"));
+        app.toggle_stale_filter();
+        assert!(!app.stale_only_filter);
+        assert!(app
+            .current_status()
+            .unwrap_or("")
+            .contains("Stale-only filter: OFF"));
+    }
+
+    #[test]
+    fn age_sort_orders_by_mtime() {
+        let (_dir, mut app) = app_with_files(0);
+        app.root_entry.children.push(aged_row("new.txt", 1));
+        app.root_entry.children.push(aged_row("old.txt", 300));
+        app.root_entry.children.push(aged_row("mid.txt", 30));
+        // Unknown mtimes carry no age info: last in both directions.
+        let mut unknown = aged_row("mystery.txt", 1);
+        unknown.mtime_secs = 0;
+        app.root_entry.children.push(unknown);
+        app.sort_mode = SortMode::ByAgeDesc;
+        let names: Vec<_> = app
+            .visible_children()
+            .iter()
+            .map(|e| e.name.clone())
+            .collect();
+        assert_eq!(names, vec!["old.txt", "mid.txt", "new.txt", "mystery.txt"]);
+        app.sort_mode = SortMode::ByAgeAsc;
+        let names: Vec<_> = app
+            .visible_children()
+            .iter()
+            .map(|e| e.name.clone())
+            .collect();
+        assert_eq!(names, vec!["new.txt", "mid.txt", "old.txt", "mystery.txt"]);
+    }
+
+    #[test]
+    fn subtree_refresh_updates_ancestor_mtime() {
+        let (_dir, mut app) = app_with_files(1);
+        let target = app.root_entry.children[0].path.clone();
+        // Backdate the ancestor, then refresh the child with a newer mtime:
+        // incremental updates must surface it just like a full scan.
+        app.root_entry.mtime_secs = 1;
+        let mut fresh = app.root_entry.children[0].clone();
+        let now = now_secs();
+        fresh.mtime_secs = now;
+        app.replace_subtree(&target, fresh);
+        assert_eq!(app.root_entry.mtime_secs, now);
+    }
+
+    #[test]
+    fn subtree_refresh_can_make_ancestor_older() {
+        let (_dir, mut app) = app_with_files(1);
+        let target = app.root_entry.children[0].path.clone();
+        // The ancestor previously aggregated as recent; replacing its child
+        // with an older one must move the aggregate down, reseeded from the
+        // directory's own mtime rather than the stored maximum.
+        app.root_entry.own_mtime_secs = 1;
+        app.root_entry.mtime_secs = now_secs();
+        let mut older = app.root_entry.children[0].clone();
+        older.mtime_secs = 2;
+        app.replace_subtree(&target, older);
+        assert_eq!(app.root_entry.mtime_secs, 2);
+    }
+}
+
+#[cfg(test)]
+mod imported_snapshot_tests {
+    use super::*;
+    use std::sync::{atomic::AtomicBool, Arc};
+
+    fn imported_app() -> (tempfile::TempDir, App) {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("f.txt"), "x").unwrap();
+        let root =
+            crate::fs::scanner::scan_directory(dir.path(), None, Arc::new(AtomicBool::new(false)))
+                .unwrap();
+        let mut app = App::new(root);
+        app.imported = true;
+        (dir, app)
+    }
+
+    #[test]
+    fn imported_prompts_refuse_with_status() {
+        let (_dir, mut app) = imported_app();
+        app.prompt_move_to_trash();
+        assert!(app
+            .current_status()
+            .unwrap_or("")
+            .contains("disabled for imported snapshots"));
+        assert!(app.pending_action.is_none());
+        app.prompt_permanent_delete();
+        assert!(app
+            .current_status()
+            .unwrap_or("")
+            .contains("disabled for imported snapshots"));
+        assert!(app.pending_action.is_none());
+        app.prompt_kill_process(424242);
+        assert!(app
+            .current_status()
+            .unwrap_or("")
+            .contains("disabled for imported snapshots"));
+        assert!(app.pending_action.is_none());
+    }
+
+    #[test]
+    fn imported_execute_and_refresh_refuse() {
+        let (_dir, mut app) = imported_app();
+        app.pending_action = Some(ConfirmAction::KillProcess {
+            pid: 424242,
+            name: "x".to_string(),
+            start_time: 0,
+            pidfd: None,
+        });
+        app.execute_kill(false);
+        assert!(app
+            .current_status()
+            .unwrap_or("")
+            .contains("disabled for imported snapshots"));
+        app.refresh_all();
+        assert!(app
+            .current_status()
+            .unwrap_or("")
+            .contains("disabled for imported snapshots"));
+    }
+
+    #[test]
+    fn imported_docker_prune_and_confirmed_execute_refuse() {
+        let (_dir, mut app) = imported_app();
+        app.prompt_docker_prune();
+        assert!(app
+            .current_status()
+            .unwrap_or("")
+            .contains("disabled for imported snapshots"));
+        assert!(app.pending_action.is_none());
+        app.pending_action = Some(ConfirmAction::KillProcess {
+            pid: 424242,
+            name: "x".to_string(),
+            start_time: 0,
+            pidfd: None,
+        });
+        app.execute_pending_action();
+        assert!(app
+            .current_status()
+            .unwrap_or("")
+            .contains("disabled for imported snapshots"));
+        assert!(app.pending_action.is_none());
+    }
+
+    #[test]
+    fn imported_janitor_and_top_file_refuse() {
+        let (_dir, mut app) = imported_app();
+        app.janitor_action(true);
+        assert!(app
+            .current_status()
+            .unwrap_or("")
+            .contains("disabled for imported snapshots"));
+        assert!(app.pending_action.is_none());
+        app.top_file_action(false);
+        assert!(app
+            .current_status()
+            .unwrap_or("")
+            .contains("disabled for imported snapshots"));
+        assert!(app.pending_action.is_none());
     }
 }
