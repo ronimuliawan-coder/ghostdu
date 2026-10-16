@@ -73,48 +73,53 @@ pub fn is_btrfs(path: &Path) -> bool {
 /// `N` extents until the kernel marks an extent LAST (or a short batch ends
 /// the file). Works on any FIEMAP-capable filesystem, not just Btrfs.
 fn extent_sharing_batched<const N: usize>(path: &Path) -> io::Result<(u64, u64)> {
-    use std::os::unix::io::AsRawFd;
     let file = std::fs::File::open(path)?;
     let mut shared = 0u64;
     let mut exclusive = 0u64;
-    let mut start = 0u64;
-    loop {
-        let mut buf = FiemapBuf {
-            head: FiemapHead {
-                fm_start: start,
-                fm_length: u64::MAX,
-                fm_extent_count: N as u32,
-                ..Default::default()
-            },
-            extents: [FiemapExtent::default(); N],
-        };
-        let ret = unsafe {
-            libc::ioctl(
-                file.as_raw_fd(),
-                FS_IOC_FIEMAP,
-                &mut buf as *mut FiemapBuf<N>,
-            )
-        };
-        if ret < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        let n = (buf.head.fm_mapped_extents as usize).min(N);
-        if n == 0 {
-            break;
-        }
-        let (batch_shared, batch_exclusive) = sum_extents(&buf.extents[..n]);
+    let mut pending = Some(0u64);
+    while let Some(start) = pending {
+        let ((batch_shared, batch_exclusive), next) = walk_batch::<N>(&file, start)?;
         shared = shared.saturating_add(batch_shared);
         exclusive = exclusive.saturating_add(batch_exclusive);
-        let last = buf.extents[..n]
-            .iter()
-            .any(|e| e.fe_flags & FIEMAP_EXTENT_LAST != 0);
-        if last || (buf.head.fm_mapped_extents as usize) < N {
-            break;
-        }
-        let tail = buf.extents[n - 1];
-        start = tail.fe_logical.saturating_add(tail.fe_length);
+        pending = next;
     }
     Ok((shared, exclusive))
+}
+
+/// One FIEMAP batch at `start`: the batch sums plus the next start, or `None`
+/// when the file is fully walked (empty batch, LAST extent, or short batch).
+fn walk_batch<const N: usize>(
+    file: &std::fs::File,
+    start: u64,
+) -> io::Result<((u64, u64), Option<u64>)> {
+    use std::os::unix::io::AsRawFd;
+    let mut buf = FiemapBuf {
+        head: FiemapHead {
+            fm_start: start,
+            fm_length: u64::MAX,
+            fm_extent_count: N as u32,
+            ..Default::default()
+        },
+        extents: [FiemapExtent::default(); N],
+    };
+    let fd = file.as_raw_fd();
+    let ptr = &mut buf as *mut FiemapBuf<N>;
+    let ret = unsafe { libc::ioctl(fd, FS_IOC_FIEMAP, ptr) };
+    if ret < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let n = (buf.head.fm_mapped_extents as usize).min(N);
+    let (batch_shared, batch_exclusive) = sum_extents(&buf.extents[..n]);
+    let last = buf.extents[..n]
+        .iter()
+        .any(|e| e.fe_flags & FIEMAP_EXTENT_LAST != 0);
+    let next = if n == 0 || last || (buf.head.fm_mapped_extents as usize) < N {
+        None
+    } else {
+        let tail = buf.extents[n - 1];
+        Some(tail.fe_logical.saturating_add(tail.fe_length))
+    };
+    Ok(((batch_shared, batch_exclusive), next))
 }
 
 /// `(shared_bytes, exclusive_bytes)` for one file. Directories, missing
@@ -207,6 +212,12 @@ mod tests {
     #[test]
     fn missing_file_errors() {
         assert!(extent_sharing(Path::new("/definitely/not/here-12345")).is_err());
+    }
+
+    #[test]
+    fn ioctl_failure_errors() {
+        // Character devices answer FIEMAP with ENOTTY on every Linux host.
+        assert!(extent_sharing(Path::new("/dev/null")).is_err());
     }
 
     #[test]
