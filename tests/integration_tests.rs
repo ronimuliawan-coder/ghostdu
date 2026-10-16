@@ -341,7 +341,7 @@ fn test_small_terminal_rendering() {
 
         // Item Info Modal
         app.active_view = ghostdu::ui::ActiveView::ItemInfoModal;
-        app.item_info = ghostdu::fs::get_detailed_item_info(&app.root_entry.path, 1);
+        app.item_info = ghostdu::fs::get_detailed_item_info(&app.root_entry.path, 1, false);
         let frame_modal = terminal.draw(|f| ghostdu::ui::render_ui(f, &app)).unwrap();
         for y in 0..h {
             let mut row = String::new();
