@@ -73,7 +73,7 @@ pub fn is_btrfs(path: &Path) -> bool {
 /// `N` extents until the kernel marks an extent LAST (or a short batch ends
 /// the file). Works on any FIEMAP-capable filesystem, not just Btrfs.
 fn extent_sharing_batched<const N: usize>(path: &Path) -> io::Result<(u64, u64)> {
-    let file = std::fs::File::open(path)?;
+    let file = open_regular_nonblocking(path)?;
     let mut shared = 0u64;
     let mut exclusive = 0u64;
     let mut pending = Some(0u64);
@@ -84,6 +84,37 @@ fn extent_sharing_batched<const N: usize>(path: &Path) -> io::Result<(u64, u64)>
         pending = next;
     }
     Ok((shared, exclusive))
+}
+
+/// Open for FIEMAP without ever blocking or following symlinks: FIFOs open
+/// fine with `O_NONBLOCK` but then fail the regular-file check, while a
+/// blocking open on a writer-less FIFO would hang the UI thread that opened
+/// the item panel. Symlinks are rejected outright (`O_NOFOLLOW`).
+fn open_regular_nonblocking(path: &Path) -> io::Result<std::fs::File> {
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::io::FromRawFd;
+    let cpath = std::ffi::CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "interior NUL"))?;
+    let fd = unsafe {
+        libc::open(
+            cpath.as_ptr(),
+            libc::O_RDONLY | libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // Own the fd immediately so every path below closes it via Drop.
+    let file = unsafe { std::fs::File::from_raw_fd(fd) };
+    // fstat on our own open fd cannot fail in practice; a false reading
+    // fails closed (rejected) rather than misclassified.
+    if !file.metadata().map(|m| m.is_file()).unwrap_or(false) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "not a regular file",
+        ));
+    }
+    Ok(file)
 }
 
 /// One FIEMAP batch at `start`: the batch sums plus the next start, or `None`
@@ -234,6 +265,34 @@ mod tests {
     fn ioctl_failure_errors() {
         // Character devices answer FIEMAP with ENOTTY on every Linux host.
         assert!(extent_sharing(Path::new("/dev/null")).is_err());
+        // Direct batch probe: opening /dev/null as a File always succeeds,
+        // so the ioctl error return is exercised deterministically.
+        let devnull = std::fs::File::open("/dev/null").unwrap();
+        assert!(walk_batch::<1>(&devnull, 0).is_err());
+    }
+
+    #[test]
+    fn fifo_and_symlink_are_rejected() {
+        let dir = scratch("special");
+        let fifo = dir.join("pipe");
+        assert_eq!(
+            unsafe {
+                libc::mkfifo(
+                    std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes())
+                        .unwrap()
+                        .as_ptr(),
+                    0o600,
+                )
+            },
+            0
+        );
+        // O_NONBLOCK opens the writer-less FIFO fine; the regular-file check
+        // rejects it instead of hanging or walking it.
+        assert!(extent_sharing(&fifo).is_err());
+        let link = dir.join("link");
+        std::os::unix::fs::symlink(&fifo, &link).unwrap();
+        assert!(extent_sharing(&link).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

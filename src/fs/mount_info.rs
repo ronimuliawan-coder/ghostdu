@@ -191,10 +191,12 @@ pub fn get_detailed_item_info(
     let fs_info = query_fs_info(path);
     let ghost_kind = classify_path(path);
     // One ioctl on the selected file only (never during scans): failures,
-    // directories, symlinks, and non-Btrfs files simply omit the CoW line.
+    // non-files, symlinks, and non-Btrfs files simply omit the CoW line.
+    // `is_file` also excludes FIFOs and sockets, whose blocking open would
+    // hang the UI thread (a writer-less FIFO blocks `File::open` forever).
     // Symlinks resolve to their target's extents, which would mislabel a
     // SYMLINK entry with another file's sharing.
-    let cow_sharing = if cow && !is_dir && !is_symlink && super::btrfs::is_btrfs(path) {
+    let cow_sharing = if cow && meta.is_file() && !is_symlink && super::btrfs::is_btrfs(path) {
         super::btrfs::extent_sharing(path).ok()
     } else {
         None
