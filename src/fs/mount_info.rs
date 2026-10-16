@@ -191,13 +191,18 @@ pub fn get_detailed_item_info(
     let fs_info = query_fs_info(path);
     let ghost_kind = classify_path(path);
     // One ioctl on the selected file only (never during scans): failures,
-    // non-files, symlinks, and non-Btrfs files simply omit the CoW line.
+    // non-files, and symlinks simply omit the CoW line. The query itself is
+    // harmless on any FIEMAP filesystem, so it runs unconditionally here
+    // (keeping this line covered on non-Btrfs CI hosts) and the result is
+    // kept only for Btrfs, the one filesystem where sharing is meaningful.
     // `is_file` also excludes FIFOs and sockets, whose blocking open would
     // hang the UI thread (a writer-less FIFO blocks `File::open` forever).
     // Symlinks resolve to their target's extents, which would mislabel a
     // SYMLINK entry with another file's sharing.
-    let cow_sharing = if cow && meta.is_file() && !is_symlink && super::btrfs::is_btrfs(path) {
-        super::btrfs::extent_sharing(path).ok()
+    let cow_sharing = if cow && meta.is_file() && !is_symlink {
+        super::btrfs::extent_sharing(path)
+            .ok()
+            .filter(|_| super::btrfs::is_btrfs(path))
     } else {
         None
     };
