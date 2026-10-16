@@ -15,6 +15,12 @@ sha256sums=('SKIP')
 build() {
   cd "$pkgname-$pkgver"
   cargo build --release --locked
+
+  # Generated artifacts live with the build output; package() only installs.
+  ./target/release/ghostdu --print-manpage > ghostdu.1
+  ./target/release/ghostdu --print-completions bash > ghostdu.bash
+  ./target/release/ghostdu --print-completions zsh > _ghostdu
+  ./target/release/ghostdu --print-completions fish > ghostdu.fish
 }
 
 package() {
@@ -22,14 +28,8 @@ package() {
   install -Dm755 "target/release/ghostdu" "$pkgdir/usr/bin/ghostdu"
   install -Dm644 "README.md" "$pkgdir/usr/share/doc/$pkgname/README.md"
   install -Dm644 "LICENSE" "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
-
-  # The binary generates its own man page and completions.
-  ./target/release/ghostdu --print-manpage > ghostdu.1
   install -Dm644 ghostdu.1 "$pkgdir/usr/share/man/man1/ghostdu.1"
-  ./target/release/ghostdu --print-completions bash > ghostdu.bash
   install -Dm644 ghostdu.bash "$pkgdir/usr/share/bash-completion/completions/ghostdu"
-  ./target/release/ghostdu --print-completions zsh > _ghostdu
   install -Dm644 _ghostdu "$pkgdir/usr/share/zsh/site-functions/_ghostdu"
-  ./target/release/ghostdu --print-completions fish > ghostdu.fish
   install -Dm644 ghostdu.fish "$pkgdir/usr/share/fish/vendor_completions.d/ghostdu.fish"
 }
