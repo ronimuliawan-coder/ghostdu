@@ -132,6 +132,17 @@ fn open_regular_nonblocking(path: &Path) -> io::Result<std::fs::File> {
     Ok(file)
 }
 
+/// Run `op` until it succeeds or fails with anything but `Interrupted`:
+/// a signal arriving mid-syscall must not turn into a spurious CoW omission.
+fn retry_on_interrupted(mut op: impl FnMut() -> io::Result<i32>) -> io::Result<i32> {
+    loop {
+        match op() {
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            other => return other,
+        }
+    }
+}
+
 /// One FIEMAP batch at `start`: the batch sums plus the next start, or `None`
 /// when the file is fully walked (empty batch, LAST extent, or short batch).
 fn walk_batch<const N: usize>(
@@ -150,10 +161,14 @@ fn walk_batch<const N: usize>(
     };
     let fd = file.as_raw_fd();
     let ptr = &mut buf as *mut FiemapBuf<N>;
-    let ret = unsafe { libc::ioctl(fd, FS_IOC_FIEMAP, ptr) };
-    if ret < 0 {
-        return Err(io::Error::last_os_error());
-    }
+    retry_on_interrupted(|| {
+        let ret = unsafe { libc::ioctl(fd, FS_IOC_FIEMAP, ptr) };
+        if ret < 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(ret)
+        }
+    })?;
     let n = (buf.head.fm_mapped_extents as usize).min(N);
     let (batch_shared, batch_exclusive) = sum_extents(&buf.extents[..n]);
     let last = buf.extents[..n]
@@ -210,6 +225,27 @@ mod tests {
             fe_flags: flags,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn interrupted_retries_then_returns() {
+        let mut calls = 0;
+        let ret = retry_on_interrupted(|| {
+            calls += 1;
+            if calls < 3 {
+                Err(io::Error::from(io::ErrorKind::Interrupted))
+            } else {
+                Ok(7)
+            }
+        })
+        .unwrap();
+        assert_eq!((ret, calls), (7, 3));
+        // Non-interrupted errors pass straight through.
+        let err = retry_on_interrupted(|| -> io::Result<i32> {
+            Err(io::Error::from(io::ErrorKind::Other))
+        })
+        .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::Other);
     }
 
     #[test]
