@@ -1,0 +1,23 @@
+# Maintainer: Ron <ron@example.com>
+pkgname=ghostdu-bin
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="High-performance TUI disk usage analyzer and ghost space detector (precompiled binary)"
+arch=('x86_64')
+url="https://github.com/ronimuliawan-coder/ghostdu"
+license=('MIT')
+provides=('ghostdu')
+conflicts=('ghostdu')
+# Built by .github/workflows/release.yml; run `updpkgsums` when bumping.
+source=("$pkgname-$pkgver-x86_64.tar.gz::$url/releases/download/v$pkgver/ghostdu-$pkgver-x86_64.tar.gz")
+sha256sums=('SKIP')
+
+package() {
+  install -Dm755 "ghostdu" "$pkgdir/usr/bin/ghostdu"
+  install -Dm644 "README.md" "$pkgdir/usr/share/doc/ghostdu/README.md"
+  install -Dm644 "LICENSE" "$pkgdir/usr/share/licenses/ghostdu/LICENSE"
+  install -Dm644 "ghostdu.1" "$pkgdir/usr/share/man/man1/ghostdu.1"
+  install -Dm644 "ghostdu.bash" "$pkgdir/usr/share/bash-completion/completions/ghostdu"
+  install -Dm644 "_ghostdu" "$pkgdir/usr/share/zsh/site-functions/_ghostdu"
+  install -Dm644 "ghostdu.fish" "$pkgdir/usr/share/fish/vendor_completions.d/ghostdu.fish"
+}
