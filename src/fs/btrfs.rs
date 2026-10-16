@@ -69,22 +69,37 @@ pub fn is_btrfs(path: &Path) -> bool {
     stat.f_type as u32 == BTRFS_SUPER_MAGIC
 }
 
-/// `(shared_bytes, exclusive_bytes)` for one file, walking FIEMAP batches of
-/// `N` extents until the kernel marks an extent LAST (or a short batch ends
-/// the file). Works on any FIEMAP-capable filesystem, not just Btrfs.
+/// `(shared_bytes, exclusive_bytes)` as logical extent lengths (not a reclaim
+/// promise: compressed, delayed, and unwritten extents report lengths without
+/// matching physical allocation). Walks FIEMAP batches of `N` extents until
+/// the kernel marks an extent LAST (or a short batch ends the file). Works on
+/// any FIEMAP-capable filesystem, not just Btrfs.
 fn extent_sharing_batched<const N: usize>(path: &Path) -> io::Result<(u64, u64)> {
     let file = open_regular_nonblocking(path)?;
     let mut shared = 0u64;
     let mut exclusive = 0u64;
+    let mut batches = 0usize;
     let mut pending = Some(0u64);
     while let Some(start) = pending {
         let ((batch_shared, batch_exclusive), next) = walk_batch::<N>(&file, start)?;
+        batches += 1;
+        // This runs synchronously when the item panel opens: bound the ioctl
+        // count so a pathologically fragmented file costs milliseconds, not
+        // a hung UI. Over budget the whole query fails (line omitted) rather
+        // than reporting partial sums that understate sharing.
+        if batches > MAX_BATCHES {
+            return Err(io::Error::other("extent budget exceeded"));
+        }
         shared = shared.saturating_add(batch_shared);
         exclusive = exclusive.saturating_add(batch_exclusive);
         pending = next;
     }
     Ok((shared, exclusive))
 }
+
+/// Upper bound on FIEMAP ioctls per query: milliseconds of UI time, then give
+/// up instead of hanging.
+const MAX_BATCHES: usize = 64;
 
 /// Open for FIEMAP without ever blocking or following symlinks: FIFOs open
 /// fine with `O_NONBLOCK` but then fail the regular-file check, while a
@@ -269,6 +284,24 @@ mod tests {
         // so the ioctl error return is exercised deterministically.
         let devnull = std::fs::File::open("/dev/null").unwrap();
         assert!(walk_batch::<1>(&devnull, 0).is_err());
+    }
+
+    #[test]
+    fn over_budget_walk_fails_instead_of_partial() {
+        // 5000 scattered blocks exceed 64 batches at any batch size: the
+        // query must fail (line omitted) rather than report partial sums.
+        let dir = scratch("fragmented");
+        let file = dir.join("frag.bin");
+        {
+            use std::io::{Seek, SeekFrom, Write};
+            let mut f = std::fs::File::create(&file).unwrap();
+            for i in 0..5000u64 {
+                f.seek(SeekFrom::Start(i * (1 << 20))).unwrap();
+                f.write_all(&[9u8; 4096]).unwrap();
+            }
+        }
+        assert!(extent_sharing(&file).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
