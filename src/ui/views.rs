@@ -2586,7 +2586,7 @@ fn render_item_info_modal(f: &mut Frame, app: &App, screen: Rect) {
             Span::styled("CoW: ", Style::default().fg(Color::Green)),
             Span::styled(
                 format!(
-                    "{} shared / {} exclusive extents",
+                    "{} shared / {} exclusive (logical sizes)",
                     crate::fs::entry::format_size(shared),
                     crate::fs::entry::format_size(exclusive)
                 ),
