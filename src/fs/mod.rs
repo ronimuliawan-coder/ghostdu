@@ -1,3 +1,4 @@
+pub mod btrfs;
 pub mod entry;
 pub mod mount_info;
 pub mod scanner;

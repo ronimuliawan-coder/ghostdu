@@ -149,9 +149,16 @@ pub struct DetailedItemInfo {
     pub fs_info: Option<FsMountInfo>,
     pub ghost_kind: GhostKind,
     pub delete_safety: DeleteSafety,
+    /// `(shared_bytes, exclusive_bytes)` from FIEMAP; `None` unless the
+    /// `--cow` flag is on, the file lives on Btrfs, and the query succeeds.
+    pub cow_sharing: Option<(u64, u64)>,
 }
 
-pub fn get_detailed_item_info(path: &Path, items_count: usize) -> Option<DetailedItemInfo> {
+pub fn get_detailed_item_info(
+    path: &Path,
+    items_count: usize,
+    cow: bool,
+) -> Option<DetailedItemInfo> {
     let meta = fs::symlink_metadata(path).ok()?;
     let disk_usage = meta.blocks() * 512;
     let apparent_size = meta.len();
@@ -183,6 +190,13 @@ pub fn get_detailed_item_info(path: &Path, items_count: usize) -> Option<Detaile
 
     let fs_info = query_fs_info(path);
     let ghost_kind = classify_path(path);
+    // One ioctl on the selected file only (never during scans): failures and
+    // non-Btrfs files simply omit the CoW line.
+    let cow_sharing = if cow && !is_dir && super::btrfs::is_btrfs(path) {
+        super::btrfs::extent_sharing(path).ok()
+    } else {
+        None
+    };
 
     Some(DetailedItemInfo {
         name: path
@@ -206,6 +220,7 @@ pub fn get_detailed_item_info(path: &Path, items_count: usize) -> Option<Detaile
         fs_info,
         ghost_kind,
         delete_safety: classify_safety(path, ghost_kind),
+        cow_sharing,
     })
 }
 
@@ -305,7 +320,7 @@ mod tests {
     #[test]
     fn test_get_detailed_item_info() {
         let root = Path::new("/");
-        let info = get_detailed_item_info(root, 42);
+        let info = get_detailed_item_info(root, 42, false);
         assert!(info.is_some(), "get_detailed_item_info(/) should succeed");
         let info = info.unwrap();
         assert!(info.is_dir);
@@ -351,9 +366,12 @@ mod coverage_tests {
 
     #[test]
     fn item_info_missing_path_returns_none() {
-        assert!(
-            get_detailed_item_info(std::path::Path::new("/definitely/not/here-12345"), 0).is_none()
-        );
+        assert!(get_detailed_item_info(
+            std::path::Path::new("/definitely/not/here-12345"),
+            0,
+            false
+        )
+        .is_none());
         assert!(query_fs_info(std::path::Path::new("/definitely/not/here-12345")).is_none());
     }
 
@@ -388,7 +406,7 @@ mod coverage_tests {
                     .to_string()
             })
             .unwrap();
-        let info = get_detailed_item_info(&file, 0).unwrap();
+        let info = get_detailed_item_info(&file, 0, true).unwrap();
         assert!(
             info.modified_str.starts_with(&expected),
             "unexpected date: {}",

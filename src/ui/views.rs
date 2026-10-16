@@ -2577,6 +2577,23 @@ fn render_item_info_modal(f: &mut Frame, app: &App, screen: Rect) {
         ]));
     }
 
+    // CoW sharing (Btrfs, --cow flag): shared extents stay allocated while
+    // snapshots or reflinks reference them, so only the exclusive bytes
+    // come back on delete.
+    if let Some((shared, exclusive)) = info.cow_sharing {
+        lines.push(Line::from(vec![
+            Span::styled("CoW: ", Style::default().fg(Color::Green)),
+            Span::styled(
+                format!(
+                    "{} shared / {} exclusive",
+                    crate::fs::entry::format_size(shared),
+                    crate::fs::entry::format_size(exclusive)
+                ),
+                Style::default().fg(Color::White),
+            ),
+        ]));
+    }
+
     // Section 4: Filesystem Details
     if let Some(ref fs) = info.fs_info {
         if !is_compact {
@@ -3482,13 +3499,34 @@ mod render_sweep_tests {
         let _ = render(&app, 100, 30);
         app.cancel_modal();
         // System tier from a live system path.
-        app.item_info =
-            crate::fs::mount_info::get_detailed_item_info(std::path::Path::new("/etc/hosts"), 0);
+        app.item_info = crate::fs::mount_info::get_detailed_item_info(
+            std::path::Path::new("/etc/hosts"),
+            0,
+            true,
+        );
         assert!(app.item_info.is_some(), "/etc/hosts must exist");
         app.previous_view = ActiveView::Filesystem;
         app.active_view = ActiveView::ItemInfoModal;
         let _ = render(&app, 100, 30);
         app.cancel_modal();
+    }
+
+    #[test]
+    fn item_info_shows_cow_sharing() {
+        let mut fx = fixture();
+        let index = fx
+            .app
+            .visible_children()
+            .iter()
+            .position(|e| e.name == "a.txt")
+            .expect("a.txt visible");
+        fx.app.cursor_index = index;
+        fx.app.open_item_info();
+        // Synthetic sharing (no filesystem dependency): the CoW line renders
+        // whenever the query produced a value.
+        fx.app.item_info.as_mut().expect("item info").cow_sharing = Some((300, 100));
+        let out = render(&fx.app, 100, 30);
+        assert!(out.contains("shared /"), "CoW sharing line renders");
     }
 
     #[test]
