@@ -2577,15 +2577,16 @@ fn render_item_info_modal(f: &mut Frame, app: &App, screen: Rect) {
         ]));
     }
 
-    // CoW sharing (Btrfs, --cow flag): shared extents stay allocated while
-    // snapshots or reflinks reference them, so only the exclusive bytes
-    // come back on delete.
+    // CoW sharing (Btrfs, --cow flag): logical extent lengths, not a reclaim
+    // promise — shared extents stay allocated while snapshots or reflinks
+    // reference them, and compressed/delayed extents report lengths without
+    // matching physical allocation.
     if let Some((shared, exclusive)) = info.cow_sharing {
         lines.push(Line::from(vec![
             Span::styled("CoW: ", Style::default().fg(Color::Green)),
             Span::styled(
                 format!(
-                    "{} shared / {} exclusive",
+                    "{} shared / {} exclusive extents",
                     crate::fs::entry::format_size(shared),
                     crate::fs::entry::format_size(exclusive)
                 ),

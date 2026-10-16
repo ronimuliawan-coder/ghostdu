@@ -554,7 +554,11 @@ impl App {
     pub fn open_item_info(&mut self) {
         let visible = self.visible_children();
         if let Some(target) = visible.get(self.cursor_index) {
-            self.item_info = get_detailed_item_info(&target.path, target.items_count, self.cow);
+            self.item_info = get_detailed_item_info(
+                &target.path,
+                target.items_count,
+                self.cow && !self.imported,
+            );
             self.previous_view = self.active_view;
             self.active_view = ActiveView::ItemInfoModal;
         }
@@ -3543,6 +3547,21 @@ mod imported_snapshot_tests {
         let mut app = App::new(root);
         app.imported = true;
         (dir, app)
+    }
+
+    #[test]
+    fn imported_item_info_omits_cow() {
+        let (_dir, mut app) = imported_app();
+        app.cow = true;
+        app.cursor_index = 0;
+        app.open_item_info();
+        assert_eq!(app.active_view, ActiveView::ItemInfoModal);
+        assert!(
+            app.item_info
+                .as_ref()
+                .is_some_and(|i| i.cow_sharing.is_none()),
+            "imported snapshots never show live CoW data"
+        );
     }
 
     #[test]
