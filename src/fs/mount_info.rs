@@ -190,9 +190,11 @@ pub fn get_detailed_item_info(
 
     let fs_info = query_fs_info(path);
     let ghost_kind = classify_path(path);
-    // One ioctl on the selected file only (never during scans): failures and
-    // non-Btrfs files simply omit the CoW line.
-    let cow_sharing = if cow && !is_dir && super::btrfs::is_btrfs(path) {
+    // One ioctl on the selected file only (never during scans): failures,
+    // directories, symlinks, and non-Btrfs files simply omit the CoW line.
+    // Symlinks resolve to their target's extents, which would mislabel a
+    // SYMLINK entry with another file's sharing.
+    let cow_sharing = if cow && !is_dir && !is_symlink && super::btrfs::is_btrfs(path) {
         super::btrfs::extent_sharing(path).ok()
     } else {
         None
@@ -362,6 +364,15 @@ mod coverage_tests {
         assert_eq!(format_mode(0o1744, true, false), "drwxr--r-T");
         assert_eq!(format_mode(0o777, false, true), "lrwxrwxrwx");
         assert_eq!(format_mode(0o600, false, false), "-rw-------");
+    }
+
+    #[test]
+    fn cow_sharing_absent_without_flag() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("f.txt");
+        std::fs::write(&file, "x").unwrap();
+        let info = get_detailed_item_info(&file, 0, false).unwrap();
+        assert!(info.cow_sharing.is_none());
     }
 
     #[test]

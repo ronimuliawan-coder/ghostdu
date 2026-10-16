@@ -117,9 +117,18 @@ fn walk_batch<const N: usize>(
         None
     } else {
         let tail = buf.extents[n - 1];
-        Some(tail.fe_logical.saturating_add(tail.fe_length))
+        advance_cursor(start, tail.fe_logical, tail.fe_length)
     };
     Ok(((batch_shared, batch_exclusive), next))
+}
+
+/// Next FIEMAP cursor after one extent, or `None` when the extent does not
+/// advance past `start`. Zero-length or backwards extents would otherwise
+/// loop the walker forever on a stuck cursor (blocking the UI thread that
+/// opened the item panel).
+fn advance_cursor(start: u64, logical: u64, length: u64) -> Option<u64> {
+    let next = logical.saturating_add(length);
+    (next > start).then_some(next)
 }
 
 /// `(shared_bytes, exclusive_bytes)` for one file. Directories, missing
@@ -155,6 +164,13 @@ mod tests {
             fe_flags: flags,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn stuck_cursor_ends_the_walk() {
+        assert_eq!(advance_cursor(10, 10, 5), Some(15));
+        assert_eq!(advance_cursor(10, 10, 0), None);
+        assert_eq!(advance_cursor(10, 5, 3), None);
     }
 
     #[test]
