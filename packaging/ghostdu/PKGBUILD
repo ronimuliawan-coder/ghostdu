@@ -6,7 +6,7 @@ pkgdesc="High-performance TUI disk usage analyzer and ghost space detector"
 arch=('x86_64' 'aarch64')
 url="https://github.com/ronimuliawan-coder/ghostdu"
 license=('MIT')
-depends=('gcc-libs')
+depends=('libgcc')
 makedepends=('cargo')
 # Upstream tags are stable; run `updpkgsums` when bumping pkgver.
 source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
