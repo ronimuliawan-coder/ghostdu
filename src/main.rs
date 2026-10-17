@@ -77,6 +77,10 @@ struct Cli {
     #[arg(long)]
     apparent_size: bool,
 
+    /// Show per-file Btrfs CoW sharing in the item panel
+    #[arg(long)]
+    cow: bool,
+
     /// Initial sort order
     #[arg(long, value_enum, value_name = "MODE")]
     sort: Option<SortArg>,
@@ -499,6 +503,9 @@ fn apply_cli_display(app: &mut App, cli: &Cli) {
     }
     if cli.apparent_size {
         app.apparent_size = true;
+    }
+    if cli.cow {
+        app.cow = true;
     }
     if let Some(sort) = cli.sort {
         app.sort_mode = match sort {
@@ -974,6 +981,7 @@ mod cli_tests {
             "--safe-only",
             "--ghost-only",
             "--apparent-size",
+            "--cow",
             "--sort",
             "items",
         ]);
@@ -981,6 +989,7 @@ mod cli_tests {
         assert!(app.safe_only_filter);
         assert_eq!(app.ghost_filter, GhostFilterMode::GhostOnly);
         assert!(app.apparent_size);
+        assert!(app.cow);
         assert_eq!(app.sort_mode, SortMode::ByItems);
 
         for (flag, sort) in [
@@ -1167,6 +1176,7 @@ mod pty_session_tests {
                 ghost_only: false,
                 hide_ghost: false,
                 apparent_size: false,
+                cow: false,
                 sort: None,
                 export: None,
                 import: None,
@@ -1272,6 +1282,7 @@ mod interactive_driver_tests {
                 ghost_only: false,
                 hide_ghost: false,
                 apparent_size: false,
+                cow: false,
                 sort: None,
                 export: None,
                 import: None,

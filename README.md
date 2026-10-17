@@ -153,7 +153,14 @@ cargo build --release
 install -m 755 target/release/ghostdu ~/.local/bin/ghostdu
 ```
 
-### 2. Command Line Usage
+### 2. Install from the AUR (Arch Linux)
+
+```bash
+yay -S ghostdu      # source build via cargo
+yay -S ghostdu-bin  # precompiled binary from GitHub Releases
+```
+
+### 3. Command Line Usage
 
 ```bash
 # Scan current directory (defaults to . with zero flags)

@@ -194,6 +194,8 @@ pub struct App {
     /// Btrfs subvolume boundaries (mount path -> subvolume name), loaded once
     /// from mountinfo. Empty on non-btrfs systems or unreadable mountinfo.
     pub btrfs_subvols: HashMap<PathBuf, String>,
+    /// Show per-file CoW sharing in the item panel (`--cow` flag).
+    pub cow: bool,
     /// Snapshot imported from `--import`: browse-only. Every destructive or
     /// rescanning path refuses with a status message instead of touching the
     /// live filesystem (remote dev/ino can never verify locally, and a
@@ -251,6 +253,7 @@ impl App {
             ghost_deleted_scroll_offset: Cell::new(0),
             fs_info,
             btrfs_subvols,
+            cow: false,
             imported: false,
             item_info: None,
         }
@@ -551,7 +554,11 @@ impl App {
     pub fn open_item_info(&mut self) {
         let visible = self.visible_children();
         if let Some(target) = visible.get(self.cursor_index) {
-            self.item_info = get_detailed_item_info(&target.path, target.items_count);
+            self.item_info = get_detailed_item_info(
+                &target.path,
+                target.items_count,
+                self.cow && !self.imported,
+            );
             self.previous_view = self.active_view;
             self.active_view = ActiveView::ItemInfoModal;
         }
@@ -2009,8 +2016,11 @@ impl App {
         if self.active_view == ActiveView::ItemInfoModal {
             let visible = self.visible_children();
             if let Some(target) = visible.get(self.cursor_index) {
-                self.item_info =
-                    crate::fs::mount_info::get_detailed_item_info(&target.path, target.items_count);
+                self.item_info = crate::fs::mount_info::get_detailed_item_info(
+                    &target.path,
+                    target.items_count,
+                    self.cow && !self.imported,
+                );
             }
         }
 
@@ -3537,6 +3547,39 @@ mod imported_snapshot_tests {
         let mut app = App::new(root);
         app.imported = true;
         (dir, app)
+    }
+
+    #[test]
+    fn imported_item_info_omits_cow() {
+        let (_dir, mut app) = imported_app();
+        app.cow = true;
+        app.cursor_index = 0;
+        app.open_item_info();
+        assert_eq!(app.active_view, ActiveView::ItemInfoModal);
+        assert!(
+            app.item_info
+                .as_ref()
+                .is_some_and(|i| i.cow_sharing.is_none()),
+            "imported snapshots never show live CoW data"
+        );
+    }
+
+    #[test]
+    fn imported_refresh_keeps_cow_hidden() {
+        let (_dir, mut app) = imported_app();
+        app.cow = true;
+        app.cursor_index = 0;
+        app.open_item_info();
+        assert_eq!(app.active_view, ActiveView::ItemInfoModal);
+        // Refresh while the modal is open: the imported gate must hold here
+        // too (refresh_all recomputes item info under the same --cow flag).
+        app.refresh_all();
+        assert!(
+            app.item_info
+                .as_ref()
+                .is_some_and(|i| i.cow_sharing.is_none()),
+            "imported snapshots never show live CoW data after refresh"
+        );
     }
 
     #[test]
