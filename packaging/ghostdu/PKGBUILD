@@ -1,7 +1,7 @@
 # Maintainer: Ron <ron@example.com>
 pkgname=ghostdu
 pkgver=0.1.0
-pkgrel=1
+pkgrel=2
 pkgdesc="High-performance TUI disk usage analyzer and ghost space detector"
 arch=('x86_64' 'aarch64')
 url="https://github.com/ronimuliawan-coder/ghostdu"
@@ -10,7 +10,7 @@ depends=('libgcc')
 makedepends=('cargo')
 # Upstream tags are stable; run `updpkgsums` when bumping pkgver.
 source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
-sha256sums=('SKIP')
+sha256sums=('6cbbb167ae44fb1f8a1093cc74587ce8e35cbdb45c800dd3d871991ed00d552b')
 
 build() {
   cd "$pkgname-$pkgver"
