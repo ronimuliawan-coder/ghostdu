@@ -2019,7 +2019,7 @@ impl App {
                 self.item_info = crate::fs::mount_info::get_detailed_item_info(
                     &target.path,
                     target.items_count,
-                    self.cow,
+                    self.cow && !self.imported,
                 );
             }
         }
@@ -3561,6 +3561,24 @@ mod imported_snapshot_tests {
                 .as_ref()
                 .is_some_and(|i| i.cow_sharing.is_none()),
             "imported snapshots never show live CoW data"
+        );
+    }
+
+    #[test]
+    fn imported_refresh_keeps_cow_hidden() {
+        let (_dir, mut app) = imported_app();
+        app.cow = true;
+        app.cursor_index = 0;
+        app.open_item_info();
+        assert_eq!(app.active_view, ActiveView::ItemInfoModal);
+        // Refresh while the modal is open: the imported gate must hold here
+        // too (refresh_all recomputes item info under the same --cow flag).
+        app.refresh_all();
+        assert!(
+            app.item_info
+                .as_ref()
+                .is_some_and(|i| i.cow_sharing.is_none()),
+            "imported snapshots never show live CoW data after refresh"
         );
     }
 
