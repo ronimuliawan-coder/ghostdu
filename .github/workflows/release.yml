@@ -77,6 +77,10 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           persist-credentials: false
+          # Explicit tag ref: the default resolves the event SHA, which
+          # collides with fetch-tags auto-following the annotated tag
+          # ("cannot fetch both a commit and a tag pointing to it").
+          ref: ${{ github.ref }}
           fetch-tags: true
 
       - name: Download tarballs
