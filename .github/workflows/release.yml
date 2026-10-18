@@ -85,6 +85,9 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           # No checkout in this job: name the repository explicitly.
+          # Notes: deterministic source, not CLI-version-dependent default
+          # behavior — the annotated release tag is the interim body until
+          # the handwritten `gh release edit` lands right after.
           gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
-            --title "$GITHUB_REF_NAME" \
+            --title "$GITHUB_REF_NAME" --notes-from-tag \
             ghostdu-*.tar.gz ghostdu-*.tar.gz.sha256
