@@ -1,7 +1,7 @@
 # Maintainer: Ron <ron@example.com>
 pkgname=ghostdu-bin
 pkgver=0.1.0
-pkgrel=1
+pkgrel=2
 pkgdesc="High-performance TUI disk usage analyzer and ghost space detector (precompiled binary)"
 arch=('x86_64')
 url="https://github.com/ronimuliawan-coder/ghostdu"
@@ -10,7 +10,7 @@ provides=('ghostdu')
 conflicts=('ghostdu')
 # Built by .github/workflows/release.yml; run `updpkgsums` when bumping.
 source=("$pkgname-$pkgver-x86_64.tar.gz::$url/releases/download/v$pkgver/ghostdu-$pkgver-x86_64.tar.gz")
-sha256sums=('SKIP')
+sha256sums=('32860f1017a2f571ed586a7abea23e7144aee27ce17412446d5fdb9ad0bfdab1')
 
 package() {
   install -Dm755 "ghostdu" "$pkgdir/usr/bin/ghostdu"
