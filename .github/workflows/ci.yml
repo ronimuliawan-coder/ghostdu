@@ -6,24 +6,52 @@ on:
   pull_request:
     branches: [ "main", "master" ]
 
+# Least privilege: both jobs only read the repo, and nothing keeps git
+# credentials while untrusted dependency build scripts and the test-run
+# subprocesses execute.
+permissions:
+  contents: read
+
+# Supersede in-progress runs on the same ref (push updates, PR force-pushes).
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
   check-and-test:
-    name: Test & Lint
-    runs-on: ubuntu-latest
+    name: Test & Lint (${{ matrix.arch }})
+    # Same matrix as release.yml: every shipped architecture runs the whole
+    # suite, so the aarch64 tarball is test-exercised, not just built.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runs-on: ubuntu-latest
+          - arch: aarch64
+            runs-on: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runs-on }}
+    # 30 min absolves the first (cache-cold) aarch64 run on slower cores;
+    # steady-state runs finish well under 5.
+    timeout-minutes: 30
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
 
       - name: Set up Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           components: rustfmt, clippy
 
       - name: Rust Cache
-        uses: Swatinem/rust-cache@v2
+        # Cache keys embed the runner arch (Linux-x64 vs Linux-arm64), so the
+        # two legs cannot poison each other's caches.
+        uses: Swatinem/rust-cache@401aff9a7a08acb9d27b64936a90db81024cff97 # v2.8.2
 
       - name: Check code formatting
         run: cargo fmt --check
@@ -35,31 +63,31 @@ jobs:
         run: cargo test --verbose
 
       - name: Build release binary
-        run: cargo build --release --verbose
+        run: cargo build --release --locked
 
   coverage:
     name: Coverage gate (100%)
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
+    timeout-minutes: 20
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           persist-credentials: false
 
       - name: Set up Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
 
       - name: Rust Cache
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@401aff9a7a08acb9d27b64936a90db81024cff97 # v2.8.2
 
       - name: Install cargo-tarpaulin
         run: cargo install cargo-tarpaulin --locked
 
       # The live-pty session hangs under ptrace instrumentation, so it is
       # skipped here; scripted driver tests cover the same arms, and the pty
-      # test still runs under `cargo test` above.
+      # test still runs under `cargo test` above. Line coverage is an
+      # arch-independent metric, so the gate runs on x86_64 only.
       - name: Run coverage gate
         run: cargo tarpaulin --all-targets --fail-under 100
         env:
