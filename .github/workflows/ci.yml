@@ -51,7 +51,7 @@ jobs:
       - name: Rust Cache
         # Cache keys embed the runner arch (Linux-x64 vs Linux-arm64), so the
         # two legs cannot poison each other's caches.
-        uses: Swatinem/rust-cache@401aff9a7a08acb9d27b64936a90db81024cff97 # v2.8.2
+        uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2.8.2
 
       - name: Check code formatting
         run: cargo fmt --check
@@ -79,7 +79,7 @@ jobs:
         uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
 
       - name: Rust Cache
-        uses: Swatinem/rust-cache@401aff9a7a08acb9d27b64936a90db81024cff97 # v2.8.2
+        uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2.8.2
 
       - name: Install cargo-tarpaulin
         run: cargo install cargo-tarpaulin --locked
