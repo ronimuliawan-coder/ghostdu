@@ -5,9 +5,9 @@
 [![Platform](https://img.shields.io/badge/platform-Linux-orange.svg)]()
 [![Binary Size](https://img.shields.io/badge/binary-1.4_MB-purple.svg)]()
 
-> **Modern, blazingly fast, native Linux disk usage & ghost file analyzer with wastebin support, smart deletion safety tiers, and zero-flag headaches.**
+> **Modern, native Linux disk usage & ghost file analyzer with wastebin support, smart deletion safety tiers, and zero-flag headaches.**
 
-`ghostdu` is an ultra-fast, compact (1.4 MB native binary) terminal disk usage analyzer engineered in Rust. Inspired by `ncdu`, it is designed to eliminate common frustrations: no need to remember complex exclusion flags, automatic isolation of Docker and ghost artifacts, 4-tier deletion safety badges, native FreeDesktop wastebin/trash integration, and responsive rendering down to the smallest terminal window.
+`ghostdu` is a compact (1.9 MB native binary) terminal disk usage analyzer engineered in Rust. Inspired by `ncdu`, it is designed to eliminate common frustrations: no need to remember complex exclusion flags, automatic isolation of Docker and ghost artifacts, 4-tier deletion safety badges, native FreeDesktop wastebin/trash integration, and responsive rendering down to the smallest terminal window.
 
 ---
 
@@ -91,8 +91,8 @@ High-impact disk consumers across modern Linux desktop and developer environment
 - **In-Place Refresh (`r` / `R`)**: Refresh directory contents or the entire tree without restarting.
 
 ### 📱 Responsive & Ultra-Lightweight
-- **1.4 MB standalone native binary** (stripped, LTO enabled, zero runtime overhead).
-- Parallel background scanning via Rayon with real-time animated progress.
+- **1.9 MB standalone native binary** (stripped, LTO enabled, zero runtime overhead).
+- Real-time animated scan progress. Measured: full 109 GiB home scan in ~21 s (NVMe btrfs, single-threaded stat traversal, sys-time-bound; 2026-10-25).
 - Dynamically adapts from widescreen displays down to tiny 20x3 terminal windows.
 - Non-interactive summary mode for scripts (`ghostdu --summary` or piped output).
 
@@ -193,7 +193,7 @@ Run the comprehensive unit and integration test suite:
 cargo test
 ```
 
-All 14 unit and integration tests verify:
+All 224 unit and integration tests verify:
 - Automatic virtual filesystem exclusion (`/proc`, `/sys`, `/dev`, `/run`)
 - Inode deduplication on hard links
 - Safety tier classification and system deletion guardrails

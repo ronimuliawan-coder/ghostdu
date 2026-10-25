@@ -34,11 +34,11 @@ use std::io::IsTerminal;
 const SECTION_RULE: &str =
     "════════════════════════════════════════════════════════════════════════════════";
 
-/// ghostdu: Modern, ultra-fast native Linux disk usage & ghost file analyzer
+/// ghostdu: Modern, native Linux disk usage & ghost file analyzer
 #[derive(Parser, Debug)]
 #[command(name = "ghostdu", author = "Ron", version)]
 #[command(
-    about = "Modern, ultra-fast native Linux disk usage & ghost file analyzer with wastebin support"
+    about = "Modern, native Linux disk usage & ghost file analyzer with wastebin support"
 )]
 struct Cli {
     /// Directory to scan (defaults to current directory)
