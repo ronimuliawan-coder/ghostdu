@@ -37,9 +37,7 @@ const SECTION_RULE: &str =
 /// ghostdu: Modern, native Linux disk usage & ghost file analyzer
 #[derive(Parser, Debug)]
 #[command(name = "ghostdu", author = "Ron", version)]
-#[command(
-    about = "Modern, native Linux disk usage & ghost file analyzer with wastebin support"
-)]
+#[command(about = "Modern, native Linux disk usage & ghost file analyzer with wastebin support")]
 struct Cli {
     /// Directory to scan (defaults to current directory)
     #[arg(default_value = ".")]
