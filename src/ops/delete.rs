@@ -132,10 +132,12 @@ pub(super) fn prepare_target_with_mount_roots(
 /// first block, with three deliberate exclusions. `/tmp` and `/var/tmp`: their
 /// children are deliberately deletable temp files, so no identity test can
 /// separate a `/tmp` alias from legitimate `/tmp` children — and the harm of
-/// deleting inside one is bounded by the tool's ordinary job. `/`: every btrfs
-/// subvolume root reports the same `st_ino`, so the root's identity collides
-/// with unrelated subvolume mounts (`/home`, `/var/cache`, …); the root itself
-/// stays string-blocked. The path travels with the identity so a protected
+/// deleting inside one is bounded by the tool's ordinary job. `/`: its
+/// identity stays out because trashing the root itself is already
+/// string-blocked, and on legacy `numdevs=1` btrfs layouts every subvolume
+/// would otherwise share the root's `(dev, 256)` and be blocked wholesale
+/// (with the default per-subvolume devices, subvolume mounts carry distinct
+/// `st_dev`s and cannot collide with it — see btrfs anon-device behavior). The path travels with the identity so a protected
 /// directory mounted at its normal location can be told apart from an alias
 /// of it (review round 1, Qodo finding 3). Captured **per batch** alongside
 /// the mount snapshot: a protected root mounted after an earlier batch —
@@ -217,14 +219,16 @@ fn check_safety(path: &Path) -> io::Result<()> {
 ///   round 1);
 /// - an ancestor that is itself a sub-path mount blocks only when the
 ///   protected path is either not a mount point (its inode cannot otherwise
-///   appear as a mount root) or is mounted with the *same* fs-root — two
-///   btrfs subvolume roots on one filesystem both report `st_ino` 256, so
-///   `/var/log` must not count as an alias of `/var` merely by sharing the
-///   identity;
+///   appear as a mount root) or is mounted with the *same* fs-root —
+///   `/var/log` on its own openSUSE subvolume carries a different
+///   `st_dev`/fs-root from `/var` and must not count as its alias;
 /// - a plain directory (no mount point of its own) carrying a protected
-///   root's identity can only be a bind-alias subtree component, so it
-///   blocks. This closes the whole-fs-bind hole: `/host/etc/ssh` is reached
-///   through `/host/etc`, an ordinary directory under the `/host` mount.
+///   root's identity blocks: btrfs gives each subvolume its own anonymous
+///   device (numdevs=many default), so equal `(dev, ino)` at another path is
+///   the protected subvolume itself exposed through a parent- or fs-root-tree
+///   mount (review round 4). This closes the whole-fs-bind hole:
+///   `/host/etc/ssh` is reached through `/host/etc`, an ordinary directory
+///   under the `/host` mount.
 ///
 /// The fs-root *string* is never classified — it is a superblock-relative
 /// path whose name coincides with host paths on real layouts (Fedora's root
@@ -254,11 +258,6 @@ fn check_not_under_protected_mount_alias(
     Ok(())
 }
 
-/// st_ino of every btrfs subvolume root: all subvolumes of one filesystem
-/// share it, which is why identity equality alone cannot tell a subvolume
-/// directory from an alias component on btrfs.
-const BTRFS_SUBVOL_ROOT_INO: u64 = 256;
-
 /// Pure decision for one ancestor, over caller-supplied mount roots and
 /// protected identities, so every arm is testable without mounting anything.
 fn ancestor_blocks(
@@ -287,14 +286,12 @@ fn ancestor_blocks(
             Some(fs_root) => mount_roots
                 .get(protected)
                 .is_none_or(|protected_root| protected_root == fs_root),
-            // Qodo round 3 (ae32ee0d): on btrfs every subvolume root reports
-            // st_ino 256, so a plain directory sharing a protected subvolume
-            // mount's identity — an unmounted subvolume directory under a
-            // fs-root-tree mount — is a different mount, not an alias. A
-            // non-256 match is a genuine alias component: directories cannot
-            // be hardlinked, and on non-btrfs filesystems the same (dev, ino)
-            // at another path is the same directory reached through a bind.
-            None => identity.1 != BTRFS_SUBVOL_ROOT_INO,
+            // Qodo round 4 (43bdcc3a): btrfs assigns each subvolume its own
+            // anonymous st_dev (numdevs=many, the default), so an identity
+            // match on a plain directory means the protected subvolume's own
+            // root directory, exposed through a parent- or fs-root-tree mount
+            // — deleting beneath it deletes real content. Block.
+            None => true,
         }
     })
 }
@@ -555,20 +552,21 @@ mod tests {
         assert!(error.to_string().contains("bind mount"));
     }
 
-    /// Qodo round 3 (ae32ee0d): an unmounted btrfs subvolume directory shares
-    /// the protected mount's st_ino 256 without being an alias; a plain
-    /// directory with a non-256 identity is a genuine alias component.
+    /// Qodo round 4 (43bdcc3a): with btrfs's default per-subvolume devices,
+    /// an identity match on a plain directory means the protected subvolume
+    /// itself, exposed through a parent- or fs-root-tree mount — blocking is
+    /// correct; identity mismatch never blocks.
     #[test]
-    fn subvol_root_collision_is_not_an_alias_but_plain_match_is() {
+    fn plain_directory_identity_match_blocks() {
         let empty = HashMap::new();
-        // Collision: ino 256 on the same device — allowed through.
-        assert!(!ancestor_blocks(
+        // The protected subvolume's root directory under a fs-root-tree mount.
+        assert!(ancestor_blocks(
             Path::new("/mnt/btrfs-root/@var"),
             (253, 256),
             &empty,
             &[("/var", 253, 256)],
         ));
-        // Genuine alias component: non-256 identity match — blocked.
+        // A regular protected directory reached through a whole-fs bind.
         assert!(ancestor_blocks(
             Path::new("/host/etc"),
             (253, 3011),
