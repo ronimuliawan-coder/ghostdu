@@ -324,8 +324,10 @@ fn is_recognized_cache_unit(path: &Path) -> bool {
     // Units count only directly beneath `.cache`: deeper nesting such as
     // `.cache/personal/pip` is a personal path that happens to contain a
     // cache-like name, not a cache. The XDG cache root itself is a cache unit
-    // too: a final `.cache` component classifies (user-found-issues #1 — the
-    // tightened unit matching below had declassified the root).
+    // too (user-found-issues #1 — the tightened unit matching had
+    // declassified the root), scoped to a `.cache` directly inside a home
+    // directory: a project-local `.cache` is personal data unless proven
+    // otherwise (review round 3, Qodo finding 42ccfb96).
     let mut under_cache = false;
     let mut components = path.components().peekable();
     while let Some(comp) = components.next() {
@@ -337,12 +339,38 @@ fn is_recognized_cache_unit(path: &Path) -> bool {
         }
         if bytes == b".cache" {
             if components.peek().is_none() {
-                return true;
+                return is_home_cache_root(path);
             }
             under_cache = true;
         }
     }
     false
+}
+
+/// True when `path`'s parent is a home directory: a user directory directly
+/// under `/home`, or `/root`. Exotic `XDG_CACHE_HOME` overrides fall through
+/// to UserData — the conservative direction.
+fn is_home_cache_root(path: &Path) -> bool {
+    // A path ending in `.cache` always has a parent; the empty fallback only
+    // serves the type and classifies as false below.
+    let parent = path.parent().unwrap_or(Path::new(""));
+    let mut parent_components = parent.components();
+    match parent_components.next() {
+        Some(Component::RootDir) => {}
+        _ => return false,
+    }
+    let mut second_last: Option<Component<'_>> = None;
+    let mut last: Option<Component<'_>> = None;
+    let mut depth = 0;
+    for component in parent_components {
+        second_last = last.take();
+        last = Some(component);
+        depth += 1;
+    }
+    if depth == 1 {
+        return last.is_some_and(|c| c.as_os_str().as_encoded_bytes() == b"root");
+    }
+    depth >= 2 && second_last.is_some_and(|c| c.as_os_str().as_encoded_bytes() == b"home")
 }
 
 /// Classifies a path and its ghost kind into a Deletion Safety Tier:
@@ -1028,9 +1056,17 @@ mod tests {
             classify_path(&PathBuf::from("/home/ron/.cache")),
             GhostKind::BuildCache
         );
+        // Non-home `.cache` roots are not the XDG cache root (review round 3);
+        // relative snapshot paths classify the same way.
+        assert_eq!(classify_path(&PathBuf::from("/.cache")), GhostKind::None);
+        assert_eq!(classify_path(&PathBuf::from("u/.cache")), GhostKind::None);
         assert_eq!(
-            classify_path(&PathBuf::from("/.cache")),
+            classify_path(&PathBuf::from("/root/.cache")),
             GhostKind::BuildCache
+        );
+        assert_eq!(
+            classify_path(&PathBuf::from("/home/u/proj/.cache")),
+            GhostKind::None
         );
         assert_eq!(
             classify_path(&PathBuf::from("/home/ron/.cache/personal/notes.txt")),

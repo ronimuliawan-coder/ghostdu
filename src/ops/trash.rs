@@ -1,4 +1,6 @@
-use super::delete::{prepare_target_with_mount_roots, read_mount_roots, verify_identity};
+use super::delete::{
+    prepare_target_with_mount_roots, protected_dir_identities, read_mount_roots, verify_identity,
+};
 use rustix::fs::{
     mkdirat, openat2, renameat_with, unlinkat, AtFlags, Mode, OFlags, RenameFlags, ResolveFlags,
     CWD,
@@ -44,7 +46,13 @@ fn trash_with_destination<P: AsRef<Path>>(
     verify: impl Fn(&Path, &File) -> io::Result<()>,
     resolve: impl FnMut(&File) -> io::Result<(File, Option<PathBuf>)>,
 ) -> TrashResult {
-    trash_with_destination_impl(paths, verify, resolve, read_mount_roots())
+    trash_with_destination_impl(
+        paths,
+        verify,
+        resolve,
+        read_mount_roots(),
+        protected_dir_identities(),
+    )
 }
 
 fn trash_with_destination_impl<P: AsRef<Path>>(
@@ -52,6 +60,7 @@ fn trash_with_destination_impl<P: AsRef<Path>>(
     verify: impl Fn(&Path, &File) -> io::Result<()>,
     mut resolve: impl FnMut(&File) -> io::Result<(File, Option<PathBuf>)>,
     mount_roots: io::Result<HashMap<PathBuf, PathBuf>>,
+    protected: Vec<(&'static str, u64, u64)>,
 ) -> TrashResult {
     let mut result = TrashResult::default();
     // One mountinfo read per batch (review round 1, Qodo finding 6), matching
@@ -71,7 +80,8 @@ fn trash_with_destination_impl<P: AsRef<Path>>(
     for path in paths {
         let path = path.as_ref();
         let moved: io::Result<()> = (|| {
-            let (parent, name, target) = prepare_target_with_mount_roots(path, &mount_roots)?;
+            let (parent, name, target) =
+                prepare_target_with_mount_roots(path, &mount_roots, &protected)?;
             verify(path, &target)?;
             topology.check_target(&target)?;
             let original = fd_path(&parent)?.join(OsStr::from_bytes(name.to_bytes()));
@@ -538,6 +548,7 @@ mod tests {
             |_, _| Ok(()),
             |parent| Ok((private_directory(parent, Path::new("Trash"))?, None)),
             read_mount_roots(),
+            protected_dir_identities(),
         );
         assert!(result.failed.is_empty(), "{:?}", result.failed);
         assert_eq!(result.succeeded.len(), 1);
@@ -642,8 +653,12 @@ mod tests {
         fs::write(&source, "confirmed").unwrap();
         let trash =
             private_directory(&File::open(fixture.path()).unwrap(), Path::new("Trash")).unwrap();
-        let (parent, name, target) =
-            prepare_target_with_mount_roots(&source, &read_mount_roots().unwrap()).unwrap();
+        let (parent, name, target) = prepare_target_with_mount_roots(
+            &source,
+            &read_mount_roots().unwrap(),
+            &protected_dir_identities(),
+        )
+        .unwrap();
         move_verified_with_hook(&parent, &name, &target, &trash, &source, |phase, _, _| {
             if phase == MovePhase::Verified {
                 fs::rename(&source, &saved).unwrap();
@@ -675,8 +690,12 @@ mod tests {
         fs::write(victim.join("file #é"), "untouched").unwrap();
         let trash =
             private_directory(&File::open(fixture.path()).unwrap(), Path::new("trash")).unwrap();
-        let (parent, name, target) =
-            prepare_target_with_mount_roots(&source, &read_mount_roots().unwrap()).unwrap();
+        let (parent, name, target) = prepare_target_with_mount_roots(
+            &source,
+            &read_mount_roots().unwrap(),
+            &protected_dir_identities(),
+        )
+        .unwrap();
         fs::rename(&source_parent, &moved_parent).unwrap();
         symlink(&victim, &source_parent).unwrap();
         move_verified(&parent, &name, &target, &trash, &source).unwrap();
@@ -716,8 +735,12 @@ mod tests {
         fs::write(&victim, "keep").unwrap();
         let trash =
             private_directory(&File::open(fixture.path()).unwrap(), Path::new("trash")).unwrap();
-        let (parent, name, target) =
-            prepare_target_with_mount_roots(&source, &read_mount_roots().unwrap()).unwrap();
+        let (parent, name, target) = prepare_target_with_mount_roots(
+            &source,
+            &read_mount_roots().unwrap(),
+            &protected_dir_identities(),
+        )
+        .unwrap();
         fs::rename(&source, fixture.path().join("moved")).unwrap();
         symlink(&victim, &source).unwrap();
         assert!(move_verified(&parent, &name, &target, &trash, &source).is_err());
@@ -746,8 +769,12 @@ mod tests {
         for _ in 0..2 {
             let source = fixture.path().join("link");
             symlink(&victim, &source).unwrap();
-            let (parent, name, target) =
-                prepare_target_with_mount_roots(&source, &read_mount_roots().unwrap()).unwrap();
+            let (parent, name, target) = prepare_target_with_mount_roots(
+                &source,
+                &read_mount_roots().unwrap(),
+                &protected_dir_identities(),
+            )
+            .unwrap();
             move_verified(&parent, &name, &target, &trash, &source).unwrap();
         }
         let files = fs::read_dir(fixture.path().join("trash/files"))
@@ -771,8 +798,12 @@ mod tests {
         let victim = fixture.path().join("victim");
         fs::create_dir(&victim).unwrap();
         symlink(&victim, fixture.path().join("trash/files")).unwrap();
-        let (parent, name, target) =
-            prepare_target_with_mount_roots(&source, &read_mount_roots().unwrap()).unwrap();
+        let (parent, name, target) = prepare_target_with_mount_roots(
+            &source,
+            &read_mount_roots().unwrap(),
+            &protected_dir_identities(),
+        )
+        .unwrap();
         assert!(move_verified(&parent, &name, &target, &trash, &source).is_err());
         assert_eq!(fs::read_to_string(&source).unwrap(), "keep");
         assert_eq!(fs::read_dir(victim).unwrap().count(), 0);
@@ -819,8 +850,12 @@ mod recovery_tests {
             let phase = std::env::var(CHILD_PHASE).unwrap();
             let source = root.join("source");
             let trash = private_directory(&File::open(&root).unwrap(), Path::new("Trash")).unwrap();
-            let (parent, name, target) =
-                prepare_target_with_mount_roots(&source, &read_mount_roots().unwrap()).unwrap();
+            let (parent, name, target) = prepare_target_with_mount_roots(
+                &source,
+                &read_mount_roots().unwrap(),
+                &protected_dir_identities(),
+            )
+            .unwrap();
             move_verified_with_hook(&parent, &name, &target, &trash, &source, |at, _, _| {
                 if matches!(
                     (phase.as_str(), at),
@@ -886,8 +921,12 @@ mod recovery_tests {
         fs::write(&source, "original").unwrap();
         let trash =
             private_directory(&File::open(fixture.path()).unwrap(), Path::new("Trash")).unwrap();
-        let (parent, name, target) =
-            prepare_target_with_mount_roots(&source, &read_mount_roots().unwrap()).unwrap();
+        let (parent, name, target) = prepare_target_with_mount_roots(
+            &source,
+            &read_mount_roots().unwrap(),
+            &protected_dir_identities(),
+        )
+        .unwrap();
         let error = move_verified_with_hook(
             &parent,
             &name,
@@ -945,8 +984,12 @@ mod recovery_tests {
                 _ => fs::write(&source, "payload").unwrap(),
             }
             let trash = home_trash(&data_home).unwrap();
-            let (parent, name, target) =
-                prepare_target_with_mount_roots(&source, &read_mount_roots().unwrap()).unwrap();
+            let (parent, name, target) = prepare_target_with_mount_roots(
+                &source,
+                &read_mount_roots().unwrap(),
+                &protected_dir_identities(),
+            )
+            .unwrap();
             move_verified(&parent, &name, &target, &trash, &source).unwrap();
             assert!(fs::symlink_metadata(&source).is_err());
             let mut child = Command::new(&restore)
@@ -1008,6 +1051,7 @@ mod coverage_tests {
             |_, _| Ok(()),
             |parent| Ok((private_directory(parent, Path::new("Trash"))?, None)),
             Err(io::Error::other("mountinfo boom")),
+            Vec::new(),
         );
         assert!(result.succeeded.is_empty());
         assert_eq!(result.failed.len(), 1);
@@ -1063,8 +1107,12 @@ mod coverage_tests {
         }
         let source = fixture.path().join("victim");
         fs::write(&source, "data").unwrap();
-        let (parent, name, target) =
-            prepare_target_with_mount_roots(&source, &read_mount_roots().unwrap()).unwrap();
+        let (parent, name, target) = prepare_target_with_mount_roots(
+            &source,
+            &read_mount_roots().unwrap(),
+            &protected_dir_identities(),
+        )
+        .unwrap();
         move_verified(&parent, &name, &target, &trash, &source).unwrap();
         assert!(!source.exists(), "file was trashed despite the collision");
         // Prove the retry path ran: the minted info name must sort past every
@@ -1100,8 +1148,12 @@ mod coverage_tests {
         let trash_dir = fixture.path().join("trash");
         let source = fixture.path().join("victim");
         fs::write(&source, "data").unwrap();
-        let (parent, name, target) =
-            prepare_target_with_mount_roots(&source, &read_mount_roots().unwrap()).unwrap();
+        let (parent, name, target) = prepare_target_with_mount_roots(
+            &source,
+            &read_mount_roots().unwrap(),
+            &protected_dir_identities(),
+        )
+        .unwrap();
         let trash_file = File::open(&trash_dir).unwrap();
         let destination = TrashDestination::open(&parent, trash_file, None).unwrap();
         std::fs::remove_dir_all(trash_dir.join("info")).unwrap();
@@ -1122,8 +1174,12 @@ mod coverage_tests {
         let trash_dir = fixture.path().join("trash");
         let source = fixture.path().join("victim");
         fs::write(&source, "data").unwrap();
-        let (parent, name, target) =
-            prepare_target_with_mount_roots(&source, &read_mount_roots().unwrap()).unwrap();
+        let (parent, name, target) = prepare_target_with_mount_roots(
+            &source,
+            &read_mount_roots().unwrap(),
+            &protected_dir_identities(),
+        )
+        .unwrap();
         let trash_file = File::open(&trash_dir).unwrap();
         let destination = TrashDestination::open(&parent, trash_file, None).unwrap();
         let sabotage = |phase: MovePhase, info: &File, info_name: &str| {
@@ -1163,8 +1219,12 @@ mod coverage_tests {
             }
             let victim = fixture.path().join(format!("victim-{round}"));
             fs::write(&victim, "data").unwrap();
-            let (parent, name, target) =
-                prepare_target_with_mount_roots(&victim, &read_mount_roots().unwrap()).unwrap();
+            let (parent, name, target) = prepare_target_with_mount_roots(
+                &victim,
+                &read_mount_roots().unwrap(),
+                &protected_dir_identities(),
+            )
+            .unwrap();
             if let Err(error) = move_verified(&parent, &name, &target, &trash, &victim) {
                 assert!(error.to_string().contains("Cannot reserve"));
                 assert!(victim.exists(), "failed move must leave the source");
@@ -1189,8 +1249,12 @@ mod coverage_tests {
         std::fs::create_dir(&grandparent).unwrap();
         let victim = grandparent.join("victim");
         fs::write(&victim, "data").unwrap();
-        let (parent, _, _) =
-            prepare_target_with_mount_roots(&victim, &read_mount_roots().unwrap()).unwrap();
+        let (parent, _, _) = prepare_target_with_mount_roots(
+            &victim,
+            &read_mount_roots().unwrap(),
+            &protected_dir_identities(),
+        )
+        .unwrap();
         std::fs::set_permissions(&grandparent, std::fs::Permissions::from_mode(0o000)).unwrap();
         // Explicit data home avoids touching the process-global XDG variable
         // that parallel tests also read.
@@ -1250,8 +1314,13 @@ mod coverage_tests {
         // Explicit data home avoids touching the process-global XDG variable
         // that parallel tests also read.
         let resolve = |parent: &File| trash_directory_for_data_home(parent, &xdg_path);
-        let result =
-            trash_with_destination_impl(&[&victim], |_, _| Ok(()), resolve, read_mount_roots());
+        let result = trash_with_destination_impl(
+            &[&victim],
+            |_, _| Ok(()),
+            resolve,
+            read_mount_roots(),
+            protected_dir_identities(),
+        );
         assert!(
             result.failed.is_empty(),
             "cross-mount trash must succeed: {:?}",
@@ -1288,8 +1357,13 @@ mod coverage_tests {
         let xdg = tempfile::tempdir().unwrap();
         let xdg_path = xdg.path().to_path_buf();
         let resolve = |parent: &File| trash_directory_for_data_home(parent, &xdg_path);
-        let result =
-            trash_with_destination_impl(&[&victim], |_, _| Ok(()), resolve, read_mount_roots());
+        let result = trash_with_destination_impl(
+            &[&victim],
+            |_, _| Ok(()),
+            resolve,
+            read_mount_roots(),
+            protected_dir_identities(),
+        );
         assert!(result.failed.is_empty(), "shared trash must succeed");
         assert!(!victim.exists());
     }
@@ -1376,8 +1450,12 @@ mod coverage_tests {
         let source = fixture.path().join("source");
         std::fs::write(&source, "payload").unwrap();
         let trash_fd = open_dir(&trash);
-        let (parent, name, target) =
-            prepare_target_with_mount_roots(&source, &read_mount_roots().unwrap()).unwrap();
+        let (parent, name, target) = prepare_target_with_mount_roots(
+            &source,
+            &read_mount_roots().unwrap(),
+            &protected_dir_identities(),
+        )
+        .unwrap();
         let error = move_verified(&parent, &name, &target, &trash_fd, &source).unwrap_err();
         assert!(!error.to_string().is_empty());
         assert!(source.exists());
