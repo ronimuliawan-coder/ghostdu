@@ -388,7 +388,7 @@ pub fn is_virtual_fs_path(path: &Path) -> bool {
     let p = path_str.as_ref();
 
     // Skip root virtual mounts
-    if p == "/proc"
+    p == "/proc"
         || p.starts_with("/proc/")
         || p == "/sys"
         || p.starts_with("/sys/")
@@ -407,11 +407,6 @@ pub fn is_virtual_fs_path(path: &Path) -> bool {
         || p == "/dev/pts"
         || p.starts_with("/dev/pts/")
         || p.starts_with("/var/lib/snapd/mnt/")
-    {
-        return true;
-    }
-
-    false
 }
 
 #[cfg(test)]
