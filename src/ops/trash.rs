@@ -1197,7 +1197,11 @@ mod coverage_tests {
         // that parallel tests also read.
         let resolve = |parent: &File| trash_directory_for_data_home(parent, &xdg_path);
         let result = trash_with_destination(&[&victim], |_, _| Ok(()), resolve);
-        assert!(result.failed.is_empty(), "cross-mount trash must succeed");
+        assert!(
+            result.failed.is_empty(),
+            "cross-mount trash must succeed: {:?}",
+            result.failed
+        );
         assert!(!victim.exists(), "victim was trashed via the mount-top dir");
     }
 

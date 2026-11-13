@@ -3,6 +3,7 @@
 use ghostdu::fs::scanner::{scan_directory_with_options, ScannerOptions};
 use std::fs;
 use std::os::unix::fs::MetadataExt;
+use std::path::Path;
 use std::process::Command;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
@@ -250,6 +251,52 @@ fn bind_mount_boundaries_and_ancestor_cycles() {
         3
     );
     assert_eq!(fs::read_dir(user_trash.join("files")).unwrap().count(), 4);
+
+    // Audit H2 regression: a bind alias of /etc must be undeletable — the alias
+    // root itself (NO_XDEV) and, under cross_mounts scans, everything beneath
+    // it (mountinfo fs-root guardrail). /etc content must stay intact.
+    let etc_alias = root.join("etc-alias");
+    fs::create_dir_all(&etc_alias).unwrap();
+    assert!(Command::new("mount")
+        .arg("--bind")
+        .arg("/etc")
+        .arg(&etc_alias)
+        .status()
+        .unwrap()
+        .success());
+    assert!(
+        etc_alias.join("hosts").exists(),
+        "bind of /etc must expose hosts"
+    );
+    let alias_tree = scan_directory_with_options(
+        &root,
+        None,
+        Arc::new(AtomicBool::new(false)),
+        ScannerOptions {
+            cross_mounts: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert!(alias_tree
+        .children
+        .iter()
+        .any(|entry| entry.path == etc_alias));
+    let result = ghostdu::ops::permanently_delete(&[etc_alias.join("hosts")]);
+    assert!(result.succeeded.is_empty(), "{:?}", result.succeeded);
+    assert_eq!(result.failed.len(), 1);
+    assert!(
+        result.failed[0].1.contains("bind mount") || result.failed[0].1.contains("alias"),
+        "unexpected failure message: {}",
+        result.failed[0].1
+    );
+    assert!(Path::new("/etc/hosts").exists(), "/etc/hosts must survive");
+    assert!(Command::new("umount")
+        .arg(&etc_alias)
+        .status()
+        .unwrap()
+        .success());
+
     // TempDir cleanup must happen after unmounting the synthetic filesystems.
     for mount in [&ancestor, &bind, &other_device] {
         assert!(Command::new("umount")
