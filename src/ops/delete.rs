@@ -203,20 +203,30 @@ fn check_safety(path: &Path) -> io::Result<()> {
 }
 
 /// Rejects `canonical_parent` — already verified to equal the pinned parent —
-/// when it sits beneath any mount point that aliases a protected tree. Only
-/// sub-path mounts (fs-root != `/`) are examined: a whole-filesystem or tmpfs
-/// mount is a natural parent whose content is governed by the string path
-/// itself. The alias test is identity-only, decided by `(dev, ino)`: the
-/// fs-root *string* must not be classified, because it is a superblock-
-/// relative path whose name coincides with host paths on real layouts —
-/// Fedora's root subvolume is `/root` mounted at `/`, and an independent
-/// filesystem's own `/etc` is not the host's `/etc` (review round 1, Qodo
-/// finding 1). A protected directory mounted at its normal location matches
-/// its own identity, so only a *different* path matching a protected identity
-/// counts as an alias — openSUSE's `/@/var` subvolume mounted at `/var` and
-/// ostree's `/var` bind keep deleting beneath `/var` working (finding 3).
-/// Takes the parsed mount roots and the protected identity list as parameters
-/// so every arm is testable without mounting anything.
+/// when it sits beneath any directory that aliases a protected tree. Every
+/// ancestor is statted (review round 2, Qodo finding 695f9642): under a bind
+/// of `/` mounted at `/host`, `/host/etc` is an ordinary directory carrying
+/// `/etc`'s identity, and only the full walk sees it. The decision per
+/// matching identity:
+/// - the protected path itself — and its natural ancestors when it is
+///   itself a mount, like Fedora's `/root` subvolume mounted at `/` — never
+///   blocks (openSUSE's `/@/var` at `/var`, ostree's `/var` bind — review
+///   round 1);
+/// - an ancestor that is itself a sub-path mount blocks only when the
+///   protected path is either not a mount point (its inode cannot otherwise
+///   appear as a mount root) or is mounted with the *same* fs-root — two
+///   btrfs subvolume roots on one filesystem both report `st_ino` 256, so
+///   `/var/log` must not count as an alias of `/var` merely by sharing the
+///   identity;
+/// - a plain directory (no mount point of its own) carrying a protected
+///   root's identity can only be a bind-alias subtree component, so it
+///   blocks. This closes the whole-fs-bind hole: `/host/etc/ssh` is reached
+///   through `/host/etc`, an ordinary directory under the `/host` mount.
+///
+/// The fs-root *string* is never classified — it is a superblock-relative
+/// path whose name coincides with host paths on real layouts (Fedora's root
+/// subvolume is `/root` mounted at `/`; an independent filesystem has its own
+/// `/etc`) — review round 1, Qodo finding 1.
 fn check_not_under_protected_mount_alias(
     canonical_parent: &Path,
     mount_roots: &HashMap<PathBuf, PathBuf>,
@@ -224,22 +234,36 @@ fn check_not_under_protected_mount_alias(
 ) -> io::Result<()> {
     let mut current = Some(canonical_parent);
     while let Some(path) = current {
-        let alias = mount_roots
-            .get(path)
-            .filter(|fs_root| *fs_root != Path::new("/"))
-            .is_some_and(|_| {
-                fs::metadata(path).ok().is_some_and(|metadata| {
-                    let identity = (metadata.dev(), metadata.ino());
-                    protected.iter().any(|(protected_path, dev, ino)| {
-                        path.as_os_str().as_encoded_bytes() != protected_path.as_bytes()
-                            && identity == (*dev, *ino)
-                    })
-                })
+        if let Ok(metadata) = fs::metadata(path) {
+            let identity = (metadata.dev(), metadata.ino());
+            let blocked = protected.iter().any(|(protected_path, dev, ino)| {
+                if identity != (*dev, *ino) {
+                    return false;
+                }
+                let protected = Path::new(protected_path);
+                // The protected directory's own location — and its natural
+                // ancestors, when it is itself a mount (Fedora's `/root`
+                // subvolume mounted at `/`) — never alias it.
+                if path == protected || protected.starts_with(path) {
+                    return false;
+                }
+                match mount_roots.get(path) {
+                    Some(fs_root) => {
+                        *fs_root != Path::new("/")
+                            && mount_roots
+                                .get(protected)
+                                .is_none_or(|protected_root| protected_root == fs_root)
+                    }
+                    // A plain directory carrying a protected root's identity
+                    // can only be a bind-alias subtree component.
+                    None => true,
+                }
             });
-        if alias {
-            return Err(io::Error::other(
-                "Blocked: target lives beneath a bind mount of a protected system directory",
-            ));
+            if blocked {
+                return Err(io::Error::other(
+                    "Blocked: target lives beneath a bind mount of a protected system directory",
+                ));
+            }
         }
         current = path.parent();
     }
@@ -419,6 +443,61 @@ mod tests {
         assert!(error.to_string().contains("bind mount"));
         // Without the identity match the same layout stays deletable.
         check_not_under_protected_mount_alias(&alias, &parse_roots(&mountinfo), &[]).unwrap();
+    }
+
+    /// Qodo round 2 (695f9642): under a whole-fs bind of `/` at `/host`,
+    /// `/host/etc` is an ordinary directory carrying `/etc`'s identity — the
+    /// full ancestor walk must catch it even with no sub-path mounts.
+    #[test]
+    fn root_bind_subtree_components_are_rejected() {
+        let fixture = tempfile::tempdir().unwrap();
+        let alias = fixture.path().join("rootalias/etc");
+        fs::create_dir_all(&alias).unwrap();
+        let metadata = fs::metadata(&alias).unwrap();
+        let protected = [("/etc", metadata.dev(), metadata.ino())];
+        // Whole-fs style mountinfo: every mount carries fs-root `/`, so the
+        // plain-directory arm is the only one that can fire.
+        let mountinfo =
+            "23 0 253:0 / / rw - ext4 /dev/root\n42 23 253:0 / /host rw - ext4 /dev/root\n"
+                .to_string();
+        let error =
+            check_not_under_protected_mount_alias(&alias, &parse_roots(&mountinfo), &protected)
+                .unwrap_err();
+        assert!(error.to_string().contains("bind mount"));
+        // Without the identity match the same layout stays deletable.
+        check_not_under_protected_mount_alias(&alias, &parse_roots(&mountinfo), &[]).unwrap();
+    }
+
+    /// Btrfs subvolume roots all report `st_ino` 256 on one filesystem: a
+    /// mount point sharing a protected root's identity but mounted from a
+    /// different fs-root is a different mount, not an alias (openSUSE's
+    /// `/var/log` beside `/var`); the same fs-root is an alias and blocks.
+    #[test]
+    fn same_fs_root_decides_between_collision_and_alias() {
+        let fixture = tempfile::tempdir().unwrap();
+        let log_mount = fixture.path().join("log");
+        fs::create_dir_all(&log_mount).unwrap();
+        let metadata = fs::metadata(&fixture).unwrap();
+        let protected = [("/var/cache", metadata.dev(), metadata.ino())];
+        // Different fs-roots: collision, not alias — allowed.
+        let distinct = format!(
+            "23 0 253:0 /@log {} rw - btrfs /dev/root\n24 23 253:0 /@cache /var/cache rw - btrfs /dev/root\n",
+            fixture.path().display()
+        );
+        check_not_under_protected_mount_alias(fixture.path(), &parse_roots(&distinct), &protected)
+            .unwrap();
+        // The same fs-root under a different path: alias — blocked.
+        let aliased = format!(
+            "23 0 253:0 /@cache {} rw - btrfs /dev/root\n24 23 253:0 /@cache /var/cache rw - btrfs /dev/root\n",
+            fixture.path().display()
+        );
+        let error = check_not_under_protected_mount_alias(
+            fixture.path(),
+            &parse_roots(&aliased),
+            &protected,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("bind mount"));
     }
 
     /// Qodo finding 3: a protected directory mounted at its normal location —

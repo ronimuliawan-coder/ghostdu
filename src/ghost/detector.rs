@@ -115,9 +115,16 @@ pub fn classify_path(path: &Path) -> GhostKind {
         return GhostKind::DockerBuildkit;
     }
     // The daemon socket is a file named `docker.sock` directly under /var/run,
-    // so the last segment matches by prefix rather than by exact component.
+    // so the component directly beneath /var/run matches by prefix — searching
+    // the rest of the path for "/docker" would sweep unrelated nested names
+    // like /var/run/work/docker-notes (review round 2, Qodo finding b8a632a2).
     if starts_with_segments(&components, &["var", "lib", "docker"])
-        || (starts_with_segments(&components, &["var", "run"]) && path_str.contains("/docker"))
+        || (starts_with_segments(&components, &["var", "run"])
+            && components.len() > 3
+            && components[3]
+                .as_os_str()
+                .as_encoded_bytes()
+                .starts_with(b"docker"))
     {
         return GhostKind::DockerUser;
     }
@@ -976,6 +983,21 @@ mod tests {
         assert_eq!(
             classify_path(&PathBuf::from("/home/u/.local/share/Trash/files/x")),
             GhostKind::Trash
+        );
+        // The /var/run socket rule matches only the component directly beneath
+        // it (review round 2): the daemon socket and docker directories stay,
+        // unrelated nested names do not borrow the badge.
+        assert_eq!(
+            classify_path(&PathBuf::from("/var/run/docker.sock")),
+            GhostKind::DockerUser
+        );
+        assert_eq!(
+            classify_path(&PathBuf::from("/var/run/docker/network/files/local-kv.db")),
+            GhostKind::DockerUser
+        );
+        assert_eq!(
+            classify_path(&PathBuf::from("/var/run/work/docker-notes")),
+            GhostKind::None
         );
     }
 
