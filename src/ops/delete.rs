@@ -2,6 +2,7 @@ use crate::fs::entry::DeleteSafety;
 use crate::fs::scanner::parse_mount_roots;
 use crate::ghost::{classify_path, classify_safety};
 use rustix::fs::{openat2, unlinkat, AtFlags, Dir, Mode, OFlags, ResolveFlags, CWD};
+use std::collections::HashMap;
 use std::ffi::{CStr, CString};
 use std::fs::{self, File};
 use std::io;
@@ -34,15 +35,39 @@ fn delete_with_verification<P: AsRef<Path>>(
     paths: &[P],
     verify: impl Fn(&Path, &File) -> io::Result<()>,
 ) -> DeleteResult {
+    delete_with_verification_impl(paths, verify, read_mount_roots())
+}
+
+fn delete_with_verification_impl<P: AsRef<Path>>(
+    paths: &[P],
+    verify: impl Fn(&Path, &File) -> io::Result<()>,
+    mount_roots: io::Result<HashMap<PathBuf, PathBuf>>,
+) -> DeleteResult {
     let mut result = DeleteResult::default();
+    // One mountinfo read per batch (review round 1, Qodo finding 6): a bind
+    // installed mid-batch is picked up by the next batch. An unreadable mount
+    // table fails the whole batch closed — without it the alias guard is
+    // blind and deletion must not proceed.
+    let mount_roots = match mount_roots {
+        Ok(roots) => roots,
+        Err(error) => {
+            result.failed = paths
+                .iter()
+                .map(|p| (p.as_ref().to_path_buf(), error.to_string()))
+                .collect();
+            return result;
+        }
+    };
     for path in paths {
         let path = path.as_ref();
-        let removal = prepare_target(path).and_then(|(parent, name, target)| {
-            verify(path, &target)?;
-            // Reject existing mounts/unreadable subtrees before mutating anything.
-            inspect_tree(&target)?;
-            remove_at(&parent, &name, &target)
-        });
+        let removal = prepare_target_with_mount_roots(path, &mount_roots).and_then(
+            |(parent, name, target)| {
+                verify(path, &target)?;
+                // Reject existing mounts/unreadable subtrees before mutating anything.
+                inspect_tree(&target)?;
+                remove_at(&parent, &name, &target)
+            },
+        );
         match removal {
             Ok(()) => result.succeeded.push(path.to_path_buf()),
             Err(error) => result.failed.push((path.to_path_buf(), error.to_string())),
@@ -51,7 +76,16 @@ fn delete_with_verification<P: AsRef<Path>>(
     result
 }
 
-pub(super) fn prepare_target(path: &Path) -> io::Result<(File, CString, File)> {
+/// The live mount table's mount point → fs-root mapping, read fresh so newly
+/// installed bind mounts are never missed by a stale snapshot.
+pub(super) fn read_mount_roots() -> io::Result<HashMap<PathBuf, PathBuf>> {
+    Ok(parse_mount_roots(&fs::read("/proc/self/mountinfo")?))
+}
+
+pub(super) fn prepare_target_with_mount_roots(
+    path: &Path,
+    mount_roots: &HashMap<PathBuf, PathBuf>,
+) -> io::Result<(File, CString, File)> {
     check_safety(path)?;
     let name = path
         .file_name()
@@ -83,7 +117,7 @@ pub(super) fn prepare_target(path: &Path) -> io::Result<(File, CString, File)> {
         ))?;
     check_not_under_protected_mount_alias(
         &canonical_parent,
-        &fs::read("/proc/self/mountinfo")?,
+        mount_roots,
         protected_dir_identities(),
     )?;
     check_safety(&pinned_path.join(std::ffi::OsStr::from_bytes(name.to_bytes())))?;
@@ -92,21 +126,24 @@ pub(super) fn prepare_target(path: &Path) -> io::Result<(File, CString, File)> {
     Ok((parent, name, target))
 }
 
-/// `(dev, ino)` of the exact-name System roots in `classify_safety`'s first
-/// block, with three deliberate exclusions. `/tmp` and `/var/tmp`: their
+/// `(path, dev, ino)` of the exact-name System roots in `classify_safety`'s
+/// first block, with three deliberate exclusions. `/tmp` and `/var/tmp`: their
 /// children are deliberately deletable temp files, so no identity test can
 /// separate a `/tmp` alias from legitimate `/tmp` children — and the harm of
 /// deleting inside one is bounded by the tool's ordinary job. `/`: every btrfs
 /// subvolume root reports the same `st_ino`, so the root's identity collides
 /// with unrelated subvolume mounts (`/home`, `/var/cache`, …); the root itself
-/// stays string-blocked. Captured lazily per process; missing paths (container
-/// images without /sys, /run, …) are skipped.
-fn protected_dir_identities() -> &'static [(u64, u64)] {
-    static IDENTITIES: OnceLock<Vec<(u64, u64)>> = OnceLock::new();
+/// stays string-blocked. The path travels with the identity so a protected
+/// directory mounted at its normal location can be told apart from an alias
+/// of it (review round 1, Qodo finding 3). Captured lazily per process;
+/// missing paths (container images without /sys, /run, …) are skipped.
+fn protected_dir_identities() -> &'static [(&'static str, u64, u64)] {
+    static IDENTITIES: OnceLock<Vec<(&'static str, u64, u64)>> = OnceLock::new();
     IDENTITIES.get_or_init(|| {
         [
             "/bin",
             "/sbin",
+            "/lib32",
             "/boot",
             "/etc",
             "/lib",
@@ -127,23 +164,27 @@ fn protected_dir_identities() -> &'static [(u64, u64)] {
             "/var/lib/systemd",
         ]
         .iter()
-        .filter_map(|path| fs::metadata(path).ok().map(|m| (m.dev(), m.ino())))
+        .filter_map(|path| fs::metadata(path).ok().map(|m| (*path, m.dev(), m.ino())))
         .collect()
     })
 }
 
 /// String guardrails classify paths; a bind-mount alias of a protected
 /// directory elsewhere in the tree shares the source's `(dev, ino)`, so the
-/// string check alone cannot see it (audit H2). Identity comparison closes the
-/// alias of the protected roots themselves at fd level, without false
-/// positives: no legitimate target ever shares a protected root's identity.
-/// Residual, documented: a bind alias of a protected *subdirectory* (e.g.
-/// `/etc/ssh` mounted elsewhere) has an ordinary inode and stays reachable
-/// under `cross_mounts` scans; closing that needs mountinfo source tracking.
-fn reject_protected_alias(target: &File, protected: &[(u64, u64)]) -> io::Result<()> {
+/// string check alone cannot see it (audit H2). Identity comparison closes
+/// the alias of the protected roots themselves at fd level, layout-proof:
+/// btrfs subvolume layouts report the mount's fs-root as the superblock path
+/// (`/@/etc`), which no string check can classify. Residual, documented: a
+/// bind alias of a protected *subdirectory* (e.g. `/etc/ssh` mounted
+/// elsewhere) has an ordinary inode and stays reachable under `cross_mounts`
+/// scans; closing that needs mountinfo source tracking.
+fn reject_protected_alias(target: &File, protected: &[(&'static str, u64, u64)]) -> io::Result<()> {
     let metadata = target.metadata()?;
     let identity = (metadata.dev(), metadata.ino());
-    if protected.contains(&identity) {
+    if protected
+        .iter()
+        .any(|(_, dev, ino)| identity == (*dev, *ino))
+    {
         return Err(io::Error::other(
             "Blocked: target is a bind-mount alias of a protected system directory",
         ));
@@ -163,33 +204,37 @@ fn check_safety(path: &Path) -> io::Result<()> {
 
 /// Rejects `canonical_parent` — already verified to equal the pinned parent —
 /// when it sits beneath any mount point that aliases a protected tree. Only
-/// sub-path mounts (fs-root != `/`) can alias: a whole-filesystem or tmpfs
+/// sub-path mounts (fs-root != `/`) are examined: a whole-filesystem or tmpfs
 /// mount is a natural parent whose content is governed by the string path
-/// itself. For a sub-path mount, two arms block: its fs-root classifies as
-/// System (bind rooted in a protected tree), or its `(dev, ino)` matches a
-/// protected root (binds from btrfs-subvolume layouts, where the fs-root
-/// string is the superblock path — `/@/etc` — and cannot be classified
-/// directly). Parsed fresh per deletion so a newly installed bind mount is
-/// never missed by a stale snapshot; the per-delete cost of one mountinfo read
-/// and a handful of stats is negligible for an interactive tool. Takes
-/// mountinfo bytes and the protected identity list as parameters so every arm
-/// is testable without mounting anything.
+/// itself. The alias test is identity-only, decided by `(dev, ino)`: the
+/// fs-root *string* must not be classified, because it is a superblock-
+/// relative path whose name coincides with host paths on real layouts —
+/// Fedora's root subvolume is `/root` mounted at `/`, and an independent
+/// filesystem's own `/etc` is not the host's `/etc` (review round 1, Qodo
+/// finding 1). A protected directory mounted at its normal location matches
+/// its own identity, so only a *different* path matching a protected identity
+/// counts as an alias — openSUSE's `/@/var` subvolume mounted at `/var` and
+/// ostree's `/var` bind keep deleting beneath `/var` working (finding 3).
+/// Takes the parsed mount roots and the protected identity list as parameters
+/// so every arm is testable without mounting anything.
 fn check_not_under_protected_mount_alias(
     canonical_parent: &Path,
-    mountinfo: &[u8],
-    protected: &[(u64, u64)],
+    mount_roots: &HashMap<PathBuf, PathBuf>,
+    protected: &[(&'static str, u64, u64)],
 ) -> io::Result<()> {
-    let mount_roots = parse_mount_roots(mountinfo);
     let mut current = Some(canonical_parent);
     while let Some(path) = current {
         let alias = mount_roots
             .get(path)
             .filter(|fs_root| *fs_root != Path::new("/"))
-            .is_some_and(|fs_root| {
-                classify_safety(fs_root, classify_path(fs_root)) == DeleteSafety::System
-                    || fs::metadata(path).ok().is_some_and(|metadata| {
-                        protected.contains(&(metadata.dev(), metadata.ino()))
+            .is_some_and(|_| {
+                fs::metadata(path).ok().is_some_and(|metadata| {
+                    let identity = (metadata.dev(), metadata.ino());
+                    protected.iter().any(|(protected_path, dev, ino)| {
+                        path.as_os_str().as_encoded_bytes() != protected_path.as_bytes()
+                            && identity == (*dev, *ino)
                     })
+                })
             });
         if alias {
             return Err(io::Error::other(
@@ -306,7 +351,7 @@ mod tests {
         fs::write(&file, "x").unwrap();
         let handle = File::open(&file).unwrap();
         let metadata = handle.metadata().unwrap();
-        let protected = [(metadata.dev(), metadata.ino())];
+        let protected = [("/etc", metadata.dev(), metadata.ino())];
         let error = reject_protected_alias(&handle, &protected).unwrap_err();
         assert!(error.to_string().contains("bind-mount alias"));
     }
@@ -322,24 +367,41 @@ mod tests {
         reject_protected_alias(&handle, &[]).unwrap();
     }
 
+    fn parse_roots(mountinfo: &str) -> HashMap<PathBuf, PathBuf> {
+        parse_mount_roots(mountinfo.as_bytes())
+    }
+
     #[test]
     fn alias_ancestors_in_mountinfo_block_deletion() {
-        let mountinfo = b"23 0 253:0 / / rw,relatime - ext4 /dev/root\n42 23 253:0 /etc /mnt/alias rw - ext4 /dev/root\n36 23 0:41 / /tmp rw - tmpfs tmpfs\n";
+        // The alias mount points at a real fixture directory whose identity is
+        // registered as the host's `/etc`; a different path with that identity
+        // is an alias.
+        let fixture = tempfile::tempdir().unwrap();
+        let alias = fixture.path().join("etc-alias");
+        fs::create_dir_all(&alias).unwrap();
+        let metadata = fs::metadata(&alias).unwrap();
+        let protected = [("/etc", metadata.dev(), metadata.ino())];
+        let mountinfo = format!(
+            "23 0 253:0 / / rw,relatime - ext4 /dev/root\n42 23 253:0 /etc {} rw - ext4 /dev/root\n36 23 0:41 / /tmp rw - tmpfs tmpfs\n",
+            alias.display()
+        );
+        let roots = parse_roots(&mountinfo);
         // The alias mount itself and anything beneath it are blocked.
-        let error = check_not_under_protected_mount_alias(Path::new("/mnt/alias"), mountinfo, &[])
-            .unwrap_err();
+        let error = check_not_under_protected_mount_alias(&alias, &roots, &protected).unwrap_err();
         assert!(error.to_string().contains("bind mount"));
-        let error =
-            check_not_under_protected_mount_alias(Path::new("/mnt/alias/deep/dir"), mountinfo, &[])
-                .unwrap_err();
+        let deep = fixture.path().join("etc-alias/deep/dir");
+        fs::create_dir_all(&deep).unwrap();
+        let error = check_not_under_protected_mount_alias(&deep, &roots, &protected).unwrap_err();
         assert!(error.to_string().contains("bind mount"));
         // Whole-fs and tmpfs mounts are natural parents; non-mount paths too.
-        check_not_under_protected_mount_alias(Path::new("/mnt"), mountinfo, &[]).unwrap();
-        check_not_under_protected_mount_alias(Path::new("/tmp/x"), mountinfo, &[]).unwrap();
+        check_not_under_protected_mount_alias(&fixture.path().join("mnt"), &roots, &protected)
+            .unwrap();
+        check_not_under_protected_mount_alias(&fixture.path().join("tmp/x"), &roots, &protected)
+            .unwrap();
     }
 
     /// Btrfs-style bind: the fs-root string is the superblock path (`/@/etc`),
-    /// which classifies as None, so only the `(dev, ino)` arm can catch it.
+    /// which no string check can classify, so only the identity arm catches it.
     #[test]
     fn subvolume_rooted_binds_are_caught_by_identity() {
         let fixture = tempfile::tempdir().unwrap();
@@ -350,12 +412,68 @@ mod tests {
             alias.display()
         );
         let metadata = fs::metadata(&alias).unwrap();
-        let protected = [(metadata.dev(), metadata.ino())];
-        let error = check_not_under_protected_mount_alias(&alias, mountinfo.as_bytes(), &protected)
-            .unwrap_err();
+        let protected = [("/etc", metadata.dev(), metadata.ino())];
+        let error =
+            check_not_under_protected_mount_alias(&alias, &parse_roots(&mountinfo), &protected)
+                .unwrap_err();
         assert!(error.to_string().contains("bind mount"));
         // Without the identity match the same layout stays deletable.
-        check_not_under_protected_mount_alias(&alias, mountinfo.as_bytes(), &[]).unwrap();
+        check_not_under_protected_mount_alias(&alias, &parse_roots(&mountinfo), &[]).unwrap();
+    }
+
+    /// Qodo finding 3: a protected directory mounted at its normal location —
+    /// openSUSE's `/@/var` subvolume at `/var`, ostree's `/var` bind — matches
+    /// its own identity, which must not count as an alias of itself.
+    #[test]
+    fn protected_directory_at_its_own_mount_point_stays_deletable() {
+        // /var exists on every Linux host; give its real identity to the guard
+        // and mount it (per the synthetic mountinfo) at exactly that path.
+        let metadata = fs::metadata("/var").unwrap();
+        let protected = [("/var", metadata.dev(), metadata.ino())];
+        let mountinfo = "23 0 253:0 /@ / rw,relatime - btrfs /dev/root\n42 23 253:0 /@/var /var rw,relatime - btrfs /dev/root\n44 23 253:0 /@/var/log /var/log rw,relatime - btrfs /dev/root\n";
+        let roots = parse_roots(mountinfo);
+        // Cleanup beneath the natural /var mount must work (log is a nested
+        // subvolume on the same layout, with an unclassified fs-root).
+        check_not_under_protected_mount_alias(Path::new("/var/log/journal"), &roots, &protected)
+            .unwrap();
+        // The same identity showing up under a DIFFERENT path is an alias.
+        let fixture = tempfile::tempdir().unwrap();
+        let alias = fixture.path().join("var-alias");
+        fs::create_dir_all(&alias).unwrap();
+        let alias_meta = fs::metadata(&alias).unwrap();
+        let alias_protected = [("/var", alias_meta.dev(), alias_meta.ino())];
+        let alias_mountinfo = format!(
+            "23 0 253:0 /@ / rw,relatime - btrfs /dev/root\n42 23 253:0 /@/var {} rw - btrfs /dev/root\n",
+            alias.display()
+        );
+        let error = check_not_under_protected_mount_alias(
+            &alias,
+            &parse_roots(&alias_mountinfo),
+            &alias_protected,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("bind mount"));
+    }
+
+    /// Qodo finding 1: Fedora-style layouts name the root subvolume `/root`
+    /// and mount it at `/`; an fs-root string must never be classified as a
+    /// host path, so nothing here may block.
+    #[test]
+    fn fedora_style_root_subvolume_does_not_block_deletions() {
+        let fixture = tempfile::tempdir().unwrap();
+        let mountinfo = format!(
+            "36 1 0:33 /root / rw,relatime - btrfs /dev/vda3 rw,subvol=/root\n37 36 0:33 /root/home {} rw,relatime - btrfs /dev/vda3 rw,subvol=/root\n",
+            fixture.path().display()
+        );
+        // Even with /root's real identity registered, the root mount and the
+        // subpath home mount must not block: their paths are not aliases.
+        let root_meta = fs::metadata("/root");
+        let protected: Vec<(&'static str, u64, u64)> = match root_meta {
+            Ok(meta) => vec![("/root", meta.dev(), meta.ino())],
+            Err(_) => vec![],
+        };
+        check_not_under_protected_mount_alias(fixture.path(), &parse_roots(&mountinfo), &protected)
+            .unwrap();
     }
 
     #[test]
@@ -365,10 +483,27 @@ mod tests {
         // must not block ordinary deletions.
         check_not_under_protected_mount_alias(
             fixture.path(),
-            &fs::read("/proc/self/mountinfo").unwrap(),
+            &read_mount_roots().unwrap(),
             protected_dir_identities(),
         )
         .unwrap();
+    }
+
+    /// An unreadable mount table fails the whole batch closed.
+    #[test]
+    fn unreadable_mountinfo_fails_the_batch() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("keep.txt");
+        fs::write(&file, "x").unwrap();
+        let result = delete_with_verification_impl(
+            std::slice::from_ref(&file),
+            |_, _| Ok(()),
+            Err(io::Error::other("mountinfo boom")),
+        );
+        assert!(result.succeeded.is_empty());
+        assert_eq!(result.failed.len(), 1);
+        assert!(result.failed[0].1.contains("mountinfo boom"));
+        assert!(file.exists());
     }
 
     #[test]
@@ -377,7 +512,8 @@ mod tests {
         let source = fixture.path().join("source");
         let saved = fixture.path().join("saved");
         fs::write(&source, "confirmed").unwrap();
-        let (parent, name, target) = prepare_target(&source).unwrap();
+        let (parent, name, target) =
+            prepare_target_with_mount_roots(&source, &read_mount_roots().unwrap()).unwrap();
         remove_at_with_hook(&parent, &name, &target, &|_, _| {
             fs::rename(&source, &saved).unwrap();
             fs::write(&source, "replacement").unwrap();
@@ -398,7 +534,9 @@ mod tests {
         fs::create_dir_all(victim.join("ssh")).unwrap();
         fs::write(parent_path.join("ssh/selected"), "selected").unwrap();
         fs::write(victim.join("ssh/keep"), "protected fixture").unwrap();
-        let (parent, name, target) = prepare_target(&parent_path.join("ssh")).unwrap();
+        let (parent, name, target) =
+            prepare_target_with_mount_roots(&parent_path.join("ssh"), &read_mount_roots().unwrap())
+                .unwrap();
         inspect_tree(&target).unwrap();
         fs::rename(&parent_path, &moved).unwrap();
         symlink(&victim, &parent_path).unwrap();
@@ -419,7 +557,8 @@ mod tests {
         fs::create_dir(&path).unwrap();
         fs::create_dir(&victim).unwrap();
         fs::write(victim.join("keep"), "untouched").unwrap();
-        let (parent, name, target) = prepare_target(&path).unwrap();
+        let (parent, name, target) =
+            prepare_target_with_mount_roots(&path, &read_mount_roots().unwrap()).unwrap();
         fs::rename(&path, &moved).unwrap();
         symlink(&victim, &path).unwrap();
         assert!(remove_at(&parent, &name, &target).is_err());

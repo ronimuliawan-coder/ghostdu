@@ -10,18 +10,20 @@ fn has_suffix_ignore_ascii_case(name: &str, suffix: &str) -> bool {
         && name.as_bytes()[name.len() - suffix.len()..].eq_ignore_ascii_case(suffix.as_bytes())
 }
 
-/// True when `path` begins at the filesystem root with exactly these components
-/// (e.g. `["var", "log"]` matches `/var/log` and `/var/log/journal`, never
-/// `/home/u/var/log`). Component-exact, so a user directory named `var` cannot
-/// borrow a system location's classification (audit M4).
-fn starts_with_segments(path: &Path, segments: &[&str]) -> bool {
-    let mut components = path.components();
-    match components.next() {
+/// True when a component slice begins at the filesystem root with exactly
+/// these components (e.g. `["var", "log"]` matches `/var/log` and
+/// `/var/log/journal`, never `/home/u/var/log`). Component-exact, so a user
+/// directory named `var` cannot borrow a system location's classification
+/// (audit M4). Takes the caller's component slice: `classify_path` builds one
+/// per entry instead of one per rule (review round 1, Qodo finding 5).
+fn starts_with_segments(components: &[Component<'_>], segments: &[&str]) -> bool {
+    let mut iter = components.iter();
+    match iter.next() {
         Some(Component::RootDir) => {}
         _ => return false,
     }
     for segment in segments {
-        match components.next() {
+        match iter.next() {
             Some(component) if component.as_os_str().as_encoded_bytes() == segment.as_bytes() => {}
             _ => return false,
         }
@@ -29,22 +31,22 @@ fn starts_with_segments(path: &Path, segments: &[&str]) -> bool {
     true
 }
 
-/// True when exactly these components appear contiguously anywhere in `path`
-/// (e.g. `[".local", "share", "Trash"]` matches any user's trash directory).
-/// Segment-exact, so `myvar/lib/docker` or `.docker-backup` cannot match a
-/// dot-directory rule they merely spell (audit M4).
-fn contains_segments(path: &Path, segments: &[&str]) -> bool {
+/// True when exactly these components appear contiguously anywhere in the
+/// component slice (e.g. `[".local", "share", "Trash"]` matches any user's
+/// trash directory). Segment-exact, so `myvar/lib/docker` or `.docker-backup`
+/// cannot match a dot-directory rule they merely spell (audit M4).
+fn contains_segments(components: &[Component<'_>], segments: &[&str]) -> bool {
     if segments.is_empty() {
         return false;
     }
-    let components: Vec<Component<'_>> = path
-        .components()
-        .skip_while(|c| matches!(c, Component::RootDir))
-        .collect();
-    if segments.len() > components.len() {
+    let body = match components {
+        [Component::RootDir, rest @ ..] => rest,
+        all => all,
+    };
+    if segments.len() > body.len() {
         return false;
     }
-    components.windows(segments.len()).any(|window| {
+    body.windows(segments.len()).any(|window| {
         window.iter().zip(segments).all(|(component, segment)| {
             component.as_os_str().as_encoded_bytes() == segment.as_bytes()
         })
@@ -66,10 +68,13 @@ fn any_component_starts_with(path: &Path, prefix: &str) -> bool {
 pub fn classify_path(path: &Path) -> GhostKind {
     let path_str = path.to_string_lossy();
     let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+    // One component slice per entry feeds every rule; the segment helpers take
+    // it so classification allocates once, not per rule (review round 1).
+    let components: Vec<Component<'_>> = path.components().collect();
 
     // 1. Wastebin / Trash locations (FreeDesktop & mount-point wastebins)
-    if contains_segments(path, &[".local", "share", "Trash"])
-        || contains_segments(path, &[".Trash"])
+    if contains_segments(&components, &[".local", "share", "Trash"])
+        || contains_segments(&components, &[".Trash"])
         || any_component_starts_with(path, ".Trash-")
         || file_name == ".Trash"
         || file_name == ".Trashes"
@@ -78,67 +83,67 @@ pub fn classify_path(path: &Path) -> GhostKind {
     }
 
     // 2. Crash Dumps & Coredumps
-    if starts_with_segments(path, &["var", "lib", "systemd", "coredump"])
-        || starts_with_segments(path, &["var", "crash"])
+    if starts_with_segments(&components, &["var", "lib", "systemd", "coredump"])
+        || starts_with_segments(&components, &["var", "crash"])
         || file_name.ends_with(".coredump")
-        || (file_name.starts_with("core.") && starts_with_segments(path, &["var"]))
+        || (file_name.starts_with("core.") && starts_with_segments(&components, &["var"]))
     {
         return GhostKind::CoreDump;
     }
 
     // 3. System Snapshots (Timeshift, Snapper)
-    if starts_with_segments(path, &["run", "timeshift", "backup"])
-        || starts_with_segments(path, &["timeshift", "snapshots"])
-        || starts_with_segments(path, &["timeshift"])
-        || contains_segments(path, &[".snapshots"])
+    if starts_with_segments(&components, &["run", "timeshift", "backup"])
+        || starts_with_segments(&components, &["timeshift", "snapshots"])
+        || starts_with_segments(&components, &["timeshift"])
+        || contains_segments(&components, &[".snapshots"])
         || file_name == ".snapshots"
     {
         return GhostKind::SystemSnapshot;
     }
 
     // 4. Docker system locations
-    if starts_with_segments(path, &["var", "lib", "docker", "overlay2"]) {
+    if starts_with_segments(&components, &["var", "lib", "docker", "overlay2"]) {
         return GhostKind::DockerOverlay;
     }
-    if starts_with_segments(path, &["var", "lib", "docker", "volumes"]) {
+    if starts_with_segments(&components, &["var", "lib", "docker", "volumes"]) {
         return GhostKind::DockerVolume;
     }
-    if starts_with_segments(path, &["var", "lib", "docker", "containers"]) {
+    if starts_with_segments(&components, &["var", "lib", "docker", "containers"]) {
         return GhostKind::DockerContainer;
     }
-    if starts_with_segments(path, &["var", "lib", "docker", "buildkit"]) {
+    if starts_with_segments(&components, &["var", "lib", "docker", "buildkit"]) {
         return GhostKind::DockerBuildkit;
     }
     // The daemon socket is a file named `docker.sock` directly under /var/run,
     // so the last segment matches by prefix rather than by exact component.
-    if starts_with_segments(path, &["var", "lib", "docker"])
-        || (starts_with_segments(path, &["var", "run"]) && path_str.contains("/docker"))
+    if starts_with_segments(&components, &["var", "lib", "docker"])
+        || (starts_with_segments(&components, &["var", "run"]) && path_str.contains("/docker"))
     {
         return GhostKind::DockerUser;
     }
 
     // 5. User-space Docker & Podman
-    if contains_segments(path, &[".local", "share", "docker"])
-        || contains_segments(path, &[".docker"])
+    if contains_segments(&components, &[".local", "share", "docker"])
+        || contains_segments(&components, &[".docker"])
     {
         return GhostKind::DockerUser;
     }
-    if contains_segments(path, &[".local", "share", "containers"])
-        || contains_segments(path, &[".config", "containers"])
+    if contains_segments(&components, &[".local", "share", "containers"])
+        || contains_segments(&components, &[".config", "containers"])
     {
         return GhostKind::PodmanUser;
     }
 
     // 6. Flatpak & Snap runtimes and app data
-    if starts_with_segments(path, &["var", "lib", "flatpak"])
-        || contains_segments(path, &[".var", "app"])
+    if starts_with_segments(&components, &["var", "lib", "flatpak"])
+        || contains_segments(&components, &[".var", "app"])
         || file_name == ".var"
-        || contains_segments(path, &[".local", "share", "flatpak"])
+        || contains_segments(&components, &[".local", "share", "flatpak"])
     {
         return GhostKind::Flatpak;
     }
-    if starts_with_segments(path, &["var", "lib", "snapd"])
-        || contains_segments(path, &["snap"])
+    if starts_with_segments(&components, &["var", "lib", "snapd"])
+        || contains_segments(&components, &["snap"])
         || path_str.ends_with("/snap")
         || (file_name == "snap" && path_str.contains("/home/"))
     {
@@ -146,9 +151,9 @@ pub fn classify_path(path: &Path) -> GhostKind {
     }
 
     // 7. Virtualization disks and ISO images
-    if starts_with_segments(path, &["var", "lib", "libvirt", "images"])
-        || contains_segments(path, &["VirtualBox VMs"])
-        || contains_segments(path, &[".vagrant.d", "boxes"])
+    if starts_with_segments(&components, &["var", "lib", "libvirt", "images"])
+        || contains_segments(&components, &["VirtualBox VMs"])
+        || contains_segments(&components, &[".vagrant.d", "boxes"])
     {
         return GhostKind::VmOrIso;
     }
@@ -163,11 +168,11 @@ pub fn classify_path(path: &Path) -> GhostKind {
     }
 
     // 8. AI & Machine Learning Models / Weights
-    if contains_segments(path, &[".ollama", "models"])
-        || contains_segments(path, &["ollama", ".ollama", "models"])
-        || contains_segments(path, &["huggingface", "hub"])
-        || contains_segments(path, &[".cache", "torch", "hub"])
-        || contains_segments(path, &[".cache", "torch", "checkpoints"])
+    if contains_segments(&components, &[".ollama", "models"])
+        || contains_segments(&components, &["ollama", ".ollama", "models"])
+        || contains_segments(&components, &["huggingface", "hub"])
+        || contains_segments(&components, &[".cache", "torch", "hub"])
+        || contains_segments(&components, &[".cache", "torch", "checkpoints"])
     {
         return GhostKind::AiModel;
     }
@@ -178,44 +183,44 @@ pub fn classify_path(path: &Path) -> GhostKind {
     }
 
     // 9. Gaming compat, Steam shader caches, Proton & Wine
-    if contains_segments(path, &["steamapps", "shadercache"])
-        || contains_segments(path, &["steamapps", "compatdata"])
-        || contains_segments(path, &[".wine"])
+    if contains_segments(&components, &["steamapps", "shadercache"])
+        || contains_segments(&components, &["steamapps", "compatdata"])
+        || contains_segments(&components, &[".wine"])
         || file_name == ".wine"
         || file_name == ".wine32"
         || file_name == ".wine64"
-        || contains_segments(path, &[".local", "share", "lutris", "runners"])
-        || contains_segments(path, &[".local", "share", "lutris", "pfx"])
-        || contains_segments(path, &["heroic", "tools"])
-        || contains_segments(path, &["heroic", "prefixes"])
+        || contains_segments(&components, &[".local", "share", "lutris", "runners"])
+        || contains_segments(&components, &[".local", "share", "lutris", "pfx"])
+        || contains_segments(&components, &["heroic", "tools"])
+        || contains_segments(&components, &["heroic", "prefixes"])
     {
         return GhostKind::GamingCompat;
     }
 
     // 10. Web Browser & Electron app caches (MUST be evaluated before general .cache)
-    if contains_segments(path, &[".cache", "google-chrome"])
-        || contains_segments(path, &[".cache", "chromium"])
-        || contains_segments(path, &[".cache", "BraveSoftware"])
-        || contains_segments(path, &[".cache", "mozilla", "firefox"])
-        || contains_segments(path, &[".cache", "microsoft-edge"])
-        || contains_segments(path, &[".cache", "opera"])
-        || contains_segments(path, &[".cache", "vivaldi"])
-        || contains_segments(path, &["discord", "Cache"])
-        || contains_segments(path, &["discord", "Code Cache"])
-        || contains_segments(path, &["Slack", "Cache"])
-        || contains_segments(path, &["Slack", "Code Cache"])
-        || contains_segments(path, &["Code", "Cache"])
-        || contains_segments(path, &["Code", "CachedData"])
+    if contains_segments(&components, &[".cache", "google-chrome"])
+        || contains_segments(&components, &[".cache", "chromium"])
+        || contains_segments(&components, &[".cache", "BraveSoftware"])
+        || contains_segments(&components, &[".cache", "mozilla", "firefox"])
+        || contains_segments(&components, &[".cache", "microsoft-edge"])
+        || contains_segments(&components, &[".cache", "opera"])
+        || contains_segments(&components, &[".cache", "vivaldi"])
+        || contains_segments(&components, &["discord", "Cache"])
+        || contains_segments(&components, &["discord", "Code Cache"])
+        || contains_segments(&components, &["Slack", "Cache"])
+        || contains_segments(&components, &["Slack", "Code Cache"])
+        || contains_segments(&components, &["Code", "Cache"])
+        || contains_segments(&components, &["Code", "CachedData"])
     {
         return GhostKind::BrowserCache;
     }
 
     // 11. System & App Logs (require directory context or recognizable log extensions)
-    if starts_with_segments(path, &["var", "log"])
-        || contains_segments(path, &[".npm", "_logs"])
-        || (contains_segments(path, &[".local", "state"])
+    if starts_with_segments(&components, &["var", "log"])
+        || contains_segments(&components, &[".npm", "_logs"])
+        || (contains_segments(&components, &[".local", "state"])
             && (file_name.eq_ignore_ascii_case("log") || file_name.eq_ignore_ascii_case("logs")))
-        || (file_name.eq_ignore_ascii_case("journal") && contains_segments(path, &["log"]))
+        || (file_name.eq_ignore_ascii_case("journal") && contains_segments(&components, &["log"]))
         || has_suffix_ignore_ascii_case(file_name, ".log")
         || has_suffix_ignore_ascii_case(file_name, ".log.gz")
         || has_suffix_ignore_ascii_case(file_name, ".log.1")
@@ -229,22 +234,22 @@ pub fn classify_path(path: &Path) -> GhostKind {
     if matches!(
         file_name,
         "node_modules" | "vendor" | ".venv" | "venv" | "site-packages" | "dist-packages"
-    ) || contains_segments(path, &["node_modules"])
-        || contains_segments(path, &[".venv"])
-        || contains_segments(path, &["venv"])
-        || contains_segments(path, &["vendor"])
-        || contains_segments(path, &["site-packages"])
-        || contains_segments(path, &["dist-packages"])
+    ) || contains_segments(&components, &["node_modules"])
+        || contains_segments(&components, &[".venv"])
+        || contains_segments(&components, &["venv"])
+        || contains_segments(&components, &["vendor"])
+        || contains_segments(&components, &["site-packages"])
+        || contains_segments(&components, &["dist-packages"])
     {
         return GhostKind::DependencyTree;
     }
 
     // 13. Package manager caches (Arch pacman, apt, dnf, AUR helpers)
-    if starts_with_segments(path, &["var", "cache", "pacman", "pkg"])
-        || starts_with_segments(path, &["var", "cache", "apt", "archives"])
-        || starts_with_segments(path, &["var", "cache", "dnf"])
-        || contains_segments(path, &[".cache", "yay"])
-        || contains_segments(path, &[".cache", "paru"])
+    if starts_with_segments(&components, &["var", "cache", "pacman", "pkg"])
+        || starts_with_segments(&components, &["var", "cache", "apt", "archives"])
+        || starts_with_segments(&components, &["var", "cache", "dnf"])
+        || contains_segments(&components, &[".cache", "yay"])
+        || contains_segments(&components, &[".cache", "paru"])
     {
         return GhostKind::PackageCache;
     }
@@ -267,17 +272,17 @@ pub fn classify_path(path: &Path) -> GhostKind {
             | "ccache"
     ) || path_str.ends_with("/.cargo/registry")
         || path_str.ends_with("/.cargo/git")
-        || contains_segments(path, &["__pycache__"])
-        || contains_segments(path, &[".pytest_cache"])
-        || contains_segments(path, &[".next"])
-        || contains_segments(path, &[".nuxt"])
-        || contains_segments(path, &[".turbo"])
-        || contains_segments(path, &[".gradle"])
-        || contains_segments(path, &[".cargo", "registry"])
-        || contains_segments(path, &[".cargo", "git"])
-        || contains_segments(path, &["go-build"])
-        || contains_segments(path, &[".mypy_cache"])
-        || contains_segments(path, &[".ruff_cache"])
+        || contains_segments(&components, &["__pycache__"])
+        || contains_segments(&components, &[".pytest_cache"])
+        || contains_segments(&components, &[".next"])
+        || contains_segments(&components, &[".nuxt"])
+        || contains_segments(&components, &[".turbo"])
+        || contains_segments(&components, &[".gradle"])
+        || contains_segments(&components, &[".cargo", "registry"])
+        || contains_segments(&components, &[".cargo", "git"])
+        || contains_segments(&components, &["go-build"])
+        || contains_segments(&components, &[".mypy_cache"])
+        || contains_segments(&components, &[".ruff_cache"])
     {
         return GhostKind::BuildCache;
     }
@@ -350,6 +355,7 @@ pub fn classify_safety(path: &Path, ghost: GhostKind) -> DeleteSafety {
         || p == "/etc"
         || p == "/lib"
         || p == "/lib64"
+        || p == "/lib32"
         || p == "/usr"
         || p == "/usr/bin"
         || p == "/usr/sbin"
@@ -840,28 +846,42 @@ mod tests {
 
     #[test]
     fn segment_helpers_are_component_exact() {
+        fn components_of(path: &Path) -> Vec<Component<'_>> {
+            path.components().collect()
+        }
         assert!(starts_with_segments(
-            Path::new("/var/log/journal"),
+            &components_of(Path::new("/var/log/journal")),
             &["var", "log"]
         ));
         assert!(!starts_with_segments(
-            Path::new("/home/u/var/log"),
+            &components_of(Path::new("/home/u/var/log")),
             &["var", "log"]
         ));
-        assert!(!starts_with_segments(Path::new("var/log"), &["var", "log"]));
+        assert!(!starts_with_segments(
+            &components_of(Path::new("var/log")),
+            &["var", "log"]
+        ));
         assert!(contains_segments(
-            Path::new("/home/u/.local/share/Trash/files"),
+            &components_of(Path::new("/home/u/.local/share/Trash/files")),
             &[".local", "share", "Trash"]
         ));
         assert!(!contains_segments(
-            Path::new("/home/u/myvar/lib/docker"),
+            &components_of(Path::new("/home/u/myvar/lib/docker")),
             &["var", "lib", "docker"]
         ));
         assert!(!contains_segments(
-            Path::new("/home/u/.docker-backup"),
+            &components_of(Path::new("/home/u/.docker-backup")),
             &[".docker"]
         ));
-        assert!(!contains_segments(Path::new("/var/log"), &[]));
+        assert!(!contains_segments(
+            &components_of(Path::new("/var/log")),
+            &[]
+        ));
+        // Relative paths (snapshot imports) classify on their components too.
+        assert!(contains_segments(
+            &components_of(Path::new("u/.cache/pip")),
+            &[".cache", "pip"]
+        ));
         assert!(any_component_starts_with(
             Path::new("/mnt/storage/.Trash-1000/x"),
             ".Trash-"
@@ -878,11 +898,18 @@ mod tests {
     /// closes the classification itself.
     #[test]
     fn system_dir_contents_are_blocked_regardless_of_usr_merge() {
-        for path in ["/bin/ls", "/sbin/fsck.ext4", "/lib32/libc.so.6"] {
+        for path in [
+            "/bin",
+            "/sbin",
+            "/lib32",
+            "/bin/ls",
+            "/sbin/fsck.ext4",
+            "/lib32/libc.so.6",
+        ] {
             assert_eq!(
                 classify_safety(Path::new(path), GhostKind::None),
                 DeleteSafety::System,
-                "{path} contents must be System"
+                "{path} must be System"
             );
         }
     }
