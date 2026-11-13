@@ -430,6 +430,15 @@ pub fn classify_safety(path: &Path, ghost: GhostKind) -> DeleteSafety {
         return DeleteSafety::System;
     }
 
+    // The home cache root carries the CACHE badge, but sweeping the whole
+    // cache home can take files the classifier itself calls UserData
+    // individually (e.g. `.cache/personal/notes.txt`) — so the root is
+    // Recheck, like the /var/log container, while well-known units beneath
+    // it stay Safe (review round 5, Qodo finding c0643b8e).
+    if ghost == GhostKind::BuildCache && is_home_cache_root(path) {
+        return DeleteSafety::Recheck;
+    }
+
     // 2. Safe to remove (Caches, Trashes, Crash Dumps, Rotated Logs, Ephemeral Caches)
     match ghost {
         GhostKind::Trash
@@ -1072,8 +1081,18 @@ mod tests {
             classify_path(&PathBuf::from("/home/ron/.cache/personal/notes.txt")),
             GhostKind::None
         );
+        // The cache home root is Recheck: its sweep can take individually-
+        // UserData files, so it wants the second confirmation (round 5).
         assert_eq!(
             classify_safety(&PathBuf::from("/home/ron/.cache"), GhostKind::BuildCache),
+            DeleteSafety::Recheck
+        );
+        // Well-known units beneath it stay one-key Safe.
+        assert_eq!(
+            classify_safety(
+                &PathBuf::from("/home/ron/.cache/pip"),
+                GhostKind::BuildCache
+            ),
             DeleteSafety::Safe
         );
     }

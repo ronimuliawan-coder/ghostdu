@@ -60,7 +60,7 @@ fn trash_with_destination_impl<P: AsRef<Path>>(
     verify: impl Fn(&Path, &File) -> io::Result<()>,
     mut resolve: impl FnMut(&File) -> io::Result<(File, Option<PathBuf>)>,
     mount_roots: io::Result<HashMap<PathBuf, PathBuf>>,
-    protected: Vec<(&'static str, u64, u64)>,
+    protected: Vec<(PathBuf, u64, u64)>,
 ) -> TrashResult {
     let mut result = TrashResult::default();
     // One mountinfo read per batch (review round 1, Qodo finding 6), matching

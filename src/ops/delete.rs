@@ -46,7 +46,7 @@ fn delete_with_verification_impl<P: AsRef<Path>>(
     paths: &[P],
     verify: impl Fn(&Path, &File) -> io::Result<()>,
     mount_roots: io::Result<HashMap<PathBuf, PathBuf>>,
-    protected: Vec<(&'static str, u64, u64)>,
+    protected: Vec<(PathBuf, u64, u64)>,
 ) -> DeleteResult {
     let mut result = DeleteResult::default();
     // One mountinfo read per batch (review round 1, Qodo finding 6): a bind
@@ -90,7 +90,7 @@ pub(super) fn read_mount_roots() -> io::Result<HashMap<PathBuf, PathBuf>> {
 pub(super) fn prepare_target_with_mount_roots(
     path: &Path,
     mount_roots: &HashMap<PathBuf, PathBuf>,
-    protected: &[(&'static str, u64, u64)],
+    protected: &[(PathBuf, u64, u64)],
 ) -> io::Result<(File, CString, File)> {
     check_safety(path)?;
     let name = path
@@ -128,7 +128,8 @@ pub(super) fn prepare_target_with_mount_roots(
     Ok((parent, name, target))
 }
 
-/// `(path, dev, ino)` of the exact-name System roots in `classify_safety`'s
+/// `(canonical path, dev, ino)` of the exact-name System roots in
+/// `classify_safety`'s
 /// first block, with three deliberate exclusions. `/tmp` and `/var/tmp`: their
 /// children are deliberately deletable temp files, so no identity test can
 /// separate a `/tmp` alias from legitimate `/tmp` children — and the harm of
@@ -145,7 +146,7 @@ pub(super) fn prepare_target_with_mount_roots(
 /// round 3, Qodo finding 83104618). Missing paths (container images without
 /// /sys, /run, …) are skipped; the ~21 stats per batch are negligible next to
 /// the mountinfo read.
-pub(super) fn protected_dir_identities() -> Vec<(&'static str, u64, u64)> {
+pub(super) fn protected_dir_identities() -> Vec<(PathBuf, u64, u64)> {
     [
         "/bin",
         "/sbin",
@@ -170,7 +171,19 @@ pub(super) fn protected_dir_identities() -> Vec<(&'static str, u64, u64)> {
         "/var/lib/systemd",
     ]
     .iter()
-    .filter_map(|path| fs::metadata(path).ok().map(|m| (*path, m.dev(), m.ino())))
+    .filter_map(|path| {
+        // Canonicalize so symlinked protected paths pair with the identity of
+        // where they actually live: ostree's `/root` → `/var/roothome` must
+        // exempt deletions beneath `/var/roothome`, not treat its own real
+        // location as an alias of `/root` (review round 5, Qodo finding
+        // db45fd0e). Missing paths (container images without /sys, /run, …)
+        // are skipped.
+        fs::canonicalize(path).ok().and_then(|canonical| {
+            fs::metadata(path)
+                .ok()
+                .map(|m| (canonical, m.dev(), m.ino()))
+        })
+    })
     .collect()
 }
 
@@ -183,7 +196,7 @@ pub(super) fn protected_dir_identities() -> Vec<(&'static str, u64, u64)> {
 /// bind alias of a protected *subdirectory* (e.g. `/etc/ssh` mounted
 /// elsewhere) has an ordinary inode and stays reachable under `cross_mounts`
 /// scans; closing that needs mountinfo source tracking.
-fn reject_protected_alias(target: &File, protected: &[(&'static str, u64, u64)]) -> io::Result<()> {
+fn reject_protected_alias(target: &File, protected: &[(PathBuf, u64, u64)]) -> io::Result<()> {
     let metadata = target.metadata()?;
     let identity = (metadata.dev(), metadata.ino());
     if protected
@@ -237,7 +250,7 @@ fn check_safety(path: &Path) -> io::Result<()> {
 fn check_not_under_protected_mount_alias(
     canonical_parent: &Path,
     mount_roots: &HashMap<PathBuf, PathBuf>,
-    protected: &[(&'static str, u64, u64)],
+    protected: &[(PathBuf, u64, u64)],
 ) -> io::Result<()> {
     let mut current = Some(canonical_parent);
     while let Some(path) = current {
@@ -264,17 +277,17 @@ fn ancestor_blocks(
     path: &Path,
     identity: (u64, u64),
     mount_roots: &HashMap<PathBuf, PathBuf>,
-    protected: &[(&'static str, u64, u64)],
+    protected: &[(PathBuf, u64, u64)],
 ) -> bool {
     protected.iter().any(|(protected_path, dev, ino)| {
         if identity != (*dev, *ino) {
             return false;
         }
-        let protected = Path::new(protected_path);
         // The protected directory's own location — and its natural ancestors,
         // when it is itself a mount, like Fedora's `/root` subvolume mounted
-        // at `/` — never alias it.
-        if path == protected || protected.starts_with(path) {
+        // at `/` — never alias it. The stored path is canonical, so a
+        // symlinked protected path exempts its real target too (round 5).
+        if path == protected_path || protected_path.starts_with(path) {
             return false;
         }
         match mount_roots.get(path) {
@@ -284,7 +297,7 @@ fn ancestor_blocks(
             // != "/" exemption skipped exactly those aliases. Decide by
             // fs-root equality alone.
             Some(fs_root) => mount_roots
-                .get(protected)
+                .get(protected_path.as_path())
                 .is_none_or(|protected_root| protected_root == fs_root),
             // Qodo round 4 (43bdcc3a): btrfs assigns each subvolume its own
             // anonymous st_dev (numdevs=many, the default), so an identity
@@ -401,7 +414,7 @@ mod tests {
         fs::write(&file, "x").unwrap();
         let handle = File::open(&file).unwrap();
         let metadata = handle.metadata().unwrap();
-        let protected = [("/etc", metadata.dev(), metadata.ino())];
+        let protected = [(PathBuf::from("/etc"), metadata.dev(), metadata.ino())];
         let error = reject_protected_alias(&handle, &protected).unwrap_err();
         assert!(error.to_string().contains("bind-mount alias"));
     }
@@ -430,7 +443,7 @@ mod tests {
         let alias = fixture.path().join("etc-alias");
         fs::create_dir_all(&alias).unwrap();
         let metadata = fs::metadata(&alias).unwrap();
-        let protected = [("/etc", metadata.dev(), metadata.ino())];
+        let protected = [(PathBuf::from("/etc"), metadata.dev(), metadata.ino())];
         let mountinfo = format!(
             "23 0 253:0 / / rw,relatime - ext4 /dev/root\n42 23 253:0 /etc {} rw - ext4 /dev/root\n36 23 0:41 / /tmp rw - tmpfs tmpfs\n",
             alias.display()
@@ -462,7 +475,7 @@ mod tests {
             alias.display()
         );
         let metadata = fs::metadata(&alias).unwrap();
-        let protected = [("/etc", metadata.dev(), metadata.ino())];
+        let protected = [(PathBuf::from("/etc"), metadata.dev(), metadata.ino())];
         let error =
             check_not_under_protected_mount_alias(&alias, &parse_roots(&mountinfo), &protected)
                 .unwrap_err();
@@ -480,7 +493,7 @@ mod tests {
         let alias = fixture.path().join("rootalias/etc");
         fs::create_dir_all(&alias).unwrap();
         let metadata = fs::metadata(&alias).unwrap();
-        let protected = [("/etc", metadata.dev(), metadata.ino())];
+        let protected = [(PathBuf::from("/etc"), metadata.dev(), metadata.ino())];
         // Whole-fs style mountinfo: every mount carries fs-root `/`, so the
         // plain-directory arm is the only one that can fire.
         let mountinfo =
@@ -504,7 +517,7 @@ mod tests {
         let log_mount = fixture.path().join("log");
         fs::create_dir_all(&log_mount).unwrap();
         let metadata = fs::metadata(&fixture).unwrap();
-        let protected = [("/var/cache", metadata.dev(), metadata.ino())];
+        let protected = [(PathBuf::from("/var/cache"), metadata.dev(), metadata.ino())];
         // Different fs-roots: collision, not alias — allowed.
         let distinct = format!(
             "23 0 253:0 /@log {} rw - btrfs /dev/root\n24 23 253:0 /@cache /var/cache rw - btrfs /dev/root\n",
@@ -538,7 +551,7 @@ mod tests {
         // Register the alias directory's identity as the host's /boot: the
         // alias IS the same directory through the bind.
         let metadata = fs::metadata(&alias).unwrap();
-        let protected = [("/boot", metadata.dev(), metadata.ino())];
+        let protected = [(PathBuf::from("/boot"), metadata.dev(), metadata.ino())];
         let mountinfo = format!(
             "23 0 253:0 / {} rw - ext4 /dev/root\n42 23 253:0 / {} rw - ext4 /dev/root\n",
             natural.display(),
@@ -564,22 +577,63 @@ mod tests {
             Path::new("/mnt/btrfs-root/@var"),
             (253, 256),
             &empty,
-            &[("/var", 253, 256)],
+            &[(PathBuf::from("/var"), 253, 256)],
         ));
         // A regular protected directory reached through a whole-fs bind.
         assert!(ancestor_blocks(
             Path::new("/host/etc"),
             (253, 3011),
             &empty,
-            &[("/etc", 253, 3011)],
+            &[(PathBuf::from("/etc"), 253, 3011)],
         ));
         // Identity mismatch never blocks.
         assert!(!ancestor_blocks(
             Path::new("/host/etc"),
             (253, 9999),
             &empty,
-            &[("/etc", 253, 3011)],
+            &[(PathBuf::from("/etc"), 253, 3011)],
         ));
+    }
+
+    /// Qodo round 5 (db45fd0e): a symlinked protected path (ostree's `/root`
+    /// → `/var/roothome`) pairs the identity with the canonical target, so
+    /// deletions beneath the real location are exempt, not alias-blocked.
+    #[test]
+    fn symlinked_protected_path_exempts_its_real_target() {
+        let fixture = tempfile::tempdir().unwrap();
+        let roothome = fixture.path().join("roothome");
+        fs::create_dir_all(&roothome).unwrap();
+        let link = fixture.path().join("rootlink");
+        symlink(&roothome, &link).unwrap();
+        // The canonical path is what the identity list stores now.
+        let canonical = fs::canonicalize(&link).unwrap();
+        let metadata = fs::metadata(&canonical).unwrap();
+        let protected = [(canonical.clone(), metadata.dev(), metadata.ino())];
+        let mountinfo = format!(
+            "23 0 253:0 /@ / rw,relatime - btrfs /dev/root\n42 23 253:0 /@/var {} rw,relatime - btrfs /dev/root\n",
+            roothome.display()
+        );
+        // Deletion beneath the symlink target's real location must work.
+        let child = roothome.join("cache-home/notes");
+        fs::create_dir_all(&child).unwrap();
+        check_not_under_protected_mount_alias(&child, &parse_roots(&mountinfo), &protected)
+            .unwrap();
+        // A different path carrying the same identity is still an alias.
+        let alias = fixture.path().join("var-alias");
+        fs::create_dir_all(&alias).unwrap();
+        let alias_meta = fs::metadata(&alias).unwrap();
+        let alias_protected = [(canonical, alias_meta.dev(), alias_meta.ino())];
+        let alias_mountinfo = format!(
+            "23 0 253:0 /@ / rw,relatime - btrfs /dev/root\n42 23 253:0 /@/root {} rw - btrfs /dev/root\n",
+            alias.display()
+        );
+        let error = check_not_under_protected_mount_alias(
+            &alias,
+            &parse_roots(&alias_mountinfo),
+            &alias_protected,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("bind mount"));
     }
 
     /// Qodo finding 3: a protected directory mounted at its normal location —
@@ -590,7 +644,7 @@ mod tests {
         // /var exists on every Linux host; give its real identity to the guard
         // and mount it (per the synthetic mountinfo) at exactly that path.
         let metadata = fs::metadata("/var").unwrap();
-        let protected = [("/var", metadata.dev(), metadata.ino())];
+        let protected = [(PathBuf::from("/var"), metadata.dev(), metadata.ino())];
         let mountinfo = "23 0 253:0 /@ / rw,relatime - btrfs /dev/root\n42 23 253:0 /@/var /var rw,relatime - btrfs /dev/root\n44 23 253:0 /@/var/log /var/log rw,relatime - btrfs /dev/root\n";
         let roots = parse_roots(mountinfo);
         // Cleanup beneath the natural /var mount must work (log is a nested
@@ -602,7 +656,7 @@ mod tests {
         let alias = fixture.path().join("var-alias");
         fs::create_dir_all(&alias).unwrap();
         let alias_meta = fs::metadata(&alias).unwrap();
-        let alias_protected = [("/var", alias_meta.dev(), alias_meta.ino())];
+        let alias_protected = [(PathBuf::from("/var"), alias_meta.dev(), alias_meta.ino())];
         let alias_mountinfo = format!(
             "23 0 253:0 /@ / rw,relatime - btrfs /dev/root\n42 23 253:0 /@/var {} rw - btrfs /dev/root\n",
             alias.display()
@@ -629,8 +683,8 @@ mod tests {
         // Even with /root's real identity registered, the root mount and the
         // subpath home mount must not block: their paths are not aliases.
         let root_meta = fs::metadata("/root");
-        let protected: Vec<(&'static str, u64, u64)> = match root_meta {
-            Ok(meta) => vec![("/root", meta.dev(), meta.ino())],
+        let protected: Vec<(PathBuf, u64, u64)> = match root_meta {
+            Ok(meta) => vec![(PathBuf::from("/root"), meta.dev(), meta.ino())],
             Err(_) => vec![],
         };
         check_not_under_protected_mount_alias(fixture.path(), &parse_roots(&mountinfo), &protected)
