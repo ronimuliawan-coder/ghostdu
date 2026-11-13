@@ -463,6 +463,23 @@ pub(crate) fn parse_mount_points(mountinfo: &[u8]) -> HashSet<PathBuf> {
         .collect()
 }
 
+/// Mount point -> root of the mount within its filesystem (mountinfo field 3),
+/// e.g. a bind of `/etc` mounted at `/mnt/alias` maps `/mnt/alias` -> `/etc`,
+/// while a whole-filesystem mount maps its point -> `/`. Lets the deletion
+/// guardrail recognize bind aliases of protected trees regardless of the path
+/// string they hide behind.
+pub(crate) fn parse_mount_roots(mountinfo: &[u8]) -> HashMap<PathBuf, PathBuf> {
+    mountinfo
+        .split(|&b| b == b'\n')
+        .filter_map(|line| {
+            let mut fields = line.split(|&b| b == b' ');
+            let root = fields.nth(3)?;
+            let point = fields.next()?;
+            Some((decode_mount_path(point), decode_mount_path(root)))
+        })
+        .collect()
+}
+
 /// Decodes mountinfo octal escapes (`\040` -> space, etc.); unknown or
 /// truncated sequences stay literal so parsing never fails on odd kernels.
 fn decode_mount_path(field: &[u8]) -> PathBuf {
@@ -551,6 +568,20 @@ mod tests {
         assert!(mounts.contains(&PathBuf::from(OsString::from_vec(
             b"/a b\tc\nd\\e\xff".to_vec()
         ))));
+    }
+
+    #[test]
+    fn mount_roots_map_mount_point_to_fs_root() {
+        let roots = parse_mount_roots(
+            b"23 0 253:0 / / rw,relatime - ext4 /dev/root\n42 23 253:0 /etc /mnt/alias\\040dir rw - ext4 /dev/root\n36 23 0:41 / /tmp rw - tmpfs tmpfs\n",
+        );
+        assert_eq!(roots.get(Path::new("/")), Some(&PathBuf::from("/")));
+        assert_eq!(
+            roots.get(Path::new("/mnt/alias dir")),
+            Some(&PathBuf::from("/etc"))
+        );
+        assert_eq!(roots.get(Path::new("/tmp")), Some(&PathBuf::from("/")));
+        assert_eq!(roots.get(Path::new("/mnt/alias")), None);
     }
 }
 
