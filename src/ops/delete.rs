@@ -10,7 +10,6 @@ use std::os::fd::AsRawFd;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
 
 #[derive(Debug, Default)]
 pub struct DeleteResult {
@@ -35,13 +34,19 @@ fn delete_with_verification<P: AsRef<Path>>(
     paths: &[P],
     verify: impl Fn(&Path, &File) -> io::Result<()>,
 ) -> DeleteResult {
-    delete_with_verification_impl(paths, verify, read_mount_roots())
+    delete_with_verification_impl(
+        paths,
+        verify,
+        read_mount_roots(),
+        protected_dir_identities(),
+    )
 }
 
 fn delete_with_verification_impl<P: AsRef<Path>>(
     paths: &[P],
     verify: impl Fn(&Path, &File) -> io::Result<()>,
     mount_roots: io::Result<HashMap<PathBuf, PathBuf>>,
+    protected: Vec<(&'static str, u64, u64)>,
 ) -> DeleteResult {
     let mut result = DeleteResult::default();
     // One mountinfo read per batch (review round 1, Qodo finding 6): a bind
@@ -60,7 +65,7 @@ fn delete_with_verification_impl<P: AsRef<Path>>(
     };
     for path in paths {
         let path = path.as_ref();
-        let removal = prepare_target_with_mount_roots(path, &mount_roots).and_then(
+        let removal = prepare_target_with_mount_roots(path, &mount_roots, &protected).and_then(
             |(parent, name, target)| {
                 verify(path, &target)?;
                 // Reject existing mounts/unreadable subtrees before mutating anything.
@@ -85,6 +90,7 @@ pub(super) fn read_mount_roots() -> io::Result<HashMap<PathBuf, PathBuf>> {
 pub(super) fn prepare_target_with_mount_roots(
     path: &Path,
     mount_roots: &HashMap<PathBuf, PathBuf>,
+    protected: &[(&'static str, u64, u64)],
 ) -> io::Result<(File, CString, File)> {
     check_safety(path)?;
     let name = path
@@ -115,14 +121,10 @@ pub(super) fn prepare_target_with_mount_roots(
         .ok_or(io::Error::other(
             "Target parent changed during verification",
         ))?;
-    check_not_under_protected_mount_alias(
-        &canonical_parent,
-        mount_roots,
-        protected_dir_identities(),
-    )?;
+    check_not_under_protected_mount_alias(&canonical_parent, mount_roots, protected)?;
     check_safety(&pinned_path.join(std::ffi::OsStr::from_bytes(name.to_bytes())))?;
     let target = open_child(&parent, &name)?;
-    reject_protected_alias(&target, protected_dir_identities())?;
+    reject_protected_alias(&target, protected)?;
     Ok((parent, name, target))
 }
 
@@ -135,38 +137,39 @@ pub(super) fn prepare_target_with_mount_roots(
 /// with unrelated subvolume mounts (`/home`, `/var/cache`, …); the root itself
 /// stays string-blocked. The path travels with the identity so a protected
 /// directory mounted at its normal location can be told apart from an alias
-/// of it (review round 1, Qodo finding 3). Captured lazily per process;
-/// missing paths (container images without /sys, /run, …) are skipped.
-fn protected_dir_identities() -> &'static [(&'static str, u64, u64)] {
-    static IDENTITIES: OnceLock<Vec<(&'static str, u64, u64)>> = OnceLock::new();
-    IDENTITIES.get_or_init(|| {
-        [
-            "/bin",
-            "/sbin",
-            "/lib32",
-            "/boot",
-            "/etc",
-            "/lib",
-            "/lib64",
-            "/usr",
-            "/usr/bin",
-            "/usr/sbin",
-            "/usr/lib",
-            "/usr/lib64",
-            "/usr/include",
-            "/sys",
-            "/proc",
-            "/dev",
-            "/run",
-            "/root",
-            "/var",
-            "/var/lib",
-            "/var/lib/systemd",
-        ]
-        .iter()
-        .filter_map(|path| fs::metadata(path).ok().map(|m| (*path, m.dev(), m.ino())))
-        .collect()
-    })
+/// of it (review round 1, Qodo finding 3). Captured **per batch** alongside
+/// the mount snapshot: a protected root mounted after an earlier batch —
+/// `/boot` appearing mid-session — must be recognized by later ones (review
+/// round 3, Qodo finding 83104618). Missing paths (container images without
+/// /sys, /run, …) are skipped; the ~21 stats per batch are negligible next to
+/// the mountinfo read.
+pub(super) fn protected_dir_identities() -> Vec<(&'static str, u64, u64)> {
+    [
+        "/bin",
+        "/sbin",
+        "/lib32",
+        "/boot",
+        "/etc",
+        "/lib",
+        "/lib64",
+        "/usr",
+        "/usr/bin",
+        "/usr/sbin",
+        "/usr/lib",
+        "/usr/lib64",
+        "/usr/include",
+        "/sys",
+        "/proc",
+        "/dev",
+        "/run",
+        "/root",
+        "/var",
+        "/var/lib",
+        "/var/lib/systemd",
+    ]
+    .iter()
+    .filter_map(|path| fs::metadata(path).ok().map(|m| (*path, m.dev(), m.ino())))
+    .collect()
 }
 
 /// String guardrails classify paths; a bind-mount alias of a protected
@@ -235,31 +238,12 @@ fn check_not_under_protected_mount_alias(
     let mut current = Some(canonical_parent);
     while let Some(path) = current {
         if let Ok(metadata) = fs::metadata(path) {
-            let identity = (metadata.dev(), metadata.ino());
-            let blocked = protected.iter().any(|(protected_path, dev, ino)| {
-                if identity != (*dev, *ino) {
-                    return false;
-                }
-                let protected = Path::new(protected_path);
-                // The protected directory's own location — and its natural
-                // ancestors, when it is itself a mount (Fedora's `/root`
-                // subvolume mounted at `/`) — never alias it.
-                if path == protected || protected.starts_with(path) {
-                    return false;
-                }
-                match mount_roots.get(path) {
-                    Some(fs_root) => {
-                        *fs_root != Path::new("/")
-                            && mount_roots
-                                .get(protected)
-                                .is_none_or(|protected_root| protected_root == fs_root)
-                    }
-                    // A plain directory carrying a protected root's identity
-                    // can only be a bind-alias subtree component.
-                    None => true,
-                }
-            });
-            if blocked {
+            if ancestor_blocks(
+                path,
+                (metadata.dev(), metadata.ino()),
+                mount_roots,
+                protected,
+            ) {
                 return Err(io::Error::other(
                     "Blocked: target lives beneath a bind mount of a protected system directory",
                 ));
@@ -268,6 +252,51 @@ fn check_not_under_protected_mount_alias(
         current = path.parent();
     }
     Ok(())
+}
+
+/// st_ino of every btrfs subvolume root: all subvolumes of one filesystem
+/// share it, which is why identity equality alone cannot tell a subvolume
+/// directory from an alias component on btrfs.
+const BTRFS_SUBVOL_ROOT_INO: u64 = 256;
+
+/// Pure decision for one ancestor, over caller-supplied mount roots and
+/// protected identities, so every arm is testable without mounting anything.
+fn ancestor_blocks(
+    path: &Path,
+    identity: (u64, u64),
+    mount_roots: &HashMap<PathBuf, PathBuf>,
+    protected: &[(&'static str, u64, u64)],
+) -> bool {
+    protected.iter().any(|(protected_path, dev, ino)| {
+        if identity != (*dev, *ino) {
+            return false;
+        }
+        let protected = Path::new(protected_path);
+        // The protected directory's own location — and its natural ancestors,
+        // when it is itself a mount, like Fedora's `/root` subvolume mounted
+        // at `/` — never alias it.
+        if path == protected || protected.starts_with(path) {
+            return false;
+        }
+        match mount_roots.get(path) {
+            // Qodo round 3 (4c1a7365): a protected directory that is its own
+            // filesystem (a separate /boot partition) reports fs-root `/`,
+            // and its bind alias carries that same fs-root — an fs-root
+            // != "/" exemption skipped exactly those aliases. Decide by
+            // fs-root equality alone.
+            Some(fs_root) => mount_roots
+                .get(protected)
+                .is_none_or(|protected_root| protected_root == fs_root),
+            // Qodo round 3 (ae32ee0d): on btrfs every subvolume root reports
+            // st_ino 256, so a plain directory sharing a protected subvolume
+            // mount's identity — an unmounted subvolume directory under a
+            // fs-root-tree mount — is a different mount, not an alias. A
+            // non-256 match is a genuine alias component: directories cannot
+            // be hardlinked, and on non-btrfs filesystems the same (dev, ino)
+            // at another path is the same directory reached through a bind.
+            None => identity.1 != BTRFS_SUBVOL_ROOT_INO,
+        }
+    })
 }
 
 fn open_child(parent: &File, name: &CStr) -> io::Result<File> {
@@ -386,7 +415,7 @@ mod tests {
         let file = fixture.path().join("ordinary");
         fs::write(&file, "x").unwrap();
         let handle = File::open(&file).unwrap();
-        reject_protected_alias(&handle, protected_dir_identities()).unwrap();
+        reject_protected_alias(&handle, &protected_dir_identities()).unwrap();
         // An empty protection set exercises the same pass path.
         reject_protected_alias(&handle, &[]).unwrap();
     }
@@ -500,6 +529,61 @@ mod tests {
         assert!(error.to_string().contains("bind mount"));
     }
 
+    /// Qodo round 3 (4c1a7365): /boot on its own partition reports fs-root
+    /// `/`, and its bind alias carries that same fs-root — the removed
+    /// fs-root != "/" exemption skipped exactly this case.
+    #[test]
+    fn whole_fs_protected_root_alias_is_blocked() {
+        let fixture = tempfile::tempdir().unwrap();
+        let natural = fixture.path().join("boot");
+        let alias = fixture.path().join("mnt/b");
+        fs::create_dir_all(&alias).unwrap();
+        // Register the alias directory's identity as the host's /boot: the
+        // alias IS the same directory through the bind.
+        let metadata = fs::metadata(&alias).unwrap();
+        let protected = [("/boot", metadata.dev(), metadata.ino())];
+        let mountinfo = format!(
+            "23 0 253:0 / {} rw - ext4 /dev/root\n42 23 253:0 / {} rw - ext4 /dev/root\n",
+            natural.display(),
+            alias.display()
+        );
+        let deep = fixture.path().join("mnt/b/grub");
+        fs::create_dir_all(&deep).unwrap();
+        let error =
+            check_not_under_protected_mount_alias(&deep, &parse_roots(&mountinfo), &protected)
+                .unwrap_err();
+        assert!(error.to_string().contains("bind mount"));
+    }
+
+    /// Qodo round 3 (ae32ee0d): an unmounted btrfs subvolume directory shares
+    /// the protected mount's st_ino 256 without being an alias; a plain
+    /// directory with a non-256 identity is a genuine alias component.
+    #[test]
+    fn subvol_root_collision_is_not_an_alias_but_plain_match_is() {
+        let empty = HashMap::new();
+        // Collision: ino 256 on the same device — allowed through.
+        assert!(!ancestor_blocks(
+            Path::new("/mnt/btrfs-root/@var"),
+            (253, 256),
+            &empty,
+            &[("/var", 253, 256)],
+        ));
+        // Genuine alias component: non-256 identity match — blocked.
+        assert!(ancestor_blocks(
+            Path::new("/host/etc"),
+            (253, 3011),
+            &empty,
+            &[("/etc", 253, 3011)],
+        ));
+        // Identity mismatch never blocks.
+        assert!(!ancestor_blocks(
+            Path::new("/host/etc"),
+            (253, 9999),
+            &empty,
+            &[("/etc", 253, 3011)],
+        ));
+    }
+
     /// Qodo finding 3: a protected directory mounted at its normal location —
     /// openSUSE's `/@/var` subvolume at `/var`, ostree's `/var` bind — matches
     /// its own identity, which must not count as an alias of itself.
@@ -563,7 +647,7 @@ mod tests {
         check_not_under_protected_mount_alias(
             fixture.path(),
             &read_mount_roots().unwrap(),
-            protected_dir_identities(),
+            &protected_dir_identities(),
         )
         .unwrap();
     }
@@ -578,6 +662,7 @@ mod tests {
             std::slice::from_ref(&file),
             |_, _| Ok(()),
             Err(io::Error::other("mountinfo boom")),
+            Vec::new(),
         );
         assert!(result.succeeded.is_empty());
         assert_eq!(result.failed.len(), 1);
@@ -591,8 +676,12 @@ mod tests {
         let source = fixture.path().join("source");
         let saved = fixture.path().join("saved");
         fs::write(&source, "confirmed").unwrap();
-        let (parent, name, target) =
-            prepare_target_with_mount_roots(&source, &read_mount_roots().unwrap()).unwrap();
+        let (parent, name, target) = prepare_target_with_mount_roots(
+            &source,
+            &read_mount_roots().unwrap(),
+            &protected_dir_identities(),
+        )
+        .unwrap();
         remove_at_with_hook(&parent, &name, &target, &|_, _| {
             fs::rename(&source, &saved).unwrap();
             fs::write(&source, "replacement").unwrap();
@@ -613,9 +702,12 @@ mod tests {
         fs::create_dir_all(victim.join("ssh")).unwrap();
         fs::write(parent_path.join("ssh/selected"), "selected").unwrap();
         fs::write(victim.join("ssh/keep"), "protected fixture").unwrap();
-        let (parent, name, target) =
-            prepare_target_with_mount_roots(&parent_path.join("ssh"), &read_mount_roots().unwrap())
-                .unwrap();
+        let (parent, name, target) = prepare_target_with_mount_roots(
+            &parent_path.join("ssh"),
+            &read_mount_roots().unwrap(),
+            &protected_dir_identities(),
+        )
+        .unwrap();
         inspect_tree(&target).unwrap();
         fs::rename(&parent_path, &moved).unwrap();
         symlink(&victim, &parent_path).unwrap();
@@ -636,8 +728,12 @@ mod tests {
         fs::create_dir(&path).unwrap();
         fs::create_dir(&victim).unwrap();
         fs::write(victim.join("keep"), "untouched").unwrap();
-        let (parent, name, target) =
-            prepare_target_with_mount_roots(&path, &read_mount_roots().unwrap()).unwrap();
+        let (parent, name, target) = prepare_target_with_mount_roots(
+            &path,
+            &read_mount_roots().unwrap(),
+            &protected_dir_identities(),
+        )
+        .unwrap();
         fs::rename(&path, &moved).unwrap();
         symlink(&victim, &path).unwrap();
         assert!(remove_at(&parent, &name, &target).is_err());
