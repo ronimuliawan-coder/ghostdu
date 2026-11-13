@@ -150,12 +150,13 @@ fn format_delta_list(title: &str, deltas: &[Delta], out: &mut String) {
     for delta in deltas {
         let sign = if delta.change() >= 0 { "+" } else { "-" };
         let magnitude = delta.change().unsigned_abs();
+        let path_lossy = delta.path.to_string_lossy();
         let _ = writeln!(
             out,
             "\n  {}{} in {}",
             sign,
             crate::fs::entry::format_size(magnitude),
-            delta.path.display()
+            crate::fs::entry::sanitize_control_chars(&path_lossy)
         );
     }
     out.push('\n');
@@ -251,6 +252,18 @@ mod tests {
         assert!(text.contains("/root/new2.txt"), "largest added path shown");
         assert!(text.contains("Removed:"), "removed paths are listed");
         assert!(text.contains("/root/gone2.txt"), "largest removed shown");
+    }
+
+    /// Audit M1: the diff report is a terminal render boundary; crafted paths
+    /// must not reach it as raw escape sequences.
+    #[test]
+    fn report_sanitizes_control_characters_in_paths() {
+        let before = tree(vec![]);
+        let after = tree(vec![file("/root/evil\u{1b}]0;pwned\u{7}.txt", 10)]);
+        let report = diff_trees(&before, &after).to_string();
+        assert!(!report.contains('\u{1b}'));
+        assert!(!report.contains('\u{7}'));
+        assert!(report.contains("evil\u{241b}]0;pwned\u{2407}.txt"));
     }
 
     #[test]
