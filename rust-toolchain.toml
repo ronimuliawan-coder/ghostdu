@@ -1,0 +1,8 @@
+# Pinned toolchain: CI resolves dtolnay/rust-toolchain@stable at runtime, so a
+# new stable release can silently break a previously green revision (clippy
+# 1.100 introduced needless_bool on this codebase in Nov 2026). Pin the exact
+# version all local and CI gates were verified against instead.
+[toolchain]
+channel = "1.99.1"
+profile = "minimal"
+components = ["clippy", "rustfmt"]
