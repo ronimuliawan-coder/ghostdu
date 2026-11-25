@@ -1,7 +1,7 @@
 use crate::fs::entry::{
     format_count, format_count_short, format_size, sanitize_control_chars, DeleteSafety, GhostKind,
 };
-use crate::ghost::prune_category_labels;
+use crate::ghost::prune_categories;
 use crate::ui::app::{ActiveView, App, ConfirmAction, GhostFilterMode};
 use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
@@ -2156,21 +2156,21 @@ fn render_confirm_modal(f: &mut Frame, app: &App, screen: Rect) {
                     )),
                     Line::from(""),
                 ];
-                for (index, label) in prune_category_labels().into_iter().enumerate() {
+                for (index, category) in prune_categories().iter().enumerate() {
                     let marker = if app.docker_prune_selection[index] {
                         "[x]"
                     } else {
                         "[ ]"
                     };
-                    // The volume total counts unused named volumes too, while a
-                    // default prune removes only anonymous ones on modern
-                    // daemons; show it as an upper bound (Qodo round 1).
-                    let size = if label == "volumes" {
+                    // The category owns whether its total is an upper bound:
+                    // the volume total counts named volumes that a default
+                    // prune keeps on modern daemons (Qodo rounds 1–2).
+                    let size = if category.size_is_upper_bound {
                         format!("≤{}", format_size(sizes[index]))
                     } else {
                         format_size(sizes[index])
                     };
-                    let line = format!(" {} {:<12} {:>10}", marker, label, size);
+                    let line = format!(" {} {:<12} {:>10}", marker, category.label, size);
                     let style = if index == app.docker_prune_cursor {
                         Style::default().fg(Color::Black).bg(Color::Yellow)
                     } else {
@@ -3464,8 +3464,18 @@ mod render_sweep_tests {
             assert!(out.contains(text), "missing category {text}");
         }
         assert!(out.contains("Docker <23 removes named too."));
-        // The volume total counts named volumes too: shown as an upper bound.
-        assert!(out.contains('≤'));
+        // The upper bound belongs to the volume row only, not to any row that
+        // happens to show the glyph elsewhere in the buffer (Qodo round 2).
+        let volume_row = out
+            .lines()
+            .find(|line| line.contains('[') && line.contains("volumes"))
+            .expect("volumes row");
+        assert!(volume_row.contains('≤'), "volumes row: {volume_row}");
+        let image_row = out
+            .lines()
+            .find(|line| line.contains('[') && line.contains("images"))
+            .expect("images row");
+        assert!(!image_row.contains('≤'), "images row: {image_row}");
     }
 
     /// Audit M1: the scan-progress path is untrusted too.

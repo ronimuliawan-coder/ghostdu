@@ -414,23 +414,44 @@ struct DockerPruneResponse {
     space_reclaimed: u64,
 }
 
-/// Prune targets as (label, endpoint), in UI and selection-array order. A
-/// const has no executable lines, so the table never shows up in line
-/// coverage. Images alone carries a `dangling=true` filter (audit H4).
-const PRUNE_TARGETS: [(&str, &str); 4] = [
-    (
-        "images",
-        "/images/prune?filters=%7B%22dangling%22%3A%7B%22true%22%3Atrue%7D%7D",
-    ),
-    ("containers", "/containers/prune"),
-    ("volumes", "/volumes/prune"),
-    ("build cache", "/build/prune"),
+/// One Docker prune category, in UI and selection-array order. A const has no
+/// executable lines, so the table never shows up in line coverage. Images
+/// alone carries a `dangling=true` filter (audit H4). The volume total counts
+/// named volumes that a default prune keeps on modern daemons, so its size is
+/// an upper bound (Qodo round 2).
+#[derive(Clone, Copy)]
+pub struct PruneCategory {
+    pub label: &'static str,
+    pub endpoint: &'static str,
+    pub size_is_upper_bound: bool,
+}
+
+const PRUNE_TARGETS: [PruneCategory; 4] = [
+    PruneCategory {
+        label: "images",
+        endpoint: "/images/prune?filters=%7B%22dangling%22%3A%7B%22true%22%3Atrue%7D%7D",
+        size_is_upper_bound: false,
+    },
+    PruneCategory {
+        label: "containers",
+        endpoint: "/containers/prune",
+        size_is_upper_bound: false,
+    },
+    PruneCategory {
+        label: "volumes",
+        endpoint: "/volumes/prune",
+        size_is_upper_bound: true,
+    },
+    PruneCategory {
+        label: "build cache",
+        endpoint: "/build/prune",
+        size_is_upper_bound: false,
+    },
 ];
 
-/// Labels of the prune categories, in the same order as the selection array
-/// gating them and the request targets below.
-pub fn prune_category_labels() -> [&'static str; 4] {
-    PRUNE_TARGETS.map(|(label, _)| label)
+/// Categories in the same order as the selection array gating them.
+pub fn prune_categories() -> &'static [PruneCategory; 4] {
+    &PRUNE_TARGETS
 }
 
 /// Live-daemon prune entry point. Excluded from line coverage: exercising it
@@ -452,23 +473,23 @@ fn prune_with_request(
     let mut skipped = Vec::new();
     let mut failed = Vec::new();
     let mut total_reclaimed = 0u64;
-    for (index, (category, endpoint)) in PRUNE_TARGETS.iter().enumerate() {
+    for (index, category) in PRUNE_TARGETS.iter().enumerate() {
         // Itemized confirmation (audit H4): the three unfiltered destructive
         // categories must be selected explicitly; images alone carries a
         // dangling=true filter.
         if selected[index] {
-            match request("POST", endpoint).and_then(|body| {
+            match request("POST", category.endpoint).and_then(|body| {
                 serde_json::from_str::<DockerPruneResponse>(&body)
                     .map_err(|e| format!("Invalid prune response: {}", e))
             }) {
                 Ok(result) => {
                     total_reclaimed = total_reclaimed.saturating_add(result.space_reclaimed);
-                    completed.push(*category);
+                    completed.push(category.label);
                 }
-                Err(error) => failed.push(format!("{}: {}", category, error)),
+                Err(error) => failed.push(format!("{}: {}", category.label, error)),
             }
         } else {
-            skipped.push(*category);
+            skipped.push(category.label);
         }
     }
     let mut summary = format!(
@@ -601,8 +622,20 @@ mod tests {
         assert!(summary.contains("Pruned none"));
         assert!(summary.contains("skipped: images, containers, volumes, build cache"));
         assert_eq!(
-            prune_category_labels(),
+            prune_categories()
+                .iter()
+                .map(|category| category.label)
+                .collect::<Vec<_>>(),
             ["images", "containers", "volumes", "build cache"]
+        );
+        // Only the volume total is an upper bound (default prune keeps named
+        // volumes on modern daemons).
+        assert_eq!(
+            prune_categories()
+                .iter()
+                .map(|category| category.size_is_upper_bound)
+                .collect::<Vec<_>>(),
+            [false, false, true, false]
         );
     }
 }
