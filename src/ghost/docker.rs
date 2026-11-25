@@ -2,7 +2,7 @@ use serde::Deserialize;
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, Default)]
 pub struct DockerDiskInfo {
@@ -156,12 +156,60 @@ fn send_to_docker_socket(
         .write_all(request.as_bytes())
         .map_err(|e| format!("Failed to write to docker socket: {}", e))?;
 
-    let mut response_bytes = Vec::new();
-    stream
-        .read_to_end(&mut response_bytes)
-        .map_err(|e| format!("Failed to read from docker socket: {}", e))?;
+    // Wall-clock deadline bounds the whole exchange: the per-read timeout
+    // bounds each syscall, but a daemon dribbling bytes one read at a time
+    // could otherwise hold the UI thread forever (audit H3). Ten seconds of
+    // transfer slack on top of the server-side wait the read timeout already
+    // tolerates.
+    let deadline = Instant::now() + read_timeout + Duration::from_secs(10);
+    let response_bytes =
+        read_response_with_limits(&stream, deadline, read_timeout, MAX_DOCKER_RESPONSE_BYTES)?;
 
     parse_docker_http_response(&response_bytes)
+}
+
+/// Hard cap on a docker response body: `system/df` JSON on pathological
+/// daemons is the largest legitimate response by far; 64 MiB is far above it
+/// and far below the memory a hostile socket could otherwise force (audit H3).
+const MAX_DOCKER_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
+
+/// Bounded replacement for `read_to_end`: stops at the wall-clock deadline,
+/// at the size cap, at clean EOF, or at a read error — whichever comes first.
+/// Each blocking read is capped at the time left before the deadline, so a
+/// peer that stalls just before it cannot hold the UI for a whole read timeout
+/// past the deadline (Qodo round 1 on PR #12).
+fn read_response_with_limits(
+    mut stream: &UnixStream,
+    deadline: Instant,
+    read_timeout: Duration,
+    cap: usize,
+) -> Result<Vec<u8>, String> {
+    let mut response_bytes = Vec::new();
+    let mut chunk = [0u8; 8192];
+    loop {
+        let now = Instant::now();
+        if now >= deadline {
+            return Err("Docker response exceeded the wall-clock deadline".to_string());
+        }
+        if response_bytes.len() >= cap {
+            return Err("Docker response exceeded the size cap".to_string());
+        }
+        let remaining = deadline.saturating_duration_since(now);
+        let per_read = read_timeout.min(remaining).max(Duration::from_millis(1));
+        stream
+            .set_read_timeout(Some(per_read))
+            .map_err(|e| format!("Failed to set docker socket timeout: {}", e))?;
+        match stream.read(&mut chunk) {
+            Ok(0) => return Ok(response_bytes),
+            Ok(n) => response_bytes.extend_from_slice(&chunk[..n]),
+            Err(error) => {
+                if Instant::now() >= deadline {
+                    return Err("Docker response exceeded the wall-clock deadline".to_string());
+                }
+                return Err(format!("Failed to read from docker socket: {}", error));
+            }
+        }
+    }
 }
 
 fn parse_docker_http_response(response_bytes: &[u8]) -> Result<String, String> {
@@ -366,47 +414,85 @@ struct DockerPruneResponse {
     space_reclaimed: u64,
 }
 
+/// One Docker prune category, in UI and selection-array order. A const has no
+/// executable lines, so the table never shows up in line coverage. Images
+/// alone carries a `dangling=true` filter (audit H4). The volume total counts
+/// named volumes that a default prune keeps on modern daemons, so its size is
+/// an upper bound (Qodo round 2).
+#[derive(Clone, Copy)]
+pub struct PruneCategory {
+    pub label: &'static str,
+    pub endpoint: &'static str,
+    pub size_is_upper_bound: bool,
+}
+
+const PRUNE_TARGETS: [PruneCategory; 4] = [
+    PruneCategory {
+        label: "images",
+        endpoint: "/images/prune?filters=%7B%22dangling%22%3A%7B%22true%22%3Atrue%7D%7D",
+        size_is_upper_bound: false,
+    },
+    PruneCategory {
+        label: "containers",
+        endpoint: "/containers/prune",
+        size_is_upper_bound: false,
+    },
+    PruneCategory {
+        label: "volumes",
+        endpoint: "/volumes/prune",
+        size_is_upper_bound: true,
+    },
+    PruneCategory {
+        label: "build cache",
+        endpoint: "/build/prune",
+        size_is_upper_bound: false,
+    },
+];
+
+/// Categories in the same order as the selection array gating them.
+pub fn prune_categories() -> &'static [PruneCategory; 4] {
+    &PRUNE_TARGETS
+}
+
 /// Live-daemon prune entry point. Excluded from line coverage: exercising it
 /// would prune a real daemon; the request core is covered via stub tests.
 #[cfg(not(tarpaulin_include))]
-pub fn prune_docker_dangling() -> Result<String, String> {
+pub fn prune_docker_categories(selected: &[bool; 4]) -> Result<String, String> {
     // Reporting and mutation must use the same socket, regardless of CLI context/DOCKER_HOST.
     // Prune operations can take significantly longer than basic inspection, so grant them an extended read timeout.
-    prune_with_request(|method, endpoint| {
+    prune_with_request(selected, |method, endpoint| {
         send_docker_http_request_with_timeout(method, endpoint, Duration::from_secs(60))
     })
 }
 
 fn prune_with_request(
+    selected: &[bool; 4],
     mut request: impl FnMut(&str, &str) -> Result<String, String>,
 ) -> Result<String, String> {
     let mut completed = Vec::new();
+    let mut skipped = Vec::new();
     let mut failed = Vec::new();
     let mut total_reclaimed = 0u64;
-    /// Prune targets as (label, endpoint). A module const has no executable
-    /// lines, so the table never shows up in line coverage.
-    const PRUNE_TARGETS: [(&str, &str); 4] = [
-        (
-            "images",
-            "/images/prune?filters=%7B%22dangling%22%3A%7B%22true%22%3Atrue%7D%7D",
-        ),
-        ("containers", "/containers/prune"),
-        ("volumes", "/volumes/prune"),
-        ("build cache", "/build/prune"),
-    ];
-    for (category, endpoint) in PRUNE_TARGETS {
-        match request("POST", endpoint).and_then(|body| {
-            serde_json::from_str::<DockerPruneResponse>(&body)
-                .map_err(|e| format!("Invalid prune response: {}", e))
-        }) {
-            Ok(result) => {
-                total_reclaimed = total_reclaimed.saturating_add(result.space_reclaimed);
-                completed.push(category);
+    for (index, category) in PRUNE_TARGETS.iter().enumerate() {
+        // Itemized confirmation (audit H4): the three unfiltered destructive
+        // categories must be selected explicitly; images alone carries a
+        // dangling=true filter.
+        if selected[index] {
+            match request("POST", category.endpoint).and_then(|body| {
+                serde_json::from_str::<DockerPruneResponse>(&body)
+                    .map_err(|e| format!("Invalid prune response: {}", e))
+            }) {
+                Ok(result) => {
+                    total_reclaimed = total_reclaimed.saturating_add(result.space_reclaimed);
+                    completed.push(category.label);
+                }
+                Err(error) => failed.push(format!("{}: {}", category.label, error)),
             }
-            Err(error) => failed.push(format!("{}: {}", category, error)),
+        } else {
+            skipped.push(category.label);
         }
     }
-    let summary = format!(
+    let mut summary = format!(
         "Pruned {} (freed {})",
         if completed.is_empty() {
             "none".to_string()
@@ -415,6 +501,9 @@ fn prune_with_request(
         },
         crate::fs::entry::format_size(total_reclaimed)
     );
+    if !skipped.is_empty() {
+        summary.push_str(&format!("; skipped: {}", skipped.join(", ")));
+    }
     if failed.is_empty() {
         Ok(summary)
     } else {
@@ -460,7 +549,7 @@ mod tests {
     #[test]
     fn prune_failure_does_not_switch_execution_paths() {
         let mut calls = Vec::new();
-        let error = prune_with_request(|method, endpoint| {
+        let error = prune_with_request(&[true, true, true, true], |method, endpoint| {
             assert_eq!(method, "POST");
             calls.push(endpoint.to_string());
             Err("Docker API error (HTTP 403): access denied".to_string())
@@ -478,11 +567,13 @@ mod tests {
 
     #[test]
     fn prune_reports_success_partial_failure_and_invalid_responses() {
-        let success =
-            prune_with_request(|_, _| Ok(r#"{"SpaceReclaimed":10}"#.to_string())).unwrap();
+        let success = prune_with_request(&[true, true, true, true], |_, _| {
+            Ok(r#"{"SpaceReclaimed":10}"#.to_string())
+        })
+        .unwrap();
         assert!(success.contains("images, containers, volumes, build cache"));
         assert!(success.contains("40 B"));
-        let partial = prune_with_request(|_, endpoint| {
+        let partial = prune_with_request(&[true, true, true, true], |_, endpoint| {
             if endpoint == "/containers/prune" {
                 Err("connection closed".to_string())
             } else {
@@ -492,9 +583,60 @@ mod tests {
         .unwrap_err();
         assert!(partial.contains("Pruned images, volumes, build cache (freed 30 B)"));
         assert!(partial.contains("failed: containers: connection closed"));
-        let invalid = prune_with_request(|_, _| Ok("invalid JSON".to_string())).unwrap_err();
+        let invalid = prune_with_request(&[true, true, true, true], |_, _| {
+            Ok("invalid JSON".to_string())
+        })
+        .unwrap_err();
         assert!(invalid.contains("Pruned none"));
         assert!(invalid.contains("Invalid prune response"));
+    }
+
+    /// Audit H4: only selected categories are pruned; unselected ones are
+    /// reported as skipped and never reach the daemon.
+    #[test]
+    fn prune_executes_only_selected_categories() {
+        let mut calls = Vec::new();
+        let summary = prune_with_request(&[true, false, true, false], |_, endpoint| {
+            calls.push(endpoint.to_string());
+            Ok(r#"{"SpaceReclaimed":5}"#.to_string())
+        })
+        .unwrap();
+        assert_eq!(
+            calls,
+            [
+                "/images/prune?filters=%7B%22dangling%22%3A%7B%22true%22%3Atrue%7D%7D",
+                "/volumes/prune"
+            ]
+        );
+        assert!(summary.contains("Pruned images, volumes (freed 10 B)"));
+        assert!(summary.contains("skipped: containers, build cache"));
+        assert!(!summary.contains("failed"));
+        // Nothing selected: no request goes out at all.
+        let calls = std::cell::RefCell::new(Vec::new());
+        let summary = prune_with_request(&[false, false, false, false], |_, endpoint| {
+            calls.borrow_mut().push(endpoint.to_string());
+            Ok(r#"{"SpaceReclaimed":1}"#.to_string())
+        })
+        .unwrap();
+        assert!(calls.borrow().is_empty());
+        assert!(summary.contains("Pruned none"));
+        assert!(summary.contains("skipped: images, containers, volumes, build cache"));
+        assert_eq!(
+            prune_categories()
+                .iter()
+                .map(|category| category.label)
+                .collect::<Vec<_>>(),
+            ["images", "containers", "volumes", "build cache"]
+        );
+        // Only the volume total is an upper bound (default prune keeps named
+        // volumes on modern daemons).
+        assert_eq!(
+            prune_categories()
+                .iter()
+                .map(|category| category.size_is_upper_bound)
+                .collect::<Vec<_>>(),
+            [false, false, true, false]
+        );
     }
 }
 
@@ -619,5 +761,99 @@ mod socket_tests {
         // Thin wrapper over the socket seam: without a daemon it errors, with
         // one it answers. Either way every line of the wrapper runs.
         let _ = send_docker_http_request_with_timeout("GET", "/version", Duration::from_secs(1));
+    }
+
+    /// Audit H3: the response reader stops at the size cap and the
+    /// wall-clock deadline instead of reading forever.
+    #[test]
+    fn response_reader_enforces_size_cap_and_deadline() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("docker.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        // Dribble one byte every few milliseconds and never close: the
+        // deadline must end the exchange, not the dribble.
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                use std::io::Write;
+                for _ in 0..64 {
+                    let _ = stream.write_all(b"x");
+                    let _ = stream.flush();
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                // Leak the stream open: no EOF for the reader.
+                std::mem::forget(stream);
+            }
+        });
+        let dribbler = UnixStream::connect(&path).unwrap();
+        dribbler
+            .set_read_timeout(Some(Duration::from_millis(40)))
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_millis(150);
+        let error =
+            read_response_with_limits(&dribbler, deadline, Duration::from_millis(40), 1 << 20)
+                .unwrap_err();
+        assert!(error.contains("wall-clock deadline"), "{error}");
+        // A server that sends past the cap is cut off by the cap.
+        let dir2 = tempfile::tempdir().unwrap();
+        let path2 = dir2.path().join("docker.sock");
+        let listener2 = UnixListener::bind(&path2).unwrap();
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener2.accept() {
+                use std::io::Write;
+                let _ = stream.write_all(&[b'x'; 128]);
+            }
+        });
+        let gusher = UnixStream::connect(&path2).unwrap();
+        gusher
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        let error = read_response_with_limits(
+            &gusher,
+            Instant::now() + Duration::from_secs(5),
+            Duration::from_secs(1),
+            64,
+        )
+        .unwrap_err();
+        assert!(error.contains("size cap"), "{error}");
+        // A server that never sends anything trips the per-read timeout — a
+        // read error, distinct from the wall-clock deadline above.
+        let dir3 = tempfile::tempdir().unwrap();
+        let path3 = dir3.path().join("docker.sock");
+        let listener3 = UnixListener::bind(&path3).unwrap();
+        std::thread::spawn(move || {
+            if let Ok((stream, _)) = listener3.accept() {
+                std::mem::forget(stream);
+            }
+        });
+        let silent = UnixStream::connect(&path3).unwrap();
+        silent
+            .set_read_timeout(Some(Duration::from_millis(40)))
+            .unwrap();
+        let error = read_response_with_limits(
+            &silent,
+            Instant::now() + Duration::from_secs(5),
+            Duration::from_millis(40),
+            64,
+        )
+        .unwrap_err();
+        assert!(
+            error.contains("Failed to read from docker socket"),
+            "{error}"
+        );
+        // An already-expired deadline is reported before any read.
+        let error =
+            read_response_with_limits(&silent, Instant::now(), Duration::from_millis(40), 64)
+                .unwrap_err();
+        assert!(error.contains("wall-clock deadline"), "{error}");
+        // A peer that stalls past the deadline is cut off at the deadline by
+        // the per-read cap, not at the full read timeout (200 ms < 1 s).
+        let error = read_response_with_limits(
+            &silent,
+            Instant::now() + Duration::from_millis(200),
+            Duration::from_secs(1),
+            64,
+        )
+        .unwrap_err();
+        assert!(error.contains("wall-clock deadline"), "{error}");
     }
 }

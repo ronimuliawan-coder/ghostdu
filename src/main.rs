@@ -8,8 +8,8 @@ use crossterm::{
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use fs::{
-    format_count, format_size, scan_directory_with_options, truncate_end_by_width, ScanProgress,
-    ScannerOptions,
+    format_count, format_size, sanitize_control_chars, scan_directory_with_options,
+    truncate_end_by_width, ScanProgress, ScannerOptions,
 };
 use ratatui::{backend::CrosstermBackend, Terminal};
 use std::{
@@ -603,10 +603,12 @@ fn format_docker_section(docker_info: &ghostdu::ghost::DockerDiskInfo) -> String
     } else {
         out.push_str(&format!(
             "  Docker daemon: {}\n",
-            docker_info
-                .error_message
-                .as_deref()
-                .unwrap_or("Not running")
+            sanitize_control_chars(
+                docker_info
+                    .error_message
+                    .as_deref()
+                    .unwrap_or("Not running")
+            )
         ));
     }
     out
@@ -633,9 +635,9 @@ fn format_ghost_section(deleted_open: &[ghostdu::ghost::DeletedOpenFile]) -> Str
             out.push_str(&format!(
                 "  PID {:<7} | {:<16} | {:<10} | {}\n",
                 item.pid,
-                item.process_name,
+                sanitize_control_chars(&item.process_name),
                 format_size(item.size),
-                item.original_path
+                sanitize_control_chars(&item.original_path)
             ));
         }
     }
@@ -672,16 +674,20 @@ fn print_headless_report(root_entry: &fs::FileEntry, live: bool) {
 
     println!();
     println!("{SECTION_RULE}");
-    println!("  📂 PATH: {}", root_entry.path.to_string_lossy());
+    println!(
+        "  📂 PATH: {}",
+        sanitize_control_chars(&root_entry.path.to_string_lossy())
+    );
     if let Some(ref fs) = fs_info {
         let percent = fs.use_percent;
         let bar_len = 10;
         let filled_len = ((percent / 100.0) * bar_len as f64).round() as usize;
         let bar_filled = "█".repeat(filled_len.min(bar_len));
         let bar_empty = "░".repeat(bar_len.saturating_sub(filled_len));
-        let device = &fs.device;
-        let fs_type = &fs.fs_type;
-        let mount = fs.mount_point.display();
+        let device = sanitize_control_chars(&fs.device);
+        let fs_type = sanitize_control_chars(&fs.fs_type);
+        let mount_lossy = fs.mount_point.to_string_lossy();
+        let mount = sanitize_control_chars(&mount_lossy);
         println!("  💾 FILESYSTEM: {device} ({fs_type} on {mount})");
         let total = format_size(fs.total_bytes);
         let used = format_size(fs.used_bytes);
@@ -710,7 +716,7 @@ fn print_headless_report(root_entry: &fs::FileEntry, live: bool) {
         let bar_text = format!("[{}{}] {:>5.1}%", bar_filled, bar_empty, percent);
 
         let icon = if entry.is_dir { "📁 " } else { "📄 " };
-        let display_name = format!("{}{}", icon, entry.name);
+        let display_name = format!("{}{}", icon, sanitize_control_chars(&entry.name));
         let name = truncate_end_by_width(&display_name, 40);
         let padding = " ".repeat(40usize.saturating_sub(name.width()));
         let badge = entry.ghost_kind.badge();
@@ -938,17 +944,20 @@ mod cli_tests {
         assert!(section.contains("Total Docker Space"));
         let missing = DockerDiskInfo {
             is_available: false,
-            error_message: Some("boom".to_string()),
+            error_message: Some("boom\u{1b}]0;pwned".to_string()),
             ..Default::default()
         };
-        assert!(format_docker_section(&missing).contains("boom"));
+        let section = format_docker_section(&missing);
+        assert!(section.contains("boom"));
+        assert!(!section.contains('\u{1b}'));
+        assert!(section.contains("\u{241b}]0;pwned"));
         assert!(format_docker_section(&DockerDiskInfo::default()).contains("Not running"));
 
         assert!(format_ghost_section(&[]).contains("No open unlinked files"));
         let rows = vec![DeletedOpenFile {
             pid: 1234,
-            process_name: "testproc".to_string(),
-            original_path: "/tmp/gone".to_string(),
+            process_name: "testproc\u{1b}]0;pwned".to_string(),
+            original_path: "/tmp/gone\u{7}".to_string(),
             size: 4096,
             fd: "3".to_string(),
             start_time: Some(999),
@@ -956,6 +965,10 @@ mod cli_tests {
         let section = format_ghost_section(&rows);
         assert!(section.contains("Total Ghost Space Held"));
         assert!(section.contains("testproc"));
+        assert!(!section.contains('\u{1b}'));
+        assert!(!section.contains('\u{7}'));
+        assert!(section.contains("\u{241b}]0;pwned"));
+        assert!(section.contains("/tmp/gone\u{2407}"));
     }
 
     #[test]
