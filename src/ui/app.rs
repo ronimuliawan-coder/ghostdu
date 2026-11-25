@@ -179,6 +179,12 @@ pub struct App {
     pub stale_only_filter: bool,
 
     // Ghost Inspector data
+    /// Whether the Docker and deleted-open data has been fetched yet. Startup
+    /// only needs the filesystem view, so the queries that can block on a live
+    /// daemon are deferred until the inspector is first opened. Explicit state
+    /// (rather than a defaulted `DockerDiskInfo`) so "not fetched yet" cannot
+    /// be rendered as "no Docker daemon".
+    ghost_loaded: bool,
     pub docker_info: DockerDiskInfo,
     pub deleted_open_files: Vec<DeletedOpenFile>,
     pub ghost_tab_index: usize, // 0 = Docker, 1 = Deleted-Open Files
@@ -211,8 +217,10 @@ pub struct App {
 
 impl App {
     pub fn new(root_entry: FileEntry) -> Self {
-        let docker_info = fetch_docker_disk_info();
-        let deleted_open_files = scan_deleted_open_files();
+        // Startup deliberately does NOT query Docker or /proc: those are only
+        // needed by the Ghost Inspector, and a wedged Docker daemon would
+        // otherwise stall the first frame by up to its 4s read timeout (or
+        // 14s wall clock). `ensure_ghost_loaded` fetches them on first open.
         let fs_info = query_fs_info(&root_entry.path);
         let btrfs_subvols = std::fs::read("/proc/self/mountinfo")
             .map(|topology| crate::fs::scanner::parse_btrfs_subvolumes(&topology))
@@ -246,8 +254,9 @@ impl App {
             action_has_system: false,
             safe_only_filter: false,
             stale_only_filter: false,
-            docker_info,
-            deleted_open_files,
+            ghost_loaded: false,
+            docker_info: DockerDiskInfo::default(),
+            deleted_open_files: Vec::new(),
             ghost_tab_index: 0,
             ghost_cursor_index: 0,
             top_files: Vec::new(),
@@ -274,8 +283,19 @@ impl App {
         !self.imported && crate::fs::scanner::has_snapshot_subvolumes(&self.btrfs_subvols)
     }
 
+    /// Fetch the Docker and deleted-open data the first time the Ghost
+    /// Inspector is opened. Kept out of `new` so startup never waits on a
+    /// Docker daemon; a later refresh goes through `refresh_ghost_info`.
+    pub fn ensure_ghost_loaded(&mut self) {
+        if !self.ghost_loaded {
+            self.ghost_loaded = true;
+            self.refresh_ghost_info();
+        }
+    }
+
     /// Refresh Docker and deleted-open ghost file info
     pub fn refresh_ghost_info(&mut self) {
+        self.ghost_loaded = true;
         self.docker_info = fetch_docker_disk_info();
         self.deleted_open_files = scan_deleted_open_files();
         self.set_status("Refreshed Docker & Ghost files data");
@@ -3335,6 +3355,38 @@ mod coverage_gap_tests {
             crate::fs::scanner::scan_directory(dir.path(), None, Arc::new(AtomicBool::new(false)))
                 .unwrap();
         (dir, App::new(root))
+    }
+
+    /// Audit M16: startup must not touch Docker or /proc, because a wedged
+    /// daemon would stall the first frame for its 4 s read timeout. The data
+    /// is fetched on first inspector open instead.
+    #[test]
+    fn app_new_defers_ghost_queries_until_first_open() {
+        let (_dir, mut app) = app_with_files(1);
+        assert!(
+            !app.ghost_loaded,
+            "startup must not fetch Docker/deleted-open data"
+        );
+        // A lazy field must not masquerade as a real "no daemon" result.
+        assert!(!app.docker_info.is_available);
+        assert!(app.deleted_open_files.is_empty());
+
+        app.ensure_ghost_loaded();
+        assert!(app.ghost_loaded, "first open fetches the data");
+        assert!(
+            app.current_status()
+                .unwrap_or("")
+                .contains("Refreshed Docker"),
+            "the fetch reports its own status"
+        );
+
+        // Idempotent: opening again does not refetch or re-announce.
+        app.status_message = None;
+        app.ensure_ghost_loaded();
+        assert!(
+            app.current_status().is_none(),
+            "a second open must not refetch"
+        );
     }
 
     #[test]
