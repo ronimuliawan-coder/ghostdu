@@ -1,0 +1,42 @@
+version: 2
+
+updates:
+  # Cargo dependencies. Grouped so a routine patch wave is one PR rather than
+  # a stream of them; a major bump still arrives on its own because it needs
+  # a compatibility decision.
+  - package-ecosystem: "cargo"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "chore"
+    groups:
+      cargo-minor-patch:
+        patterns:
+          - "*"
+        update-types:
+          - "minor"
+          - "patch"
+    ignore:
+      # Pinned deliberately by rust-toolchain.toml: a stable bump broke a
+      # previously green revision once (clippy 1.100 needless_bool). Toolchain
+      # upgrades are a deliberate change with gate evidence, not an auto-PR.
+      - dependency-name: "rust"
+
+  # GitHub Actions. These are pinned by commit SHA in the workflows; Dependabot
+  # updates both the SHA and its trailing version comment.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "ci"
+    groups:
+      actions-minor-patch:
+        patterns:
+          - "*"
+        update-types:
+          - "minor"
+          - "patch"
