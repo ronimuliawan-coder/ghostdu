@@ -1,6 +1,5 @@
-use super::delete::{
-    prepare_target_with_mount_roots, protected_dir_identities, read_mount_roots, verify_identity,
-};
+use super::delete::{prepare_target_with_mount_roots, protected_dir_identities, verify_identity};
+use crate::fs::scanner::{parse_mount_points, parse_mount_roots};
 use rustix::fs::{
     mkdirat, openat2, renameat_with, unlinkat, AtFlags, Mode, OFlags, RenameFlags, ResolveFlags,
     CWD,
@@ -50,7 +49,7 @@ fn trash_with_destination<P: AsRef<Path>>(
         paths,
         verify,
         resolve,
-        read_mount_roots(),
+        fs::read("/proc/self/mountinfo"),
         protected_dir_identities(),
     )
 }
@@ -59,14 +58,15 @@ fn trash_with_destination_impl<P: AsRef<Path>>(
     paths: &[P],
     verify: impl Fn(&Path, &File) -> io::Result<()>,
     mut resolve: impl FnMut(&File) -> io::Result<(File, Option<PathBuf>)>,
-    mount_roots: io::Result<HashMap<PathBuf, PathBuf>>,
+    mountinfo: io::Result<Vec<u8>>,
     protected: Vec<(PathBuf, u64, u64)>,
 ) -> TrashResult {
     let mut result = TrashResult::default();
-    // One mountinfo read per batch (review round 1, Qodo finding 6), matching
-    // the delete path; an unreadable mount table fails the batch closed.
-    let mount_roots = match mount_roots {
-        Ok(roots) => roots,
+    // Exactly one mountinfo read per batch (review round 1, Qodo finding 6;
+    // cubic round 6): the bind-alias roots and the mount trie are built from
+    // the same snapshot. An unreadable mount table fails the batch closed.
+    let mountinfo = match mountinfo {
+        Ok(bytes) => bytes,
         Err(error) => {
             result.failed = paths
                 .iter()
@@ -75,8 +75,9 @@ fn trash_with_destination_impl<P: AsRef<Path>>(
             return result;
         }
     };
+    let mount_roots = parse_mount_roots(&mountinfo);
     let mut destinations = HashMap::new();
-    let topology = MountTopology::load();
+    let topology = MountTopology::from_mountinfo(&mountinfo);
     for path in paths {
         let path = path.as_ref();
         let moved: io::Result<()> = (|| {
@@ -135,22 +136,20 @@ impl MountTrieNode {
     }
 }
 
-/// Shared mount topology index loaded once per trash batch.
-/// Evaluates directory targets against an in-memory prefix trie in O(depth) rather
-/// than repeatedly rereading and parsing /proc/self/mountinfo on every target.
+/// Shared mount topology index built once per trash batch from the same
+/// mountinfo snapshot as the bind-alias guard. Evaluates directory targets
+/// against an in-memory prefix trie in O(depth) rather than repeatedly
+/// rereading and parsing /proc/self/mountinfo on every target.
 struct MountTopology {
-    root: io::Result<MountTrieNode>,
+    root: MountTrieNode,
 }
 
 impl MountTopology {
-    fn load() -> Self {
-        let root = fs::read("/proc/self/mountinfo").map(|topology| {
-            let mut root = MountTrieNode::default();
-            for mount in crate::fs::scanner::parse_mount_points(&topology) {
-                root.insert(&mount);
-            }
-            root
-        });
+    fn from_mountinfo(mountinfo: &[u8]) -> Self {
+        let mut root = MountTrieNode::default();
+        for mount in parse_mount_points(mountinfo) {
+            root.insert(&mount);
+        }
         Self { root }
     }
 
@@ -158,12 +157,8 @@ impl MountTopology {
         if !target.metadata()?.is_dir() {
             return Ok(());
         }
-        let root = match &self.root {
-            Ok(root) => root,
-            Err(e) => return Err(io::Error::new(e.kind(), e.to_string())),
-        };
         let path = fd_path(target)?;
-        if root.has_mount_at_or_under(&path) {
+        if self.root.has_mount_at_or_under(&path) {
             return Err(io::Error::from_raw_os_error(libc::EXDEV));
         }
         Ok(())
@@ -522,6 +517,7 @@ fn move_prepared_with_hook(
 
 #[cfg(test)]
 mod tests {
+    use super::super::delete::read_mount_roots;
     use super::*;
     use std::os::unix::fs::symlink;
 
@@ -547,7 +543,7 @@ mod tests {
             &[&source],
             |_, _| Ok(()),
             |parent| Ok((private_directory(parent, Path::new("Trash"))?, None)),
-            read_mount_roots(),
+            fs::read("/proc/self/mountinfo"),
             protected_dir_identities(),
         );
         assert!(result.failed.is_empty(), "{:?}", result.failed);
@@ -838,6 +834,7 @@ mod tests {
 
 #[cfg(test)]
 mod recovery_tests {
+    use super::super::delete::read_mount_roots;
     use super::*;
     use std::process::{Command, Stdio};
 
@@ -1032,6 +1029,7 @@ mod recovery_tests {
 
 #[cfg(test)]
 mod coverage_tests {
+    use super::super::delete::read_mount_roots;
     use super::*;
     use std::os::unix::fs::PermissionsExt;
 
@@ -1060,17 +1058,6 @@ mod coverage_tests {
     }
 
     #[test]
-    fn unreadable_mountinfo_maps_error() {
-        let topo = MountTopology {
-            root: Err(io::Error::other("mountinfo boom")),
-        };
-        let dir = tempfile::tempdir().unwrap();
-        let target = open_dir(dir.path());
-        let error = topo.check_target(&target).unwrap_err();
-        assert_eq!(error.to_string(), "mountinfo boom");
-    }
-
-    #[test]
     fn mount_under_target_refuses_with_exdev() {
         // Fake a mount at the target itself; canonicalize because fd paths
         // resolve symlinks (e.g. /tmp) while TempDir paths may not.
@@ -1078,7 +1065,7 @@ mod coverage_tests {
         let canonical = std::fs::canonicalize(dir.path()).unwrap();
         let mut trie = MountTrieNode::default();
         trie.insert(&canonical);
-        let topo = MountTopology { root: Ok(trie) };
+        let topo = MountTopology { root: trie };
         let target = open_dir(dir.path());
         let error = topo.check_target(&target).unwrap_err();
         assert_eq!(error.raw_os_error(), Some(libc::EXDEV));
@@ -1318,7 +1305,7 @@ mod coverage_tests {
             &[&victim],
             |_, _| Ok(()),
             resolve,
-            read_mount_roots(),
+            fs::read("/proc/self/mountinfo"),
             protected_dir_identities(),
         );
         assert!(
@@ -1361,7 +1348,7 @@ mod coverage_tests {
             &[&victim],
             |_, _| Ok(()),
             resolve,
-            read_mount_roots(),
+            fs::read("/proc/self/mountinfo"),
             protected_dir_identities(),
         );
         assert!(result.failed.is_empty(), "shared trash must succeed");
