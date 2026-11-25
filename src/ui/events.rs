@@ -1084,8 +1084,9 @@ mod key_view_tests {
                 "ghost key {code:?}"
             );
         }
-        // Refresh keys leave the view to the event loop instead of refreshing
-        // inline, so a live Docker or /proc query cannot stall the frame.
+        // Refresh keys leave the view to the event loop rather than querying
+        // Docker and /proc inline, so those reads run after the tree swap
+        // instead of interleaving with the frame that returned them.
         for code in [KeyCode::Char('r'), KeyCode::F(5)] {
             app.active_view = ActiveView::GhostInspector;
             assert!(
