@@ -115,9 +115,11 @@ pub fn scan_directory_with_options(
         );
     }
     // Sort root children descending by disk usage
-    root_entry
-        .children
-        .sort_by_key(|a| std::cmp::Reverse(a.disk_usage));
+    root_entry.children.sort_by(|a, b| {
+        b.disk_usage
+            .cmp(&a.disk_usage)
+            .then_with(|| a.name.cmp(&b.name))
+    });
 
     if let Some(ref tx) = progress_tx {
         let _ = tx.send(ScanProgress {
@@ -289,9 +291,11 @@ fn scan_dir_recursive(
             }
 
             // Sort child entries descending by disk usage
-            dir_node
-                .children
-                .sort_by_key(|a| std::cmp::Reverse(a.disk_usage));
+            dir_node.children.sort_by(|a, b| {
+                b.disk_usage
+                    .cmp(&a.disk_usage)
+                    .then_with(|| a.name.cmp(&b.name))
+            });
 
             sub_entries.push(dir_node);
         } else {
@@ -456,9 +460,11 @@ pub(crate) fn rescan_entry(
             &Arc::new(AtomicU64::new(0)),
             &Arc::new(Mutex::new(Instant::now())),
         );
-        entry
-            .children
-            .sort_by_key(|child| std::cmp::Reverse(child.disk_usage));
+        entry.children.sort_by(|a, b| {
+            b.disk_usage
+                .cmp(&a.disk_usage)
+                .then_with(|| a.name.cmp(&b.name))
+        });
     }
     Ok(entry)
 }
@@ -661,6 +667,33 @@ mod tests {
         );
         assert!(!rescanned.children.is_empty(), "the child was scanned");
         assert!(child_total > 0, "the child contributes real bytes");
+    }
+
+    /// Equal disk usage must still order deterministically. `sort_by_key` is
+    /// not stable, so ties previously fell back to readdir order, which varies
+    /// by filesystem — seeding directory inode usage created new ties and made
+    /// child order (and any position-based UI test) host-dependent.
+    #[test]
+    fn equal_disk_usage_sorts_by_name() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("aaa.bin"), vec![1u8; 4096]).unwrap();
+        std::fs::write(dir.path().join("zzz.bin"), vec![1u8; 4096]).unwrap();
+
+        // LIMITATION: btrfs returns readdir entries alphabetically, so this
+        // passes even with the unstable sort — it cannot prove the tie-break
+        // here. It becomes meaningful on a filesystem with different readdir
+        // order (CI's). The tie-break is nevertheless the correct behaviour:
+        // an unstable sort over equal keys has no defined order at all.
+        for _ in 0..5 {
+            let scanned =
+                scan_directory(dir.path(), None, Arc::new(AtomicBool::new(false))).unwrap();
+            let names: Vec<&str> = scanned.children.iter().map(|c| c.name.as_str()).collect();
+            assert_eq!(
+                names,
+                vec!["aaa.bin", "zzz.bin"],
+                "equal sizes must break ties by name, not readdir order"
+            );
+        }
     }
 
     #[test]
