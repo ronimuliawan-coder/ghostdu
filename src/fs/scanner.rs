@@ -37,6 +37,16 @@ fn is_excluded(path: &Path, excludes: &[String]) -> bool {
     excludes.iter().any(|p| path_str.contains(p))
 }
 
+/// Largest first, with a name tie-break so equal disk usage never inherits
+/// readdir order, which varies by filesystem.
+fn sort_children(children: &mut [FileEntry]) {
+    children.sort_by(|a, b| {
+        b.disk_usage
+            .cmp(&a.disk_usage)
+            .then_with(|| a.name.cmp(&b.name))
+    });
+}
+
 pub fn scan_directory(
     root_path: &Path,
     progress_tx: Option<Sender<ScanProgress>>,
@@ -115,11 +125,7 @@ pub fn scan_directory_with_options(
         );
     }
     // Sort root children descending by disk usage
-    root_entry.children.sort_by(|a, b| {
-        b.disk_usage
-            .cmp(&a.disk_usage)
-            .then_with(|| a.name.cmp(&b.name))
-    });
+    sort_children(&mut root_entry.children);
 
     if let Some(ref tx) = progress_tx {
         let _ = tx.send(ScanProgress {
@@ -291,11 +297,7 @@ fn scan_dir_recursive(
             }
 
             // Sort child entries descending by disk usage
-            dir_node.children.sort_by(|a, b| {
-                b.disk_usage
-                    .cmp(&a.disk_usage)
-                    .then_with(|| a.name.cmp(&b.name))
-            });
+            sort_children(&mut dir_node.children);
 
             sub_entries.push(dir_node);
         } else {
@@ -460,11 +462,7 @@ pub(crate) fn rescan_entry(
             &Arc::new(AtomicU64::new(0)),
             &Arc::new(Mutex::new(Instant::now())),
         );
-        entry.children.sort_by(|a, b| {
-            b.disk_usage
-                .cmp(&a.disk_usage)
-                .then_with(|| a.name.cmp(&b.name))
-        });
+        sort_children(&mut entry.children);
     }
     Ok(entry)
 }
@@ -669,10 +667,41 @@ mod tests {
         assert!(child_total > 0, "the child contributes real bytes");
     }
 
-    /// Equal disk usage must still order deterministically. `sort_by_key` is
-    /// not stable, so ties previously fell back to readdir order, which varies
-    /// by filesystem — seeding directory inode usage created new ties and made
-    /// child order (and any position-based UI test) host-dependent.
+    /// `sort_by_key` is stable, so equal keys preserve whatever order the
+    /// caller supplies. This proves the comparator replaces that order with a
+    /// name tie-break, including when the input is reversed.
+    #[test]
+    fn sort_children_breaks_size_ties_by_name_for_any_input_order() {
+        use crate::fs::entry::GhostKind;
+        fn entry(name: &str, disk_usage: u64) -> FileEntry {
+            FileEntry::new_file(
+                name.into(),
+                PathBuf::from(name),
+                0,
+                disk_usage,
+                false,
+                0,
+                0,
+                GhostKind::None,
+                DeleteSafety::UserData,
+            )
+        }
+        let forward = vec![
+            entry("zzz.bin", 4096),
+            entry("aaa.bin", 4096),
+            entry("big.bin", 8192),
+            entry("small.bin", 1024),
+        ];
+        let reversed: Vec<FileEntry> = forward.iter().cloned().rev().collect();
+        for mut entries in [forward, reversed] {
+            sort_children(&mut entries);
+            let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+            assert_eq!(names, ["big.bin", "aaa.bin", "zzz.bin", "small.bin"]);
+        }
+    }
+
+    /// End-to-end check that `scan_directory` applies the comparator to the
+    /// host's readdir order.
     #[test]
     fn equal_disk_usage_sorts_by_name() {
         let dir = tempfile::tempdir().unwrap();
@@ -680,10 +709,8 @@ mod tests {
         std::fs::write(dir.path().join("zzz.bin"), vec![1u8; 4096]).unwrap();
 
         // LIMITATION: btrfs returns readdir entries alphabetically, so this
-        // passes even with the unstable sort — it cannot prove the tie-break
-        // here. It becomes meaningful on a filesystem with different readdir
-        // order (CI's). The tie-break is nevertheless the correct behaviour:
-        // an unstable sort over equal keys has no defined order at all.
+        // passes even without the tie-break; the comparator test above is the
+        // regression proof. This still catches a scan that bypasses it.
         for _ in 0..5 {
             let scanned =
                 scan_directory(dir.path(), None, Arc::new(AtomicBool::new(false))).unwrap();

@@ -1898,9 +1898,12 @@ impl App {
     /// Apply a whole batch in one walk and recalculate each changed ancestor once.
     /// Returns visited nodes so regression tests can assert linear traversal work.
     fn apply_tree_updates(&mut self, mut updates: HashMap<PathBuf, Option<FileEntry>>) -> usize {
-        fn recalc(entry: &mut FileEntry) {
+        fn recalc(entry: &mut FileEntry, own_disk_usage: u64) {
             let mut total_size = 0u64;
-            let mut total_disk = 0u64;
+            // Seed from the directory's own inode allocation, exactly as the
+            // scanner aggregates; children alone would drop it when an
+            // ancestor is rebuilt after an incremental update.
+            let mut total_disk = own_disk_usage;
             let mut total_reclaimable = 0u64;
             let mut total_items = 0usize;
             let mut total_safe_reclaimable = 0u64;
@@ -1947,6 +1950,14 @@ impl App {
                 return false;
             }
             *visited += 1;
+            // Capture the directory's own inode allocation before children are
+            // replaced or removed; it is not derivable from the new children.
+            let own_disk_usage = entry.disk_usage.saturating_sub(
+                entry
+                    .children
+                    .iter()
+                    .fold(0u64, |sum, child| sum.saturating_add(child.disk_usage)),
+            );
             let mut changed = false;
             entry.children.retain_mut(|child| {
                 if updates.is_empty() {
@@ -1966,7 +1977,7 @@ impl App {
                 true
             });
             if changed {
-                recalc(entry);
+                recalc(entry, own_disk_usage);
             }
             changed
         }
@@ -2678,6 +2689,61 @@ mod reconciliation_tests {
         assert_eq!(app.root_entry.children.len(), 256);
         assert_eq!(app.root_entry.items_count, 257);
         assert_eq!(app.root_entry.size, 512);
+    }
+
+    #[test]
+    fn incremental_updates_preserve_each_directorys_own_inode_blocks() {
+        use crate::fs::entry::{DeleteSafety, FileEntry, GhostKind};
+        use std::os::unix::fs::MetadataExt;
+        use std::path::Path;
+
+        let fixture = tempfile::tempdir().unwrap();
+        let root_path = fixture.path().join("root");
+        let child_path = root_path.join("child");
+        fs::create_dir_all(&child_path).unwrap();
+        let root_meta = fs::symlink_metadata(&root_path).unwrap();
+        let child_meta = fs::symlink_metadata(&child_path).unwrap();
+        let child_own = child_meta.blocks() * 512;
+        const ROOT_OWN: u64 = 4096;
+
+        // Directory inode blocks are 0 on btrfs, so inject synthetic
+        // allocations to prove the accounting on every host.
+        let mut child = FileEntry::new_dir(
+            "child".into(),
+            child_path.clone(),
+            child_meta.dev(),
+            child_meta.ino(),
+            GhostKind::None,
+            DeleteSafety::UserData,
+        );
+        child.disk_usage = child_own + 8192;
+        child.own_mtime_secs = 1;
+        let mut root = FileEntry::new_dir(
+            "root".into(),
+            root_path.clone(),
+            root_meta.dev(),
+            root_meta.ino(),
+            GhostKind::None,
+            DeleteSafety::UserData,
+        );
+        root.disk_usage = ROOT_OWN + child.disk_usage;
+        root.children = vec![child];
+
+        let mut app = App::new(root);
+        let mut replacement = app.root_entry.children[0].clone();
+        replacement.disk_usage = child_own + 1024;
+        app.replace_subtree(Path::new(&child_path), replacement);
+
+        assert_eq!(
+            app.root_entry.disk_usage,
+            ROOT_OWN + child_own + 1024,
+            "recalculation must keep the root's own inode allocation"
+        );
+        assert_eq!(
+            app.root_entry.children[0].disk_usage,
+            child_own + 1024,
+            "a replaced subtree keeps its freshly scanned total"
+        );
     }
 
     #[test]
