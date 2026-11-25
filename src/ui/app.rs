@@ -565,6 +565,7 @@ impl App {
             self.item_info = get_detailed_item_info(
                 &target.path,
                 target.items_count,
+                Some(target.disk_usage),
                 self.cow && !self.imported,
             );
             self.previous_view = self.active_view;
@@ -2020,6 +2021,7 @@ impl App {
                 self.item_info = crate::fs::mount_info::get_detailed_item_info(
                     &target.path,
                     target.items_count,
+                    Some(target.disk_usage),
                     self.cow && !self.imported,
                 );
             }
