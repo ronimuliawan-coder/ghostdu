@@ -167,7 +167,7 @@ pub struct App {
     /// Scroll offset for the multi-target list in the confirmation modal.
     pub confirm_list_offset: usize,
     /// Itemized Docker prune selection (audit H4), indexed like
-    /// `prune_category_labels()`. Dangling images default on; the three
+    /// `prune_categories()`. Dangling images default on; the three
     /// unfiltered destructive categories must be opted into explicitly.
     pub docker_prune_selection: [bool; 4],
     /// Cursor inside the itemized Docker prune modal.

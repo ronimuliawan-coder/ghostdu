@@ -9,6 +9,4 @@ pub use detector::{classify_path, classify_safety, is_virtual_fs_path};
 /// real daemon), so the re-export is gated with the definition.
 #[cfg(not(tarpaulin_include))]
 pub use docker::prune_docker_categories;
-pub use docker::{
-    fetch_docker_disk_info, parse_docker_df_json, prune_category_labels, DockerDiskInfo,
-};
+pub use docker::{fetch_docker_disk_info, parse_docker_df_json, prune_categories, DockerDiskInfo};
