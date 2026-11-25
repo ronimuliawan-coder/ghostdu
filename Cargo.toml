@@ -2,6 +2,10 @@
 name = "ghostdu"
 version = "0.1.1"
 edition = "2021"
+# Minimum supported Rust version. Declared as the toolchain CI actually builds
+# and tests against (rust-toolchain.toml), not a guessed older floor: an MSRV
+# nobody tests is a promise the project cannot keep.
+rust-version = "1.99.1"
 authors = ["Roni Muliawan <ronimuliawan12@gmail.com>"]
 license = "MIT"
 description = "Modern, native Linux disk usage & ghost file analyzer with wastebin support"

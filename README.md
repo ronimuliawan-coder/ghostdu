@@ -204,6 +204,12 @@ All 258 unit and integration tests verify:
 
 ---
 
+## 🔐 Security
+
+Report vulnerabilities privately — see [SECURITY.md](SECURITY.md) for the
+channel, scope, and supported versions. The guarantees this tool does and does
+not make are in the safety-model sections above.
+
 ## 📄 License
 
 This project is licensed under the [MIT License](LICENSE) - see the LICENSE file for details.
