@@ -99,6 +99,10 @@ jobs:
           # above materializes refs/tags/<release>. Notes are the tag
           # annotation; a lightweight tag fails visibly and must be annotated
           # (house invariant: every release tag is annotated).
-          gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
+          #
+          # No --repo here: gh rejects `--notes-from-tag` combined with
+          # `--repo` ("using --notes-from-tag with --repo is not supported"),
+          # and the checkout above already establishes the repository.
+          gh release create "$GITHUB_REF_NAME" \
             --title "$GITHUB_REF_NAME" --notes-from-tag \
             ghostdu-*.tar.gz ghostdu-*.tar.gz.sha256
