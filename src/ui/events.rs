@@ -427,6 +427,8 @@ fn handle_filesystem_keys(app: &mut App, key: KeyEvent) -> EventResult {
 
         // Ghost & Docker
         KeyCode::Tab | KeyCode::Char('g') => {
+            // First open pays for the Docker and /proc queries; startup did not.
+            app.ensure_ghost_loaded();
             app.active_view = ActiveView::GhostInspector;
             EventResult::Continue
         }
@@ -870,7 +872,11 @@ mod key_action_tests {
             handle_key_event(app, key(KeyCode::Esc)),
             EventResult::Continue
         ));
-        // Item info modal and its keys.
+        // Item info modal and its keys. Both close keys are exercised while
+        // the modal is open: Enter on the filesystem view opens the selected
+        // directory, so closing with 'I' first would navigate whenever the
+        // size ordering puts a directory first (ext4, where directories claim
+        // inode blocks) and later assertions would inspect its children.
         assert!(matches!(
             handle_key_event(app, key(KeyCode::Char('i'))),
             EventResult::Continue
@@ -881,14 +887,21 @@ mod key_action_tests {
             EventResult::Continue
         ));
         assert!(matches!(
-            handle_key_event(app, key(KeyCode::Char('I'))),
-            EventResult::Continue
-        ));
-        assert!(matches!(
             handle_key_event(app, key(KeyCode::Enter)),
             EventResult::Continue
         ));
         assert_eq!(app.active_view, ActiveView::Filesystem);
+        assert!(matches!(
+            handle_key_event(app, key(KeyCode::Char('i'))),
+            EventResult::Continue
+        ));
+        assert_eq!(app.active_view, ActiveView::ItemInfoModal);
+        assert!(matches!(
+            handle_key_event(app, key(KeyCode::Char('I'))),
+            EventResult::Continue
+        ));
+        assert_eq!(app.active_view, ActiveView::Filesystem);
+        assert!(app.path_stack.is_empty());
         // Search mode captures typing, Enter/Escape leave it.
         assert!(matches!(
             handle_key_event(app, key(KeyCode::Char('/'))),
