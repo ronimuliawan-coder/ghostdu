@@ -254,12 +254,20 @@ fn bind_mount_boundaries_and_ancestor_cycles() {
 
     // Audit H2 regression: a bind alias of /etc must be undeletable — the alias
     // root itself (NO_XDEV) and, under cross_mounts scans, everything beneath
-    // it (mountinfo fs-root guardrail). /etc content must stay intact.
+    // it (mountinfo fs-root guardrail). The bind is remounted read-only so a
+    // guard regression cannot unlink the real /etc/hosts before the assertion
+    // fails (Qodo round 6); the source mount stays writable.
     let etc_alias = root.join("etc-alias");
     fs::create_dir_all(&etc_alias).unwrap();
     assert!(Command::new("mount")
         .arg("--bind")
         .arg("/etc")
+        .arg(&etc_alias)
+        .status()
+        .unwrap()
+        .success());
+    assert!(Command::new("mount")
+        .args(["-o", "remount,bind,ro"])
         .arg(&etc_alias)
         .status()
         .unwrap()
@@ -283,6 +291,16 @@ fn bind_mount_boundaries_and_ancestor_cycles() {
         .iter()
         .any(|entry| entry.path == etc_alias));
     let result = ghostdu::ops::permanently_delete(&[etc_alias.join("hosts")]);
+    // Unmount before asserting so a failed assertion cannot leave the alias
+    // mounted and cleanup always runs.
+    assert!(
+        Command::new("umount")
+            .arg(&etc_alias)
+            .status()
+            .unwrap()
+            .success(),
+        "etc-alias mount must unmount"
+    );
     assert!(result.succeeded.is_empty(), "{:?}", result.succeeded);
     assert_eq!(result.failed.len(), 1);
     assert!(
@@ -291,11 +309,6 @@ fn bind_mount_boundaries_and_ancestor_cycles() {
         result.failed[0].1
     );
     assert!(Path::new("/etc/hosts").exists(), "/etc/hosts must survive");
-    assert!(Command::new("umount")
-        .arg(&etc_alias)
-        .status()
-        .unwrap()
-        .success());
 
     // TempDir cleanup must happen after unmounting the synthetic filesystems.
     for mount in [&ancestor, &bind, &other_device] {

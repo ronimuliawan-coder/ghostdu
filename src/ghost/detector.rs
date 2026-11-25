@@ -1,4 +1,5 @@
 use crate::fs::entry::{DeleteSafety, GhostKind};
+use std::ffi::OsStr;
 use std::path::{Component, Path};
 
 /// Case-insensitive ASCII suffix match without allocating a lowercased copy.
@@ -351,9 +352,12 @@ fn is_recognized_cache_unit(path: &Path) -> bool {
     false
 }
 
-/// True when `path`'s parent is a home directory: a user directory directly
-/// under `/home`, or `/root`. Exotic `XDG_CACHE_HOME` overrides fall through
-/// to UserData — the conservative direction.
+/// True when `path`'s parent is a home directory: `/home/<user>`, `/root`, or
+/// their canonical OSTree forms `/var/home/<user>` and `/var/roothome` (the
+/// scanner canonicalizes before classifying, and OSTree's documented layout
+/// resolves `/home` and `/root` there). A penultimate `home` elsewhere in the
+/// path (`/mnt/home/alice/.cache`) is not a home. Exotic `XDG_CACHE_HOME`
+/// overrides fall through to UserData — the conservative direction.
 fn is_home_cache_root(path: &Path) -> bool {
     // A path ending in `.cache` always has a parent; the empty fallback only
     // serves the type and classifies as false below.
@@ -363,20 +367,16 @@ fn is_home_cache_root(path: &Path) -> bool {
         Some(Component::RootDir) => {}
         _ => return false,
     }
-    let mut second_last: Option<Component<'_>> = None;
-    let mut last: Option<Component<'_>> = None;
-    let mut depth = 0;
-    for component in parent_components {
-        second_last = last.take();
-        last = Some(component);
-        depth += 1;
+    let names: Vec<&OsStr> = parent_components.map(Component::as_os_str).collect();
+    match names.as_slice() {
+        [name] => *name == OsStr::new("root"),
+        [first, second] => {
+            *first == OsStr::new("home")
+                || (*first == OsStr::new("var") && *second == OsStr::new("roothome"))
+        }
+        [first, second, _] => *first == OsStr::new("var") && *second == OsStr::new("home"),
+        _ => false,
     }
-    if depth == 1 {
-        return last.is_some_and(|c| c.as_os_str().as_encoded_bytes() == b"root");
-    }
-    // Exactly `/home/<user>`: a penultimate `home` deeper in the path
-    // (`/mnt/home/alice/.cache`) is not a home cache root (cubic round 6).
-    depth == 2 && second_last.is_some_and(|c| c.as_os_str().as_encoded_bytes() == b"home")
 }
 
 /// Classifies a path and its ghost kind into a Deletion Safety Tier:
@@ -1095,6 +1095,27 @@ mod tests {
         assert_eq!(
             classify_safety(&foreign_home, classify_path(&foreign_home)),
             DeleteSafety::UserData
+        );
+        // Canonical OSTree layouts (Qodo round 6): the scanner classifies
+        // canonical paths, so /home and /root arrive as /var/home and
+        // /var/roothome and must keep the cache-root classification.
+        for path in ["/var/home/alice/.cache", "/var/roothome/.cache"] {
+            let path = PathBuf::from(path);
+            assert_eq!(classify_path(&path), GhostKind::BuildCache, "{path:?}");
+            assert_eq!(
+                classify_safety(&path, GhostKind::BuildCache),
+                DeleteSafety::Recheck,
+                "{path:?}"
+            );
+        }
+        assert_eq!(
+            classify_path(&PathBuf::from("/var/home/alice/proj/.cache")),
+            GhostKind::None
+        );
+        // `/var/home` parents user homes; it is not a home itself.
+        assert_eq!(
+            classify_path(&PathBuf::from("/var/home/.cache")),
+            GhostKind::None
         );
         assert_eq!(
             classify_path(&PathBuf::from("/home/ron/.cache/personal/notes.txt")),
