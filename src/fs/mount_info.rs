@@ -174,10 +174,12 @@ fn display_disk_usage(is_dir: bool, inode_usage: u64, subtree_disk_usage: Option
     }
 }
 
-/// A file occupying zero blocks is sparse (or stored inline), not broken.
-/// Directories are excluded: their inode figure says nothing about contents.
-fn is_zero_block_file(is_dir: bool, blocks: u64) -> bool {
-    !is_dir && blocks == 0
+/// A non-empty file occupying zero blocks is sparse (or stored inline), not
+/// broken. Directories are excluded: their inode figure says nothing about
+/// contents. A zero-length file is excluded too: it occupies nothing because
+/// it holds nothing, so calling it sparse or inline would be wrong.
+fn is_zero_block_file(is_dir: bool, blocks: u64, apparent_size: u64) -> bool {
+    !is_dir && blocks == 0 && apparent_size > 0
 }
 
 /// `subtree_disk_usage` is the scanned total for a directory, or `None` when
@@ -206,7 +208,7 @@ pub fn get_detailed_item_info(
     // hard-link duplicate, whose tree entry is deliberately zeroed so the
     // parent aggregate counts it once.
     let disk_usage = display_disk_usage(is_dir, inode_disk_usage, subtree_disk_usage);
-    let is_zero_block = is_zero_block_file(is_dir, meta.blocks());
+    let is_zero_block = is_zero_block_file(is_dir, meta.blocks(), apparent_size);
 
     let mode_str = format_mode(mode, is_dir, is_symlink);
     let mode_octal = mode & 0o7777;
@@ -467,12 +469,24 @@ mod coverage_tests {
     }
 
     #[test]
-    fn zero_block_detection_excludes_directories() {
-        assert!(is_zero_block_file(false, 0), "a zero-block file is flagged");
-        assert!(!is_zero_block_file(false, 8), "an allocated file is not");
+    fn zero_block_detection_excludes_directories_and_empty_files() {
         assert!(
-            !is_zero_block_file(true, 0),
+            is_zero_block_file(false, 0, 848),
+            "a non-empty zero-block file is flagged"
+        );
+        assert!(
+            !is_zero_block_file(false, 8, 848),
+            "an allocated file is not flagged"
+        );
+        assert!(
+            !is_zero_block_file(true, 0, 4096),
             "a directory is never flagged, whatever its inode says"
+        );
+        // A zero-length file occupies nothing because it holds nothing; it is
+        // neither sparse nor inline, so the qualifier would be a lie.
+        assert!(
+            !is_zero_block_file(false, 0, 0),
+            "an empty file is not 'sparse or inline'"
         );
     }
 

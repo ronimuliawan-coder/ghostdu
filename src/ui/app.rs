@@ -2033,8 +2033,14 @@ impl App {
     /// an open item-info modal, and the cursor clamp.
     fn refresh_after_scan(&mut self) {
         self.refresh_fs_info();
-        self.docker_info = crate::ghost::fetch_docker_disk_info();
-        self.deleted_open_files = crate::ghost::scan_deleted_open_files();
+        // Re-query ghost data only when it was already fetched. The inspector
+        // is the sole consumer, so a rescan before it is ever opened must stay
+        // as cheap as startup: fetching here would reintroduce the Docker
+        // stall (up to 14 s against a wedged daemon) and, without setting the
+        // flag, make the first Tab/g pay for the same queries again.
+        if self.ghost_loaded {
+            self.refresh_ghost_info();
+        }
         if self.active_view == ActiveView::ItemInfoModal {
             let visible = self.visible_children();
             if let Some(target) = visible.get(self.cursor_index) {
