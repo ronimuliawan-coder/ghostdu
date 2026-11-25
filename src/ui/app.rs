@@ -3,7 +3,7 @@ use crate::fs::mount_info::{get_detailed_item_info, query_fs_info, DetailedItemI
 use crate::fs::scanner::ScannerOptions;
 /// Live-daemon prune; gated with its definition (excluded from coverage).
 #[cfg(not(tarpaulin_include))]
-use crate::ghost::prune_docker_dangling;
+use crate::ghost::prune_docker_categories;
 use crate::ghost::{
     classify_path, classify_safety, describe_pid_ghost, fetch_docker_disk_info, proc_start_time,
     scan_deleted_open_files, DeletedOpenFile, DockerDiskInfo,
@@ -166,6 +166,12 @@ pub struct App {
     pub action_total_size: u64,
     /// Scroll offset for the multi-target list in the confirmation modal.
     pub confirm_list_offset: usize,
+    /// Itemized Docker prune selection (audit H4), indexed like
+    /// `prune_categories()`. Dangling images default on; the three
+    /// unfiltered destructive categories must be opted into explicitly.
+    pub docker_prune_selection: [bool; 4],
+    /// Cursor inside the itemized Docker prune modal.
+    pub docker_prune_cursor: usize,
     pub action_safety_blocked: bool,
     pub action_has_recheck: bool,
     pub action_has_system: bool,
@@ -233,6 +239,8 @@ impl App {
             action_targets: Vec::new(),
             action_total_size: 0,
             confirm_list_offset: 0,
+            docker_prune_selection: [true, false, false, false],
+            docker_prune_cursor: 0,
             action_safety_blocked: false,
             action_has_recheck: false,
             action_has_system: false,
@@ -1463,6 +1471,10 @@ impl App {
         self.action_has_system = false;
         self.action_has_recheck = false;
         self.action_safety_blocked = false;
+        // Itemized defaults (audit H4): dangling images on, the three
+        // unfiltered destructive categories off until explicitly selected.
+        self.docker_prune_selection = [true, false, false, false];
+        self.docker_prune_cursor = 0;
         self.pending_action = Some(ConfirmAction::DockerPrune);
         self.previous_view = self.active_view;
         self.active_view = ActiveView::ConfirmModal;
@@ -1473,7 +1485,7 @@ impl App {
     #[cfg(not(tarpaulin_include))]
     #[allow(unexpected_cfgs)]
     fn execute_docker_prune(&mut self) {
-        match prune_docker_dangling() {
+        match prune_docker_categories(&self.docker_prune_selection) {
             Ok(msg) => {
                 self.refresh_ghost_info();
                 self.set_status(format!("✔ Docker Prune: {}", msg));

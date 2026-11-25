@@ -444,6 +444,30 @@ pub fn truncate_start_by_width(s: &str, max_width: usize) -> String {
     format!("{}{}", marker, &s[start..])
 }
 
+/// Renders C0 control characters (including ESC, the terminal-escape injection
+/// vector) as visible control pictures, so a crafted file, directory or
+/// process name cannot rewrite the screen or title through render boundaries
+/// (audit M1). DEL becomes the symbol-for-delete picture. Char-level on
+/// purpose: bytes 0x80–0x9f are UTF-8 continuation bytes of legitimate
+/// characters, and C1 code points carried in valid UTF-8 are two bytes the
+/// terminal cannot misread as escape leads, so they pass through untouched.
+/// Display-only: scan, export and snapshot data stay raw.
+pub fn sanitize_control_chars(text: &str) -> std::borrow::Cow<'_, str> {
+    let needs_sanitizing = text.chars().any(|c| c < '\u{20}' || c == '\u{7f}');
+    if !needs_sanitizing {
+        return std::borrow::Cow::Borrowed(text);
+    }
+    std::borrow::Cow::Owned(
+        text.chars()
+            .map(|c| match c {
+                '\u{7f}' => '\u{2421}',
+                c if c < '\u{20}' => char::from_u32(0x2400 + c as u32).unwrap_or('\u{fffd}'),
+                _ => c,
+            })
+            .collect(),
+    )
+}
+
 #[cfg(test)]
 mod coverage_tests {
     use super::*;
@@ -619,5 +643,28 @@ mod coverage_tests {
         assert_eq!(age_glyph(AgeTier::Warm), "💤");
         assert_eq!(age_glyph(AgeTier::Cold), "🧊");
         assert_eq!(age_glyph(AgeTier::Unknown), "");
+    }
+
+    /// Audit M1: control characters render as pictures so a crafted name
+    /// cannot inject terminal escape sequences; legitimate multibyte
+    /// characters survive untouched, and clean strings stay borrowed.
+    #[test]
+    fn control_chars_render_as_pictures_and_multibyte_survives() {
+        // Clean text is borrowed unchanged.
+        match sanitize_control_chars("héllo wörld") {
+            std::borrow::Cow::Borrowed(text) => assert_eq!(text, "héllo wörld"),
+            std::borrow::Cow::Owned(_) => panic!("clean text must not allocate"),
+        }
+        // The ESC-injection vector becomes a visible picture.
+        let sanitized = sanitize_control_chars("evil\u{1b}]0;pwned\u{7}");
+        assert_eq!(sanitized, "evil\u{241b}]0;pwned\u{2407}");
+        assert!(!sanitized.contains('\u{1b}'));
+        // Newlines, tabs, carriage returns and DEL are all defused.
+        assert_eq!(
+            sanitize_control_chars("a\nb\tc\rd\u{7f}"),
+            "a\u{240a}b\u{2409}c\u{240d}d\u{2421}"
+        );
+        // C1 code points and multibyte characters pass through byte-safely.
+        assert_eq!(sanitize_control_chars("résumé\u{85}"), "résumé\u{85}");
     }
 }

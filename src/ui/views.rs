@@ -1,4 +1,7 @@
-use crate::fs::entry::{format_count, format_count_short, format_size, DeleteSafety, GhostKind};
+use crate::fs::entry::{
+    format_count, format_count_short, format_size, sanitize_control_chars, DeleteSafety, GhostKind,
+};
+use crate::ghost::prune_categories;
 use crate::ui::app::{ActiveView, App, ConfirmAction, GhostFilterMode};
 use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
@@ -59,7 +62,8 @@ pub fn render_scan_progress(
 
     let files_str = format_count(progress.files_scanned as usize);
     let bytes_str = format_size(progress.bytes_scanned);
-    let path_str = progress.current_path.to_string_lossy();
+    let path_lossy = progress.current_path.to_string_lossy();
+    let path_str = sanitize_control_chars(&path_lossy);
 
     let lines = vec![
         Line::from(vec![
@@ -202,7 +206,8 @@ fn render_header(f: &mut Frame, app: &App, area: Rect, header_len: u16) {
     }
 
     let current_dir = app.current_dir_entry();
-    let current_path = current_dir.path.to_string_lossy();
+    let current_path_lossy = current_dir.path.to_string_lossy();
+    let current_path = sanitize_control_chars(&current_path_lossy);
     let count_str = format_count(current_dir.items_count);
 
     let (sel_count, sel_size) = app.selection_summary();
@@ -973,10 +978,13 @@ fn render_filesystem_view(f: &mut Frame, app: &App, area: Rect) {
                 .btrfs_subvols
                 .get(&entry.path)
                 .filter(|_| !app.imported)
-                .map(|name| format!(" ⛁{name}"))
+                .map(|name| format!(" ⛁{}", sanitize_control_chars(name)))
                 .unwrap_or_default();
 
             // In narrow modes (2 & 3), embed ghost badge & safety directly into name column
+            // Names are untrusted (audit M1): control characters render as
+            // pictures so they cannot inject terminal escapes here.
+            let entry_name = sanitize_control_chars(&entry.name);
             let display_name = if col_mode >= 2 {
                 if entry.ghost_kind.is_ghost() {
                     format!(
@@ -984,7 +992,7 @@ fn render_filesystem_view(f: &mut Frame, app: &App, area: Rect) {
                         icon,
                         entry.delete_safety.glyph(),
                         entry.ghost_kind.badge(),
-                        entry.name,
+                        entry_name,
                         subvol_suffix,
                     )
                 } else if entry.delete_safety == DeleteSafety::System {
@@ -992,14 +1000,14 @@ fn render_filesystem_view(f: &mut Frame, app: &App, area: Rect) {
                         "{}{} SYSTEM {}{}",
                         icon,
                         entry.delete_safety.glyph(),
-                        entry.name,
+                        entry_name,
                         subvol_suffix,
                     )
                 } else {
-                    format!("{}{}{}", icon, entry.name, subvol_suffix)
+                    format!("{}{}{}", icon, entry_name, subvol_suffix)
                 }
             } else {
-                format!("{}{}{}", icon, entry.name, subvol_suffix)
+                format!("{}{}{}", icon, entry_name, subvol_suffix)
             };
 
             let display_name = format!(
@@ -1391,11 +1399,12 @@ fn render_ghost_inspector(f: &mut Frame, app: &App, area: Rect) {
 
 fn render_docker_tab(f: &mut Frame, app: &App, area: Rect) {
     if !app.docker_info.is_available {
-        let err_msg = app
-            .docker_info
-            .error_message
-            .as_deref()
-            .unwrap_or("Docker daemon is not reachable at /var/run/docker.sock");
+        let err_msg = sanitize_control_chars(
+            app.docker_info
+                .error_message
+                .as_deref()
+                .unwrap_or("Docker daemon is not reachable at /var/run/docker.sock"),
+        );
         let p = Paragraph::new(vec![
             Line::from(Span::styled(
                 "Docker Daemon Unavailable",
@@ -1471,7 +1480,7 @@ fn render_docker_tab(f: &mut Frame, app: &App, area: Rect) {
                     Span::styled(item.category, cat_style),
                 ]),
                 Line::from(Span::styled(
-                    &item.id_or_name,
+                    sanitize_control_chars(&item.id_or_name),
                     Style::default().fg(Color::White),
                 )),
                 Line::from(Span::styled(
@@ -1480,7 +1489,7 @@ fn render_docker_tab(f: &mut Frame, app: &App, area: Rect) {
                 )),
                 Line::from(recl_span),
                 Line::from(Span::styled(
-                    &item.details,
+                    sanitize_control_chars(&item.details),
                     Style::default().fg(Color::Gray),
                 )),
             ])
@@ -1570,7 +1579,7 @@ fn render_docker_summary(f: &mut Frame, app: &App, area: Rect) {
         ),
         Span::raw(" │ "),
         Span::styled(
-            "[p] Prune Dangling Resources",
+            "[p] Prune Docker Ghosts",
             Style::default()
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::BOLD),
@@ -1629,7 +1638,7 @@ fn render_deleted_open_tab(f: &mut Frame, app: &App, area: Rect) {
             Row::new(vec![
                 Line::from(format!("{}{}", cursor, item.pid)),
                 Line::from(Span::styled(
-                    &item.process_name,
+                    sanitize_control_chars(&item.process_name),
                     Style::default().fg(Color::LightYellow),
                 )),
                 Line::from(Span::styled(
@@ -1639,7 +1648,7 @@ fn render_deleted_open_tab(f: &mut Frame, app: &App, area: Rect) {
                         .add_modifier(Modifier::BOLD),
                 )),
                 Line::from(Span::styled(
-                    &item.original_path,
+                    sanitize_control_chars(&item.original_path),
                     Style::default().fg(Color::White),
                 )),
             ])
@@ -1750,7 +1759,10 @@ fn render_top_files(f: &mut Frame, app: &App, area: Rect) {
                 format!("{:>4}", index + 1),
                 size,
                 top.safety.badge().to_string(),
-                truncate_path(&top.path.to_string_lossy(), path_budget.max(8)),
+                truncate_path(
+                    &sanitize_control_chars(&top.path.to_string_lossy()),
+                    path_budget.max(8),
+                ),
             ])
         })
         .collect();
@@ -1852,7 +1864,7 @@ fn render_janitor(f: &mut Frame, app: &App, area: Rect) {
                 let checkbox = if item.selected { "[x]" } else { "[ ]" };
                 push_row!(Row::new(vec![
                     checkbox.to_string(),
-                    format!("    {}", item.display),
+                    format!("    {}", sanitize_control_chars(&item.display)),
                     format_size(item.size),
                 ]));
             }
@@ -1900,7 +1912,18 @@ fn render_confirm_modal(f: &mut Frame, app: &App, screen: Rect) {
     // shows a page with scroll hints instead of rebuilding per frame.
     let show_targets = !app.action_safety_blocked && app.action_targets.len() > 1;
     let popup_width = 65.min(screen.width.saturating_sub(4));
-    let popup_height = if show_targets { 21 } else { 14 }.min(screen.height.saturating_sub(4));
+    // The itemized Docker modal carries eleven information lines (four
+    // categories plus copy) against ten rows in the 14-row non-target layout;
+    // it gets two extra rows so the last warning is not clipped (Qodo round 1
+    // on PR #12).
+    let popup_height = if show_targets {
+        21
+    } else if matches!(action, ConfirmAction::DockerPrune) {
+        16
+    } else {
+        14
+    }
+    .min(screen.height.saturating_sub(4));
 
     let area = Rect {
         x: (screen.width.saturating_sub(popup_width)) / 2,
@@ -1952,7 +1975,10 @@ fn render_confirm_modal(f: &mut Frame, app: &App, screen: Rect) {
 
         if let Some(first) = app.action_targets.first() {
             infos.push(Line::from(Span::styled(
-                format!("Protected Path: {}", first.to_string_lossy()),
+                format!(
+                    "Protected Path: {}",
+                    sanitize_control_chars(&first.to_string_lossy())
+                ),
                 Style::default().fg(Color::LightYellow),
             )));
         }
@@ -2016,7 +2042,10 @@ fn render_confirm_modal(f: &mut Frame, app: &App, screen: Rect) {
 
                 if let Some(first) = app.action_targets.first() {
                     infos.push(Line::from(Span::styled(
-                        format!("Target: {}", first.to_string_lossy()),
+                        format!(
+                            "Target: {}",
+                            sanitize_control_chars(&first.to_string_lossy())
+                        ),
                         Style::default().fg(Color::Yellow),
                     )));
                 }
@@ -2079,7 +2108,10 @@ fn render_confirm_modal(f: &mut Frame, app: &App, screen: Rect) {
 
                 if let Some(first) = app.action_targets.first() {
                     infos.push(Line::from(Span::styled(
-                        format!("Target: {}", first.to_string_lossy()),
+                        format!(
+                            "Target: {}",
+                            sanitize_control_chars(&first.to_string_lossy())
+                        ),
                         Style::default().fg(Color::Yellow),
                     )));
                 }
@@ -2087,13 +2119,12 @@ fn render_confirm_modal(f: &mut Frame, app: &App, screen: Rect) {
                 (title, border_color, prompt, infos)
             }
             ConfirmAction::DockerPrune => {
-                let sz = format_size(app.action_total_size);
                 let title = " 🐳  DOCKER SYSTEM PRUNE ";
                 let border_color = Color::Yellow;
 
                 let prompt = Line::from(vec![
                     Span::styled(
-                        " [y] Prune Dangling Resources ",
+                        " [y] Prune Selected ",
                         Style::default()
                             .bg(Color::Yellow)
                             .fg(Color::Black)
@@ -2106,24 +2137,64 @@ fn render_confirm_modal(f: &mut Frame, app: &App, screen: Rect) {
                     ),
                 ]);
 
-                let infos = vec![
+                // Itemized confirmation (audit H4): each category carries its
+                // own reclaimable size and selection state; the three
+                // unfiltered destructive categories default off so a
+                // kept-for-logs container never dies behind one generic y.
+                let sizes = [
+                    app.docker_info.images_reclaimable_size,
+                    app.docker_info.containers_reclaimable_size,
+                    app.docker_info.volumes_reclaimable_size,
+                    app.docker_info.build_cache_reclaimable_size,
+                ];
+                let mut infos = vec![
                     Line::from(Span::styled(
-                        format!("Reclaim up to {} of Docker ghost data?", sz),
+                        "Select what to prune:  ↑/↓ move · Space toggles",
                         Style::default()
                             .fg(Color::White)
                             .add_modifier(Modifier::BOLD),
                     )),
                     Line::from(""),
-                    Line::from(Span::styled(
-                        "🟢 SAFE: Only removes stopped containers, dangling images & build cache.",
-                        Style::default().fg(Color::LightGreen),
-                    )),
-                    Line::from(Span::styled(
-                        "Running containers and named volumes will NOT be affected.",
-                        Style::default().fg(Color::DarkGray),
-                    )),
-                    Line::from(""),
                 ];
+                for (index, category) in prune_categories().iter().enumerate() {
+                    let marker = if app.docker_prune_selection[index] {
+                        "[x]"
+                    } else {
+                        "[ ]"
+                    };
+                    // The category owns whether its total is an upper bound:
+                    // the volume total counts named volumes that a default
+                    // prune keeps on modern daemons (Qodo rounds 1–2).
+                    let size = if category.size_is_upper_bound {
+                        format!("≤{}", format_size(sizes[index]))
+                    } else {
+                        format_size(sizes[index])
+                    };
+                    let line = format!(" {} {:<12} {:>10}", marker, category.label, size);
+                    let style = if index == app.docker_prune_cursor {
+                        Style::default().fg(Color::Black).bg(Color::Yellow)
+                    } else {
+                        Style::default().fg(Color::White)
+                    };
+                    infos.push(Line::from(Span::styled(line, style)));
+                }
+                infos.push(Line::from(""));
+                infos.push(Line::from(Span::styled(
+                    "Images: dangling only. Build cache: unused only.",
+                    Style::default().fg(Color::LightGreen),
+                )));
+                infos.push(Line::from(Span::styled(
+                    "Containers: stopped ones (incl. kept-for-logs) removed;",
+                    Style::default().fg(Color::DarkGray),
+                )));
+                infos.push(Line::from(Span::styled(
+                    "running containers survive.",
+                    Style::default().fg(Color::DarkGray),
+                )));
+                infos.push(Line::from(Span::styled(
+                    "Volumes: unused anonymous; Docker <23 removes named too.",
+                    Style::default().fg(Color::DarkGray),
+                )));
 
                 (title, border_color, prompt, infos)
             }
@@ -2156,7 +2227,7 @@ fn render_confirm_modal(f: &mut Frame, app: &App, screen: Rect) {
 
                 let infos = vec![
                     Line::from(Span::styled(
-                        format!("Terminate '{name}' (PID {pid})?"),
+                        format!("Terminate '{}' (PID {pid})?", sanitize_control_chars(name)),
                         Style::default()
                             .fg(Color::White)
                             .add_modifier(Modifier::BOLD),
@@ -2212,7 +2283,7 @@ fn render_confirm_modal(f: &mut Frame, app: &App, screen: Rect) {
         for target in app.action_targets.iter().skip(offset).take(PAGE) {
             info_lines.push(Line::from(format!(
                 "  • {}",
-                truncate_path(&target.to_string_lossy(), budget)
+                truncate_path(&sanitize_control_chars(&target.to_string_lossy()), budget)
             )));
         }
         let shown = offset + PAGE.min(total.saturating_sub(offset));
@@ -2410,7 +2481,10 @@ fn render_item_info_modal(f: &mut Frame, app: &App, screen: Rect) {
     };
 
     let max_p = (popup_width as usize).saturating_sub(10);
-    let trunc_p = truncate_path(&info.full_path.to_string_lossy(), max_p);
+    let trunc_p = truncate_path(
+        &sanitize_control_chars(&info.full_path.to_string_lossy()),
+        max_p,
+    );
 
     lines.push(Line::from(vec![
         Span::styled(
@@ -2420,7 +2494,7 @@ fn render_item_info_modal(f: &mut Frame, app: &App, screen: Rect) {
                 .add_modifier(Modifier::BOLD),
         ),
         Span::styled(
-            &info.name,
+            sanitize_control_chars(&info.name),
             Style::default()
                 .fg(Color::White)
                 .add_modifier(Modifier::BOLD),
@@ -2600,6 +2674,7 @@ fn render_item_info_modal(f: &mut Frame, app: &App, screen: Rect) {
         if !is_compact {
             lines.push(Line::from(""));
         }
+        let mount_point = fs.mount_point.to_string_lossy();
         lines.push(Line::from(vec![
             Span::styled(
                 "FS: ",
@@ -2607,9 +2682,16 @@ fn render_item_info_modal(f: &mut Frame, app: &App, screen: Rect) {
                     .fg(Color::Magenta)
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::styled(&fs.device, Style::default().fg(Color::White)),
             Span::styled(
-                format!(" ({}) on {}", fs.fs_type, fs.mount_point.display()),
+                sanitize_control_chars(&fs.device),
+                Style::default().fg(Color::White),
+            ),
+            Span::styled(
+                format!(
+                    " ({}) on {}",
+                    sanitize_control_chars(&fs.fs_type),
+                    sanitize_control_chars(&mount_point)
+                ),
                 Style::default().fg(Color::DarkGray),
             ),
         ]));
@@ -2669,7 +2751,9 @@ fn render_footer(f: &mut Frame, app: &App, area: Rect) {
     if let Some(status) = app.current_status() {
         // " 📢 " occupies 4 terminal cells (1 space + 2-wide emoji + 1 space)
         let max_status_len = (area.width as usize).saturating_sub(4);
-        let display_status = crate::fs::entry::truncate_end_by_width(status, max_status_len);
+        let sanitized_status = sanitize_control_chars(status);
+        let display_status =
+            crate::fs::entry::truncate_end_by_width(&sanitized_status, max_status_len);
         let status_line = Line::from(vec![
             Span::styled(" 📢 ", Style::default().fg(Color::Yellow)),
             Span::styled(
@@ -2908,7 +2992,7 @@ mod render_sweep_tests {
     use crate::fs::scanner::scan_directory;
     use crate::ghost::docker::DockerItemSummary;
     use crate::ghost::{DeletedOpenFile, DockerDiskInfo};
-    use crate::ui::app::{GhostFilterMode, SortMode};
+    use crate::ui::app::{GhostFilterMode, JanitorCategory, JanitorItem, SortMode};
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
     use std::sync::{atomic::AtomicBool, Arc};
@@ -3305,6 +3389,112 @@ mod render_sweep_tests {
         // Current-folder scope exercises the scope label.
         app.janitor_scope = crate::ui::app::JanitorScope::Current;
         let _ = render(app, 100, 30);
+    }
+
+    /// Audit M1: every TUI render boundary showing a file, directory, process,
+    /// Docker or status string turns control characters into pictures, so a
+    /// crafted name cannot inject terminal escapes.
+    #[test]
+    fn control_characters_never_reach_the_render_buffer() {
+        let evil = "evil\u{1b}]0;pwned\u{7}";
+        let dir = tempfile::Builder::new().prefix(evil).tempdir().unwrap();
+        std::fs::write(dir.path().join(evil), "x").unwrap();
+        let root = scan_directory(dir.path(), None, Arc::new(AtomicBool::new(false))).unwrap();
+        let mut app = App::new(root);
+        // Filesystem table + header path.
+        let out = render(&app, 140, 30);
+        assert!(!out.contains('\u{1b}'), "ESC reached the filesystem view");
+        assert!(!out.contains('\u{7}'), "BEL reached the filesystem view");
+        // Status footer.
+        app.set_status(format!("status {evil}"));
+        let out = render(&app, 140, 30);
+        assert!(!out.contains('\u{1b}'), "ESC reached the status footer");
+        // Janitor rows.
+        app.janitor_cats = vec![JanitorCategory {
+            title: "Cache",
+            items: vec![JanitorItem {
+                display: evil.to_string(),
+                targets: Vec::new(),
+                size: 1,
+                trash_only_delete: false,
+                selected: false,
+            }],
+            expanded: true,
+            total: 1,
+        }];
+        app.active_view = ActiveView::Janitor;
+        let out = render(&app, 100, 30);
+        assert!(!out.contains('\u{1b}'), "ESC reached the janitor");
+        // Docker tab: crafted item names/details and daemon error.
+        app.active_view = ActiveView::GhostInspector;
+        app.ghost_tab_index = 0;
+        let mut docker = available_docker();
+        docker.items[0].id_or_name = evil.to_string();
+        docker.items[0].details = evil.to_string();
+        app.docker_info = docker;
+        let out = render(&app, 140, 30);
+        assert!(!out.contains('\u{1b}'), "ESC reached the Docker tab");
+        app.docker_info.is_available = false;
+        app.docker_info.error_message = Some(evil.to_string());
+        let out = render(&app, 140, 30);
+        assert!(!out.contains('\u{1b}'), "ESC reached the Docker error");
+        // Deleted-open tab: crafted process name and original path.
+        app.ghost_tab_index = 1;
+        app.deleted_open_files = vec![DeletedOpenFile {
+            pid: 1,
+            process_name: evil.to_string(),
+            original_path: format!("/gone/{evil}"),
+            size: 4096,
+            fd: "3".to_string(),
+            start_time: Some(1),
+        }];
+        let out = render(&app, 140, 30);
+        assert!(!out.contains('\u{1b}'), "ESC reached the deleted-open tab");
+    }
+
+    /// Qodo round 1 on PR #12: the itemized Docker modal must fit all eleven
+    /// information lines at a normal 80x24 terminal, including the volume
+    /// warning, instead of clipping the last row.
+    #[test]
+    fn docker_prune_modal_is_not_clipped_at_80x24() {
+        let mut fx = fixture();
+        fx.app.prompt_docker_prune();
+        let out = render(&fx.app, 80, 24);
+        for text in ["images", "containers", "volumes", "build cache"] {
+            assert!(out.contains(text), "missing category {text}");
+        }
+        assert!(out.contains("Docker <23 removes named too."));
+        // The upper bound belongs to the volume row only, not to any row that
+        // happens to show the glyph elsewhere in the buffer (Qodo round 2).
+        let volume_row = out
+            .lines()
+            .find(|line| line.contains('[') && line.contains("volumes"))
+            .expect("volumes row");
+        assert!(volume_row.contains('≤'), "volumes row: {volume_row}");
+        let image_row = out
+            .lines()
+            .find(|line| line.contains('[') && line.contains("images"))
+            .expect("images row");
+        assert!(!image_row.contains('≤'), "images row: {image_row}");
+    }
+
+    /// Audit M1: the scan-progress path is untrusted too.
+    #[test]
+    fn scan_progress_sanitizes_current_path() {
+        let backend = TestBackend::new(80, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let progress = crate::fs::scanner::ScanProgress {
+            files_scanned: 1,
+            bytes_scanned: 1,
+            current_path: std::path::PathBuf::from("/tmp/evil\u{1b}]0;pwned\u{7}"),
+            is_finished: false,
+        };
+        terminal
+            .draw(|f| render_scan_progress(f, "⠋", &progress, 1.0))
+            .unwrap();
+        let out = terminal.backend().to_string();
+        assert!(!out.contains('\u{1b}'));
+        assert!(!out.contains('\u{7}'));
     }
 
     #[test]

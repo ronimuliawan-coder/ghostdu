@@ -58,6 +58,22 @@ pub fn handle_key_event(app: &mut App, key: KeyEvent) -> EventResult {
     }
 }
 
+/// Confirm handler for the itemized Docker prune modal (audit H4): an empty
+/// selection refuses in place with a status hint and the modal stays open; a
+/// non-empty selection executes the prunes for the selected categories only.
+/// The execution arm is excluded like the other live-daemon paths — no test
+/// may reach a real daemon through this seam, so tests press 'y' only with an
+/// empty selection.
+fn confirm_docker_prune(app: &mut App) -> EventResult {
+    if app.docker_prune_selection.iter().any(|on| *on) {
+        #[cfg(not(tarpaulin_include))]
+        app.execute_pending_action();
+    } else {
+        app.set_status("Select at least one category to prune (Space toggles)");
+    }
+    EventResult::Continue
+}
+
 fn handle_confirm_keys(app: &mut App, key: KeyEvent) -> EventResult {
     // Scroll the frozen multi-target list without touching the confirmation.
     if app.action_targets.len() > 1 {
@@ -83,6 +99,31 @@ fn handle_confirm_keys(app: &mut App, key: KeyEvent) -> EventResult {
         match key.code {
             KeyCode::Char('1') => app.execute_kill(true),
             KeyCode::Char('2') => app.execute_kill(false),
+            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => app.cancel_modal(),
+            _ => {}
+        }
+        return EventResult::Continue;
+    }
+    // The itemized Docker prune modal navigates and toggles categories before
+    // the generic y/n handling; confirming prunes only what is selected
+    // (audit H4). Empty selection stays in the modal instead of no-oping.
+    if matches!(app.pending_action, Some(ConfirmAction::DockerPrune)) {
+        match key.code {
+            KeyCode::Up => {
+                app.docker_prune_cursor = app.docker_prune_cursor.saturating_sub(1);
+            }
+            KeyCode::Down => {
+                if app.docker_prune_cursor < 3 {
+                    app.docker_prune_cursor += 1;
+                }
+            }
+            KeyCode::Char(' ') | KeyCode::Left | KeyCode::Right => {
+                let cursor = app.docker_prune_cursor;
+                app.docker_prune_selection[cursor] = !app.docker_prune_selection[cursor];
+            }
+            KeyCode::Char('y') | KeyCode::Char('Y') => {
+                return confirm_docker_prune(app);
+            }
             KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => app.cancel_modal(),
             _ => {}
         }
@@ -535,6 +576,41 @@ mod key_matrix_tests {
 
     pub(crate) fn ctrl(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::CONTROL)
+    }
+
+    /// Audit H4: the itemized prune modal navigates, toggles, and refuses to
+    /// execute with an empty selection — the only confirm test allowed here,
+    /// because a selected confirm reaches a real daemon through the hardcoded
+    /// live socket.
+    #[test]
+    fn docker_prune_modal_navigates_and_refuses_empty_selection() {
+        let mut fx = fixture();
+        fx.app.prompt_docker_prune();
+        assert_eq!(fx.app.docker_prune_selection, [true, false, false, false]);
+        handle_confirm_keys(&mut fx.app, key(KeyCode::Down));
+        handle_confirm_keys(&mut fx.app, key(KeyCode::Down));
+        handle_confirm_keys(&mut fx.app, key(KeyCode::Char(' ')));
+        assert_eq!(fx.app.docker_prune_selection, [true, false, true, false]);
+        handle_confirm_keys(&mut fx.app, key(KeyCode::Up));
+        handle_confirm_keys(&mut fx.app, key(KeyCode::Char(' ')));
+        // Cursor is on containers here, so volumes stay selected.
+        assert_eq!(fx.app.docker_prune_selection, [true, true, true, false]);
+        // De-select everything: 'y' refuses in place and keeps the modal.
+        fx.app.docker_prune_selection = [false, false, false, false];
+        handle_confirm_keys(&mut fx.app, key(KeyCode::Char('y')));
+        assert!(matches!(
+            fx.app.pending_action,
+            Some(ConfirmAction::DockerPrune)
+        ));
+        assert!(fx
+            .app
+            .current_status()
+            .unwrap()
+            .contains("Select at least one category"));
+        // Cancel closes without executing.
+        handle_confirm_keys(&mut fx.app, key(KeyCode::Esc));
+        assert!(fx.app.pending_action.is_none());
+        assert_eq!(fx.app.active_view, fx.app.previous_view);
     }
 
     /// Shadow `xdg-open` and the clipboard tools with fakes that consume
