@@ -255,17 +255,26 @@ fn run_interactive(
     app_result
 }
 
+/// How a cancellable scan phase ended. A scan failure is a value, not an
+/// error: the tree on screen is still valid, so a refresh reports it and keeps
+/// browsing instead of discarding the session. Terminal and input I/O
+/// failures remain `Err` and propagate exactly as before.
+enum ScanOutcome {
+    Completed(fs::FileEntry),
+    Cancelled,
+    Failed(String),
+}
+
 /// Scans `target` on a worker thread while drawing the live progress screen.
 /// Shared by the opening scan and in-place refreshes, so both get the same
-/// spinner, throttled progress, and `q`/Ctrl+C cancel. Cancel is reported as
-/// `None`; the caller decides whether that ends the session.
+/// spinner, throttled progress, and `q`/Ctrl+C cancel.
 fn scan_with_progress<B: ratatui::backend::Backend>(
     terminal: &mut Terminal<B>,
     target: &std::path::Path,
     options: &ScannerOptions,
     scan_poll: &dyn Fn(Duration) -> Result<bool, std::io::Error>,
     scan_read: &dyn Fn() -> Result<Event, std::io::Error>,
-) -> Result<Option<fs::FileEntry>, Box<dyn std::error::Error>> {
+) -> Result<ScanOutcome, Box<dyn std::error::Error>> {
     let (progress_tx, progress_rx) = unbounded::<ScanProgress>();
     let stop_signal = Arc::new(AtomicBool::new(false));
     let stop_clone = stop_signal.clone();
@@ -296,8 +305,12 @@ fn scan_with_progress<B: ratatui::backend::Backend>(
             // The scanner never panics (all channel sends are best-effort),
             // so `expect` keeps this a single covered line: the message
             // only materializes on a cannot-happen thread panic, which the
-            // panic hook then restores the terminal for.
-            return Ok(Some(scan_handle.join().expect("Scan thread panicked")?));
+            // panic hook then restores the terminal for. A scanner error is
+            // the reported tree failure, not a session-ending condition.
+            return Ok(match scan_handle.join().expect("Scan thread panicked") {
+                Ok(entry) => ScanOutcome::Completed(entry),
+                Err(error) => ScanOutcome::Failed(error),
+            });
         }
 
         // Draw scanning progress screen
@@ -314,7 +327,7 @@ fn scan_with_progress<B: ratatui::backend::Backend>(
                         && key.code == KeyCode::Char('c'))
                 {
                     stop_signal.store(true, Ordering::Relaxed);
-                    return Ok(None);
+                    return Ok(ScanOutcome::Cancelled);
                 }
             }
         }
@@ -359,9 +372,11 @@ fn fresh_app<B: ratatui::backend::Backend>(
     let root_entry = match preload {
         Some(root) => root,
         None => match scan_with_progress(terminal, target, scan_options, scan.poll, scan.read)? {
-            Some(root) => root,
+            ScanOutcome::Completed(root) => root,
             // Cancelled during the opening scan: end the session.
-            None => return Ok(None),
+            ScanOutcome::Cancelled => return Ok(None),
+            // Nothing to show yet, so a failed opening scan is fatal.
+            ScanOutcome::Failed(error) => return Err(error.into()),
         },
     };
 
@@ -414,10 +429,13 @@ fn run_app<B: ratatui::backend::Backend>(
         // otherwise this is a fresh scan, which re-roots the tree.
         let mut app = if let Some(mut app) = carried_app.take() {
             let (target, options) = app.refresh_plan();
+            // A scan failure must not end the session: the tree on screen is
+            // still valid. Only terminal/input errors stay fatal.
             match scan_with_progress(terminal, &target, &options, refresh.poll, refresh.read)? {
-                Some(scanned) => app.apply_refresh(&target, scanned),
+                ScanOutcome::Completed(scanned) => app.apply_refresh(&target, scanned),
                 // Cancelled mid-refresh: keep the tree and navigation as-is.
-                None => app.set_status("Refresh cancelled"),
+                ScanOutcome::Cancelled => app.set_status("Refresh cancelled"),
+                ScanOutcome::Failed(error) => app.set_status(format!("Refresh failed: {error}")),
             }
             app
         } else {
@@ -1720,6 +1738,54 @@ mod interactive_driver_tests {
         )
         .with_refresh(vec![false, false, true], vec![key(KeyCode::Char('q'))]);
         run(dir.path().to_path_buf(), &driver, &subshell_ok).unwrap();
+    }
+
+    #[test]
+    fn refresh_scan_failure_keeps_the_session() {
+        // A refresh target can vanish between scans (deleted, renamed, made
+        // unreadable). The tree on screen is still valid, so the failure must
+        // be reported and browsing must continue: previously the `?` on the
+        // scan ended the session and discarded navigation and selections.
+        let dir = fixture(20);
+        let target = dir.path().to_path_buf();
+        let driver = Driver::new(
+            vec![],
+            vec![],
+            vec![true, true],
+            vec![key(KeyCode::Char('r')), Driver::quit()],
+        );
+        let (cli, options) = test_cli(target.clone());
+        let mut terminal = test_terminal();
+        // Delete the scan target on the first browse poll, so the opening scan
+        // succeeds and the refresh that follows cannot resolve its target.
+        let removed = std::cell::Cell::new(false);
+        let result = run_app(
+            &mut terminal,
+            target.clone(),
+            &cli,
+            &options,
+            &ScanSource {
+                poll: &|_| driver.scan_poll(),
+                read: &|| driver.scan_read(),
+            },
+            &ScanSource {
+                poll: &|_| driver.refresh_poll(),
+                read: &|| driver.refresh_read(),
+            },
+            &|_| {
+                if !removed.replace(true) {
+                    std::fs::remove_dir_all(&target).unwrap();
+                }
+                driver.main_poll()
+            },
+            &|| driver.main_read(),
+            &subshell_ok,
+            None,
+        );
+        assert!(
+            result.is_ok(),
+            "a failed refresh must not end the session: {result:?}"
+        );
     }
 
     #[test]
