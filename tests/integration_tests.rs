@@ -1,5 +1,6 @@
 use std::fs::{self, File};
 use std::io::Write;
+use std::os::unix::fs::MetadataExt;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
@@ -1274,7 +1275,13 @@ fn failed_deletion_rescans_only_affected_subtrees_and_preserves_hardlink_totals(
         .unwrap();
     assert_eq!(updated.children.len(), 1);
     assert_eq!(updated.children[0].name, "shared-link");
-    assert_eq!(updated.disk_usage, 0);
+    // The recreated directory keeps its own inode allocation, while the
+    // hardlink contributes nothing because the inode is already counted in
+    // `unrelated`. Both terms are filesystem-dependent (ext4 allocates a
+    // directory block, btrfs may not), so derive them from the live tree.
+    let affected_own = fs::symlink_metadata(&affected).unwrap().blocks() * 512;
+    assert_eq!(updated.children[0].disk_usage, 0);
+    assert_eq!(updated.disk_usage, affected_own);
     let retained = app
         .root_entry
         .children
@@ -1282,7 +1289,12 @@ fn failed_deletion_rescans_only_affected_subtrees_and_preserves_hardlink_totals(
         .find(|child| child.path == unrelated)
         .unwrap();
     assert_eq!(retained.children.len(), 1);
-    assert_eq!(app.root_entry.disk_usage, expected_disk);
+    let root_own = fs::symlink_metadata(&root_path).unwrap().blocks() * 512;
+    assert_eq!(
+        app.root_entry.disk_usage,
+        root_own + affected_own + expected_disk,
+        "the shared inode must stay counted once, and neither directory may lose its own blocks"
+    );
     assert_eq!(app.root_entry.items_count, 5);
     assert!(app.current_status().unwrap().contains("1 failed"));
 }
