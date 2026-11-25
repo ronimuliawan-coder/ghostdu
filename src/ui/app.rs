@@ -1975,56 +1975,45 @@ impl App {
         self.apply_tree_updates(HashMap::from([(target.to_path_buf(), Some(new_node))]));
     }
 
-    /// Refresh filesystem stats, directory tree, Docker storage, and ghost files without restarting
-    pub fn refresh_all(&mut self) {
-        if self.imported {
-            self.set_status("Refresh is disabled for imported snapshots");
-            return;
-        }
-        self.discard_changed_selections();
+    /// What an in-place refresh must rescan, and with which depth budget.
+    /// A subtree refresh restarts traversal at the current directory, so the
+    /// budget shrinks by that directory's level below the scan root; a zero
+    /// remainder rescans that directory alone (see `ScannerOptions`).
+    pub fn refresh_plan(&self) -> (PathBuf, ScannerOptions) {
         let current_path = self.current_dir_entry().path.clone();
-        let is_at_root = self.path_stack.is_empty();
-
-        let stop_signal = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        if is_at_root {
-            if let Ok(new_root) = crate::fs::scanner::scan_directory_with_options(
-                &self.root_entry.path,
-                None,
-                stop_signal,
-                self.scan_options.clone(),
-            ) {
-                self.root_entry = new_root;
-            }
-        } else {
-            // A subtree refresh restarts traversal at the current directory, so
-            // shrink the depth budget by its level below the scan root. A zero
-            // remainder rescans the directory alone (see ScannerOptions).
-            let mut options = self.scan_options.clone();
-            if let Some(max) = options.max_depth {
-                let depth = current_path
-                    .strip_prefix(&self.root_entry.path)
-                    .map(|p| p.components().count())
-                    .unwrap_or(0);
-                options.max_depth = Some(max.saturating_sub(depth));
-            }
-            if let Ok(new_subtree) = crate::fs::scanner::scan_directory_with_options(
-                &current_path,
-                None,
-                stop_signal,
-                options,
-            ) {
-                self.replace_subtree(&current_path, new_subtree);
-            }
+        if self.path_stack.is_empty() {
+            return (self.root_entry.path.clone(), self.scan_options.clone());
         }
+        let mut options = self.scan_options.clone();
+        if let Some(max) = options.max_depth {
+            let depth = current_path
+                .strip_prefix(&self.root_entry.path)
+                .map(|p| p.components().count())
+                .unwrap_or(0);
+            options.max_depth = Some(max.saturating_sub(depth));
+        }
+        (current_path, options)
+    }
 
-        // 1. Refresh global fs statvfs
+    /// Swap in a freshly scanned tree and refresh the views derived from it.
+    /// The scan itself belongs to the caller, so the event loop can run it on
+    /// a worker thread while `refresh_all` keeps the synchronous path.
+    pub fn apply_refresh(&mut self, target: &Path, scanned: FileEntry) {
+        self.discard_changed_selections();
+        if target == self.root_entry.path {
+            self.root_entry = scanned;
+        } else {
+            self.replace_subtree(target, scanned);
+        }
+        self.refresh_after_scan();
+    }
+
+    /// Derived state a tree swap invalidates: filesystem stats, ghost data,
+    /// an open item-info modal, and the cursor clamp.
+    fn refresh_after_scan(&mut self) {
         self.refresh_fs_info();
-
-        // 2. Refresh Docker & unlinked ghost files
         self.docker_info = crate::ghost::fetch_docker_disk_info();
         self.deleted_open_files = crate::ghost::scan_deleted_open_files();
-
-        // 3. Refresh detailed item info if modal is open
         if self.active_view == ActiveView::ItemInfoModal {
             let visible = self.visible_children();
             if let Some(target) = visible.get(self.cursor_index) {
@@ -2035,14 +2024,30 @@ impl App {
                 );
             }
         }
-
-        // 4. Clamp cursor
         let total = self.visible_children().len();
         if self.cursor_index >= total && total > 0 {
             self.cursor_index = total - 1;
         }
-
         self.set_status("⚡ Refreshed disk usage, free space & ghost details");
+    }
+
+    /// Synchronous full refresh. The event loop uses `refresh_plan` plus
+    /// `apply_refresh` instead, so the scan runs off the UI thread; this stays
+    /// the synchronous reference for the same behavior and is what the
+    /// integration tests drive. Selection pruning lives in `apply_refresh`,
+    /// so it runs exactly once on both paths.
+    pub fn refresh_all(&mut self) {
+        if self.imported {
+            self.set_status("Refresh is disabled for imported snapshots");
+            return;
+        }
+        let (target, options) = self.refresh_plan();
+        let stop_signal = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        if let Ok(scanned) =
+            crate::fs::scanner::scan_directory_with_options(&target, None, stop_signal, options)
+        {
+            self.apply_refresh(&target, scanned);
+        }
     }
 
     /// Navigate path_stack to reach target path if it exists within root_entry
@@ -3202,6 +3207,58 @@ mod refresh_lookup_tests {
         assert!(app.refresh_path(&sub));
         assert!(app.refresh_path(&app.root_entry.path.clone()));
         assert!(!app.refresh_path(Path::new("/definitely/not/here-12345")));
+    }
+
+    #[test]
+    fn refresh_plan_targets_root_or_current_dir_with_remaining_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let sub = dir.path().join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        std::fs::write(sub.join("b.txt"), "b").unwrap();
+        let mut app = App::new(scanned(dir.path()));
+
+        // At the scan root the plan is the root itself, options untouched.
+        app.scan_options.max_depth = Some(5);
+        let (target, options) = app.refresh_plan();
+        assert_eq!(target, app.root_entry.path);
+        assert_eq!(options.max_depth, Some(5));
+
+        // Inside a subdirectory the budget shrinks by that level, so the
+        // subtree rescan stops at the same depth the full scan would have.
+        app.navigate_to_path(&sub);
+        let (target, options) = app.refresh_plan();
+        assert_eq!(target, sub);
+        assert_eq!(options.max_depth, Some(4));
+
+        // An exhausted budget rescans the directory alone rather than
+        // underflowing.
+        app.scan_options.max_depth = Some(1);
+        let (_, options) = app.refresh_plan();
+        assert_eq!(options.max_depth, Some(0));
+    }
+
+    #[test]
+    fn apply_refresh_swaps_tree_and_clamps_cursor() {
+        let dir = tempfile::tempdir().unwrap();
+        let sub = dir.path().join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        std::fs::write(sub.join("b.txt"), "b").unwrap();
+        let mut app = App::new(scanned(dir.path()));
+        app.cursor_index = 9999;
+        let scanned_root = scanned(dir.path());
+        app.apply_refresh(&app.root_entry.path.clone(), scanned_root);
+        assert!(app.cursor_index < 9999, "cursor clamps after a swap");
+        assert!(app
+            .current_status()
+            .unwrap_or("")
+            .contains("Refreshed disk usage"));
+
+        // A subtree swap keeps the surrounding tree intact.
+        app.navigate_to_path(&sub);
+        let scanned_sub = scanned(&sub);
+        app.apply_refresh(&sub, scanned_sub);
+        assert!(app.find_entry(&sub.join("b.txt")).is_some());
+        assert!(app.find_entry(&dir.path().join("sub")).is_some());
     }
 
     #[test]

@@ -38,6 +38,10 @@ pub enum EventResult {
     Exit,
     RescanRequested,
     RescanPath(PathBuf),
+    /// Refresh in place, preserving navigation, filters, and selection scope.
+    /// Unlike `RescanRequested` the tree is not re-rooted, so the scan caller
+    /// must apply the result with `App::apply_refresh`.
+    RefreshRequested,
     Subshell(PathBuf),
 }
 
@@ -225,9 +229,7 @@ fn handle_ghost_keys(app: &mut App, key: KeyEvent) -> EventResult {
                 }
             }
         }
-        KeyCode::Char('r') | KeyCode::F(5) => {
-            app.refresh_all();
-        }
+        KeyCode::Char('r') | KeyCode::F(5) => return EventResult::RefreshRequested,
         KeyCode::Char('q') => {
             app.active_view = ActiveView::Filesystem;
         }
@@ -531,10 +533,7 @@ fn handle_filesystem_keys(app: &mut App, key: KeyEvent) -> EventResult {
             }
             EventResult::Continue
         }
-        KeyCode::Char('r') => {
-            app.refresh_all();
-            EventResult::Continue
-        }
+        KeyCode::Char('r') => EventResult::RefreshRequested,
         KeyCode::Char('R') | KeyCode::F(5) => EventResult::RescanRequested,
         KeyCode::Char('?') => {
             app.previous_view = app.active_view;
@@ -984,10 +983,10 @@ mod key_action_tests {
             handle_key_event(app, key(KeyCode::Char('!'))),
             EventResult::Subshell(_)
         ));
-        // Refresh paths: in-place rescan and full rescan request.
+        // Refresh paths: in-place refresh keeps the tree, full rescan re-roots.
         assert!(matches!(
             handle_key_event(app, key(KeyCode::Char('r'))),
-            EventResult::Continue
+            EventResult::RefreshRequested
         ));
         assert!(matches!(
             handle_key_event(app, key(KeyCode::Char('R'))),
@@ -1076,8 +1075,6 @@ mod key_view_tests {
             KeyCode::Char('p'),
             KeyCode::Char('P'),
             KeyCode::Char('K'),
-            KeyCode::Char('r'),
-            KeyCode::F(5),
             KeyCode::Char('q'),
             KeyCode::Char('?'),
         ] {
@@ -1085,6 +1082,19 @@ mod key_view_tests {
             assert!(
                 matches!(handle_key_event(app, key(code)), EventResult::Continue),
                 "ghost key {code:?}"
+            );
+        }
+        // Refresh keys leave the view to the event loop rather than querying
+        // Docker and /proc inline, so those reads run after the tree swap
+        // instead of interleaving with the frame that returned them.
+        for code in [KeyCode::Char('r'), KeyCode::F(5)] {
+            app.active_view = ActiveView::GhostInspector;
+            assert!(
+                matches!(
+                    handle_key_event(app, key(code)),
+                    EventResult::RefreshRequested
+                ),
+                "ghost refresh key {code:?}"
             );
         }
         assert!(matches!(
