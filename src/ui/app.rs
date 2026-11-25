@@ -179,6 +179,12 @@ pub struct App {
     pub stale_only_filter: bool,
 
     // Ghost Inspector data
+    /// Whether the Docker and deleted-open data has been fetched yet. Startup
+    /// only needs the filesystem view, so the queries that can block on a live
+    /// daemon are deferred until the inspector is first opened. Explicit state
+    /// (rather than a defaulted `DockerDiskInfo`) so "not fetched yet" cannot
+    /// be rendered as "no Docker daemon".
+    ghost_loaded: bool,
     pub docker_info: DockerDiskInfo,
     pub deleted_open_files: Vec<DeletedOpenFile>,
     pub ghost_tab_index: usize, // 0 = Docker, 1 = Deleted-Open Files
@@ -211,8 +217,10 @@ pub struct App {
 
 impl App {
     pub fn new(root_entry: FileEntry) -> Self {
-        let docker_info = fetch_docker_disk_info();
-        let deleted_open_files = scan_deleted_open_files();
+        // Startup deliberately does NOT query Docker or /proc: those are only
+        // needed by the Ghost Inspector, and a wedged Docker daemon would
+        // otherwise stall the first frame by up to its 4s read timeout (or
+        // 14s wall clock). `ensure_ghost_loaded` fetches them on first open.
         let fs_info = query_fs_info(&root_entry.path);
         let btrfs_subvols = std::fs::read("/proc/self/mountinfo")
             .map(|topology| crate::fs::scanner::parse_btrfs_subvolumes(&topology))
@@ -246,8 +254,9 @@ impl App {
             action_has_system: false,
             safe_only_filter: false,
             stale_only_filter: false,
-            docker_info,
-            deleted_open_files,
+            ghost_loaded: false,
+            docker_info: DockerDiskInfo::default(),
+            deleted_open_files: Vec::new(),
             ghost_tab_index: 0,
             ghost_cursor_index: 0,
             top_files: Vec::new(),
@@ -274,8 +283,19 @@ impl App {
         !self.imported && crate::fs::scanner::has_snapshot_subvolumes(&self.btrfs_subvols)
     }
 
+    /// Fetch the Docker and deleted-open data the first time the Ghost
+    /// Inspector is opened. Kept out of `new` so startup never waits on a
+    /// Docker daemon; a later refresh goes through `refresh_ghost_info`.
+    pub fn ensure_ghost_loaded(&mut self) {
+        if !self.ghost_loaded {
+            self.ghost_loaded = true;
+            self.refresh_ghost_info();
+        }
+    }
+
     /// Refresh Docker and deleted-open ghost file info
     pub fn refresh_ghost_info(&mut self) {
+        self.ghost_loaded = true;
         self.docker_info = fetch_docker_disk_info();
         self.deleted_open_files = scan_deleted_open_files();
         self.set_status("Refreshed Docker & Ghost files data");
@@ -565,6 +585,7 @@ impl App {
             self.item_info = get_detailed_item_info(
                 &target.path,
                 target.items_count,
+                Some(target.disk_usage),
                 self.cow && !self.imported,
             );
             self.previous_view = self.active_view;
@@ -1877,9 +1898,12 @@ impl App {
     /// Apply a whole batch in one walk and recalculate each changed ancestor once.
     /// Returns visited nodes so regression tests can assert linear traversal work.
     fn apply_tree_updates(&mut self, mut updates: HashMap<PathBuf, Option<FileEntry>>) -> usize {
-        fn recalc(entry: &mut FileEntry) {
+        fn recalc(entry: &mut FileEntry, own_disk_usage: u64) {
             let mut total_size = 0u64;
-            let mut total_disk = 0u64;
+            // Seed from the directory's own inode allocation, exactly as the
+            // scanner aggregates; children alone would drop it when an
+            // ancestor is rebuilt after an incremental update.
+            let mut total_disk = own_disk_usage;
             let mut total_reclaimable = 0u64;
             let mut total_items = 0usize;
             let mut total_safe_reclaimable = 0u64;
@@ -1926,6 +1950,14 @@ impl App {
                 return false;
             }
             *visited += 1;
+            // Capture the directory's own inode allocation before children are
+            // replaced or removed; it is not derivable from the new children.
+            let own_disk_usage = entry.disk_usage.saturating_sub(
+                entry
+                    .children
+                    .iter()
+                    .fold(0u64, |sum, child| sum.saturating_add(child.disk_usage)),
+            );
             let mut changed = false;
             entry.children.retain_mut(|child| {
                 if updates.is_empty() {
@@ -1945,7 +1977,7 @@ impl App {
                 true
             });
             if changed {
-                recalc(entry);
+                recalc(entry, own_disk_usage);
             }
             changed
         }
@@ -2012,14 +2044,21 @@ impl App {
     /// an open item-info modal, and the cursor clamp.
     fn refresh_after_scan(&mut self) {
         self.refresh_fs_info();
-        self.docker_info = crate::ghost::fetch_docker_disk_info();
-        self.deleted_open_files = crate::ghost::scan_deleted_open_files();
+        // Re-query ghost data only when it was already fetched. The inspector
+        // is the sole consumer, so a rescan before it is ever opened must stay
+        // as cheap as startup: fetching here would reintroduce the Docker
+        // stall (up to 14 s against a wedged daemon) and, without setting the
+        // flag, make the first Tab/g pay for the same queries again.
+        if self.ghost_loaded {
+            self.refresh_ghost_info();
+        }
         if self.active_view == ActiveView::ItemInfoModal {
             let visible = self.visible_children();
             if let Some(target) = visible.get(self.cursor_index) {
                 self.item_info = crate::fs::mount_info::get_detailed_item_info(
                     &target.path,
                     target.items_count,
+                    Some(target.disk_usage),
                     self.cow && !self.imported,
                 );
             }
@@ -2650,6 +2689,61 @@ mod reconciliation_tests {
         assert_eq!(app.root_entry.children.len(), 256);
         assert_eq!(app.root_entry.items_count, 257);
         assert_eq!(app.root_entry.size, 512);
+    }
+
+    #[test]
+    fn incremental_updates_preserve_each_directorys_own_inode_blocks() {
+        use crate::fs::entry::{DeleteSafety, FileEntry, GhostKind};
+        use std::os::unix::fs::MetadataExt;
+        use std::path::Path;
+
+        let fixture = tempfile::tempdir().unwrap();
+        let root_path = fixture.path().join("root");
+        let child_path = root_path.join("child");
+        fs::create_dir_all(&child_path).unwrap();
+        let root_meta = fs::symlink_metadata(&root_path).unwrap();
+        let child_meta = fs::symlink_metadata(&child_path).unwrap();
+        let child_own = child_meta.blocks() * 512;
+        const ROOT_OWN: u64 = 4096;
+
+        // Directory inode blocks are 0 on btrfs, so inject synthetic
+        // allocations to prove the accounting on every host.
+        let mut child = FileEntry::new_dir(
+            "child".into(),
+            child_path.clone(),
+            child_meta.dev(),
+            child_meta.ino(),
+            GhostKind::None,
+            DeleteSafety::UserData,
+        );
+        child.disk_usage = child_own + 8192;
+        child.own_mtime_secs = 1;
+        let mut root = FileEntry::new_dir(
+            "root".into(),
+            root_path.clone(),
+            root_meta.dev(),
+            root_meta.ino(),
+            GhostKind::None,
+            DeleteSafety::UserData,
+        );
+        root.disk_usage = ROOT_OWN + child.disk_usage;
+        root.children = vec![child];
+
+        let mut app = App::new(root);
+        let mut replacement = app.root_entry.children[0].clone();
+        replacement.disk_usage = child_own + 1024;
+        app.replace_subtree(Path::new(&child_path), replacement);
+
+        assert_eq!(
+            app.root_entry.disk_usage,
+            ROOT_OWN + child_own + 1024,
+            "recalculation must keep the root's own inode allocation"
+        );
+        assert_eq!(
+            app.root_entry.children[0].disk_usage,
+            child_own + 1024,
+            "a replaced subtree keeps its freshly scanned total"
+        );
     }
 
     #[test]
@@ -3333,6 +3427,38 @@ mod coverage_gap_tests {
             crate::fs::scanner::scan_directory(dir.path(), None, Arc::new(AtomicBool::new(false)))
                 .unwrap();
         (dir, App::new(root))
+    }
+
+    /// Audit M16: startup must not touch Docker or /proc, because a wedged
+    /// daemon would stall the first frame for its 4 s read timeout. The data
+    /// is fetched on first inspector open instead.
+    #[test]
+    fn app_new_defers_ghost_queries_until_first_open() {
+        let (_dir, mut app) = app_with_files(1);
+        assert!(
+            !app.ghost_loaded,
+            "startup must not fetch Docker/deleted-open data"
+        );
+        // A lazy field must not masquerade as a real "no daemon" result.
+        assert!(!app.docker_info.is_available);
+        assert!(app.deleted_open_files.is_empty());
+
+        app.ensure_ghost_loaded();
+        assert!(app.ghost_loaded, "first open fetches the data");
+        assert!(
+            app.current_status()
+                .unwrap_or("")
+                .contains("Refreshed Docker"),
+            "the fetch reports its own status"
+        );
+
+        // Idempotent: opening again does not refetch or re-announce.
+        app.status_message = None;
+        app.ensure_ghost_loaded();
+        assert!(
+            app.current_status().is_none(),
+            "a second open must not refetch"
+        );
     }
 
     #[test]

@@ -193,7 +193,7 @@ Run the comprehensive unit and integration test suite:
 cargo test
 ```
 
-All 258 unit and integration tests verify:
+All 275 unit and integration tests verify:
 - Automatic virtual filesystem exclusion (`/proc`, `/sys`, `/dev`, `/run`)
 - Inode deduplication on hard links
 - Safety tier classification and system deletion guardrails
@@ -203,6 +203,12 @@ All 258 unit and integration tests verify:
 - Responsive TUI rendering across compact and wide dimensions
 
 ---
+
+## 🔐 Security
+
+Report vulnerabilities privately — see [SECURITY.md](SECURITY.md) for the
+channel, scope, and supported versions. The guarantees this tool does and does
+not make are in the safety-model sections above.
 
 ## 📄 License
 
