@@ -336,7 +336,9 @@ struct ScanSource<'a> {
 
 /// The live crossterm event source, used by every cancellable phase of a real
 /// session. A function rather than a constant, so each call site borrows an
-/// independent pair.
+/// independent pair. Terminal-only wiring like `run_interactive`: every caller
+/// already requires a real terminal, so there is no body to cover.
+#[cfg(not(tarpaulin_include))]
 fn live_source() -> ScanSource<'static> {
     ScanSource {
         poll: &|d| crossterm::event::poll(d),
