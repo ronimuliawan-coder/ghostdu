@@ -1,5 +1,5 @@
 use crate::fs::entry::DeleteSafety;
-use crate::fs::scanner::parse_mount_roots;
+use crate::fs::scanner::{parse_mount_roots, MountRoot};
 use crate::ghost::{classify_path, classify_safety};
 use rustix::fs::{openat2, unlinkat, AtFlags, Dir, Mode, OFlags, ResolveFlags, CWD};
 use std::collections::HashMap;
@@ -45,7 +45,7 @@ fn delete_with_verification<P: AsRef<Path>>(
 fn delete_with_verification_impl<P: AsRef<Path>>(
     paths: &[P],
     verify: impl Fn(&Path, &File) -> io::Result<()>,
-    mount_roots: io::Result<HashMap<PathBuf, PathBuf>>,
+    mount_roots: io::Result<HashMap<PathBuf, MountRoot>>,
     protected: Vec<(PathBuf, u64, u64)>,
 ) -> DeleteResult {
     let mut result = DeleteResult::default();
@@ -83,13 +83,13 @@ fn delete_with_verification_impl<P: AsRef<Path>>(
 
 /// The live mount table's mount point → fs-root mapping, read fresh so newly
 /// installed bind mounts are never missed by a stale snapshot.
-pub(super) fn read_mount_roots() -> io::Result<HashMap<PathBuf, PathBuf>> {
+pub(super) fn read_mount_roots() -> io::Result<HashMap<PathBuf, MountRoot>> {
     Ok(parse_mount_roots(&fs::read("/proc/self/mountinfo")?))
 }
 
 pub(super) fn prepare_target_with_mount_roots(
     path: &Path,
-    mount_roots: &HashMap<PathBuf, PathBuf>,
+    mount_roots: &HashMap<PathBuf, MountRoot>,
     protected: &[(PathBuf, u64, u64)],
 ) -> io::Result<(File, CString, File)> {
     check_safety(path)?;
@@ -249,7 +249,7 @@ fn check_safety(path: &Path) -> io::Result<()> {
 /// `/etc`) — review round 1, Qodo finding 1.
 fn check_not_under_protected_mount_alias(
     canonical_parent: &Path,
-    mount_roots: &HashMap<PathBuf, PathBuf>,
+    mount_roots: &HashMap<PathBuf, MountRoot>,
     protected: &[(PathBuf, u64, u64)],
 ) -> io::Result<()> {
     let mut current = Some(canonical_parent);
@@ -276,7 +276,7 @@ fn check_not_under_protected_mount_alias(
 fn ancestor_blocks(
     path: &Path,
     identity: (u64, u64),
-    mount_roots: &HashMap<PathBuf, PathBuf>,
+    mount_roots: &HashMap<PathBuf, MountRoot>,
     protected: &[(PathBuf, u64, u64)],
 ) -> bool {
     protected.iter().any(|(protected_path, dev, ino)| {
@@ -295,16 +295,20 @@ fn ancestor_blocks(
             // filesystem (a separate /boot partition) reports fs-root `/`,
             // and its bind alias carries that same fs-root — an fs-root
             // != "/" exemption skipped exactly those aliases. Decide by
-            // fs-root equality alone.
-            Some(fs_root) => mount_roots
-                .get(protected_path.as_path())
-                .is_none_or(|protected_root| protected_root == fs_root),
+            // fs-root equality alone. An ambiguous protected path has no
+            // fs-root to compare against, so it blocks too.
+            Some(MountRoot::Unique(fs_root)) => match mount_roots.get(protected_path.as_path()) {
+                Some(MountRoot::Unique(protected_root)) => protected_root == fs_root,
+                _ => true,
+            },
             // Qodo round 4 (43bdcc3a): btrfs assigns each subvolume its own
             // anonymous st_dev (numdevs=many, the default), so an identity
             // match on a plain directory means the protected subvolume's own
             // root directory, exposed through a parent- or fs-root-tree mount
             // — deleting beneath it deletes real content. Block.
-            None => true,
+            // Cubic round 6: stacked mounts at one point have no single
+            // fs-root; an identity match there must fail closed as well.
+            Some(MountRoot::Stacked) | None => true,
         }
     })
 }
@@ -430,7 +434,7 @@ mod tests {
         reject_protected_alias(&handle, &[]).unwrap();
     }
 
-    fn parse_roots(mountinfo: &str) -> HashMap<PathBuf, PathBuf> {
+    fn parse_roots(mountinfo: &str) -> HashMap<PathBuf, MountRoot> {
         parse_mount_roots(mountinfo.as_bytes())
     }
 
@@ -537,6 +541,40 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.to_string().contains("bind mount"));
+    }
+
+    /// Cubic round 6: `mount --move` preserves the moved mount's ID, so a
+    /// stacked point can list the hidden mount last. Different fs-roots at one
+    /// point are ambiguous; the alias guard must fail closed instead of
+    /// trusting whichever line the map happened to keep.
+    #[test]
+    fn stacked_mount_points_fail_closed() {
+        let fixture = tempfile::tempdir().unwrap();
+        let alias = fixture.path().join("boot-alias");
+        fs::create_dir_all(&alias).unwrap();
+        let metadata = fs::metadata(&alias).unwrap();
+        let protected = [(PathBuf::from("/boot"), metadata.dev(), metadata.ino())];
+        // Visible mount (ID 430, a /boot bind with fs-root `/`) moved on top
+        // of the hidden mount (ID 431, fs-root `/@snapshot`).
+        let mountinfo = format!(
+            "430 421 253:0 / {} rw - ext4 /dev/boot\n431 421 253:0 /@snapshot {} rw - btrfs /dev/root\n",
+            alias.display(),
+            alias.display()
+        );
+        let roots = parse_roots(&mountinfo);
+        assert_eq!(roots.get(&alias), Some(&MountRoot::Stacked));
+        let error = check_not_under_protected_mount_alias(&alias, &roots, &protected).unwrap_err();
+        assert!(error.to_string().contains("bind mount"));
+        // Repeated points that agree on the fs-root stay unambiguous.
+        let same = format!(
+            "430 421 253:0 / {} rw - ext4 /dev/boot\n431 421 253:0 / {} rw - ext4 /dev/boot\n",
+            alias.display(),
+            alias.display()
+        );
+        assert_eq!(
+            parse_roots(&same).get(&alias),
+            Some(&MountRoot::Unique(PathBuf::from("/")))
+        );
     }
 
     /// Qodo round 3 (4c1a7365): /boot on its own partition reports fs-root

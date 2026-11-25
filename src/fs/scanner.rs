@@ -463,21 +463,39 @@ pub(crate) fn parse_mount_points(mountinfo: &[u8]) -> HashSet<PathBuf> {
         .collect()
 }
 
-/// Mount point -> root of the mount within its filesystem (mountinfo field 3),
-/// e.g. a bind of `/etc` mounted at `/mnt/alias` maps `/mnt/alias` -> `/etc`,
-/// while a whole-filesystem mount maps its point -> `/`. Lets the deletion
-/// guardrail recognize bind aliases of protected trees regardless of the path
-/// string they hide behind.
-pub(crate) fn parse_mount_roots(mountinfo: &[u8]) -> HashMap<PathBuf, PathBuf> {
-    mountinfo
-        .split(|&b| b == b'\n')
-        .filter_map(|line| {
-            let mut fields = line.split(|&b| b == b' ');
-            let root = fields.nth(3)?;
-            let point = fields.next()?;
-            Some((decode_mount_path(point), decode_mount_path(root)))
-        })
-        .collect()
+/// The directory within its filesystem that backs a mount point (mountinfo
+/// field 4). A mount point can carry stacked mounts, and `mount --move`
+/// preserves the moved mount's ID, so mountinfo's line order does not identify
+/// the visible mount. Different fs-roots at one point are therefore ambiguous
+/// and must fail closed (cubic review round 6).
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum MountRoot {
+    Unique(PathBuf),
+    Stacked,
+}
+
+/// Mount point -> root of the visible mount within its filesystem, e.g. a bind
+/// of `/etc` mounted at `/mnt/alias` maps `/mnt/alias` -> `/etc`, while a
+/// whole-filesystem mount maps its point -> `/`. Lets the deletion guardrail
+/// recognize bind aliases of protected trees regardless of the path string they
+/// hide behind. Repeated points with different roots record [`MountRoot::Stacked`]
+/// instead of trusting one line.
+pub(crate) fn parse_mount_roots(mountinfo: &[u8]) -> HashMap<PathBuf, MountRoot> {
+    let mut roots = HashMap::new();
+    for line in mountinfo.split(|&b| b == b'\n') {
+        let mut fields = line.split(|&b| b == b' ');
+        let Some(root) = fields.nth(3) else {
+            continue;
+        };
+        let Some(point) = fields.next() else {
+            continue;
+        };
+        let point = decode_mount_path(point);
+        let root = MountRoot::Unique(decode_mount_path(root));
+        let stacked = roots.get(&point).is_some_and(|existing| existing != &root);
+        roots.insert(point, if stacked { MountRoot::Stacked } else { root });
+    }
+    roots
 }
 
 /// Decodes mountinfo octal escapes (`\040` -> space, etc.); unknown or
@@ -571,16 +589,34 @@ mod tests {
     }
 
     #[test]
+    fn mount_roots_skips_malformed_lines() {
+        // Empty and truncated lines contribute no mapping; only the complete
+        // line is inserted (cubic round 6 refactor).
+        let roots = parse_mount_roots(b"\n1 0 8:1 /\n2 1 8:1 /root /mnt rw - ext4 /dev/root\n");
+        assert_eq!(roots.len(), 1);
+        assert_eq!(
+            roots.get(Path::new("/mnt")),
+            Some(&MountRoot::Unique(PathBuf::from("/root")))
+        );
+    }
+
+    #[test]
     fn mount_roots_map_mount_point_to_fs_root() {
         let roots = parse_mount_roots(
             b"23 0 253:0 / / rw,relatime - ext4 /dev/root\n42 23 253:0 /etc /mnt/alias\\040dir rw - ext4 /dev/root\n36 23 0:41 / /tmp rw - tmpfs tmpfs\n",
         );
-        assert_eq!(roots.get(Path::new("/")), Some(&PathBuf::from("/")));
+        assert_eq!(
+            roots.get(Path::new("/")),
+            Some(&MountRoot::Unique(PathBuf::from("/")))
+        );
         assert_eq!(
             roots.get(Path::new("/mnt/alias dir")),
-            Some(&PathBuf::from("/etc"))
+            Some(&MountRoot::Unique(PathBuf::from("/etc")))
         );
-        assert_eq!(roots.get(Path::new("/tmp")), Some(&PathBuf::from("/")));
+        assert_eq!(
+            roots.get(Path::new("/tmp")),
+            Some(&MountRoot::Unique(PathBuf::from("/")))
+        );
         assert_eq!(roots.get(Path::new("/mnt/alias")), None);
     }
 }

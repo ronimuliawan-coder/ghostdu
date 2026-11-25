@@ -92,8 +92,12 @@ pub fn classify_path(path: &Path) -> GhostKind {
     }
 
     // 3. System Snapshots (Timeshift, Snapper)
+    // Timeshift's store can live on another mount (`/mnt/backup/timeshift`),
+    // so the `timeshift/snapshots` sequence matches anywhere; a lone
+    // `timeshift` component only identifies the root-level store (cubic
+    // review round 6).
     if starts_with_segments(&components, &["run", "timeshift", "backup"])
-        || starts_with_segments(&components, &["timeshift", "snapshots"])
+        || contains_segments(&components, &["timeshift", "snapshots"])
         || starts_with_segments(&components, &["timeshift"])
         || contains_segments(&components, &[".snapshots"])
         || file_name == ".snapshots"
@@ -370,7 +374,9 @@ fn is_home_cache_root(path: &Path) -> bool {
     if depth == 1 {
         return last.is_some_and(|c| c.as_os_str().as_encoded_bytes() == b"root");
     }
-    depth >= 2 && second_last.is_some_and(|c| c.as_os_str().as_encoded_bytes() == b"home")
+    // Exactly `/home/<user>`: a penultimate `home` deeper in the path
+    // (`/mnt/home/alice/.cache`) is not a home cache root (cubic round 6).
+    depth == 2 && second_last.is_some_and(|c| c.as_os_str().as_encoded_bytes() == b"home")
 }
 
 /// Classifies a path and its ghost kind into a Deletion Safety Tier:
@@ -604,6 +610,11 @@ mod tests {
         );
         assert_eq!(
             classify_path(&PathBuf::from("/run/timeshift/backup/2026-09-01")),
+            GhostKind::SystemSnapshot
+        );
+        // Cubic round 6: Timeshift's store can live on another mount.
+        assert_eq!(
+            classify_path(&PathBuf::from("/mnt/backup/timeshift/snapshots/2026-09-01")),
             GhostKind::SystemSnapshot
         );
         assert_eq!(
@@ -1076,6 +1087,14 @@ mod tests {
         assert_eq!(
             classify_path(&PathBuf::from("/home/u/proj/.cache")),
             GhostKind::None
+        );
+        // Cubic round 6: a penultimate `home` deeper in the path is not a home
+        // root, so the root stays personal data rather than a cache home.
+        let foreign_home = PathBuf::from("/mnt/home/alice/.cache");
+        assert_eq!(classify_path(&foreign_home), GhostKind::None);
+        assert_eq!(
+            classify_safety(&foreign_home, classify_path(&foreign_home)),
+            DeleteSafety::UserData
         );
         assert_eq!(
             classify_path(&PathBuf::from("/home/ron/.cache/personal/notes.txt")),
