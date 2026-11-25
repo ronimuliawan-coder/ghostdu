@@ -3311,6 +3311,45 @@ mod render_sweep_tests {
     }
 
     #[test]
+    fn ghost_inspector_scroll_paths_with_overflowing_rows() {
+        // The scroll indicator and scrollbar only render once the row count
+        // exceeds the viewport. Startup no longer prefetches Docker data, so
+        // this has to be fabricated explicitly rather than arriving from a
+        // live daemon on the developer's machine.
+        let mut fx = fixture();
+        let app = &mut fx.app;
+        app.active_view = ActiveView::GhostInspector;
+        app.ghost_tab_index = 0;
+        let mut docker = available_docker();
+        docker.items = (0..40)
+            .map(|i| DockerItemSummary {
+                category: "Image",
+                id_or_name: format!("img{i:03}"),
+                size: 100 + i as u64,
+                is_reclaimable: i % 2 == 0,
+                details: "unused".to_string(),
+            })
+            .collect();
+        app.docker_info = docker;
+        // Small viewport so 40 rows overflow it.
+        let out = render(app, 100, 12);
+        assert!(out.contains("img000"), "first row is visible");
+        assert!(
+            out.contains("1/40"),
+            "the scroll indicator must appear when rows overflow"
+        );
+
+        // Scrolled to the end: the scrollbar renders and the offset advances.
+        app.ghost_cursor_index = 39;
+        let out = render(app, 100, 12);
+        assert!(out.contains("40/40"), "cursor reaches the last row");
+        assert!(
+            app.ghost_docker_scroll_offset.get() > 0,
+            "the window must scroll to keep the cursor visible"
+        );
+    }
+
+    #[test]
     fn ghost_inspector_tabs() {
         let mut fx = fixture();
         let app = &mut fx.app;

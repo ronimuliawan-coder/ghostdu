@@ -427,6 +427,8 @@ fn handle_filesystem_keys(app: &mut App, key: KeyEvent) -> EventResult {
 
         // Ghost & Docker
         KeyCode::Tab | KeyCode::Char('g') => {
+            // First open pays for the Docker and /proc queries; startup did not.
+            app.ensure_ghost_loaded();
             app.active_view = ActiveView::GhostInspector;
             EventResult::Continue
         }
