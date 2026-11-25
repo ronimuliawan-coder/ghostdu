@@ -162,7 +162,8 @@ fn send_to_docker_socket(
     // transfer slack on top of the server-side wait the read timeout already
     // tolerates.
     let deadline = Instant::now() + read_timeout + Duration::from_secs(10);
-    let response_bytes = read_response_with_limits(&stream, deadline, MAX_DOCKER_RESPONSE_BYTES)?;
+    let response_bytes =
+        read_response_with_limits(&stream, deadline, read_timeout, MAX_DOCKER_RESPONSE_BYTES)?;
 
     parse_docker_http_response(&response_bytes)
 }
@@ -174,25 +175,39 @@ const MAX_DOCKER_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
 
 /// Bounded replacement for `read_to_end`: stops at the wall-clock deadline,
 /// at the size cap, at clean EOF, or at a read error — whichever comes first.
-/// Per-read timeouts (set on the stream) still bound each individual syscall.
+/// Each blocking read is capped at the time left before the deadline, so a
+/// peer that stalls just before it cannot hold the UI for a whole read timeout
+/// past the deadline (Qodo round 1 on PR #12).
 fn read_response_with_limits(
     mut stream: &UnixStream,
     deadline: Instant,
+    read_timeout: Duration,
     cap: usize,
 ) -> Result<Vec<u8>, String> {
     let mut response_bytes = Vec::new();
     let mut chunk = [0u8; 8192];
     loop {
-        if Instant::now() >= deadline {
+        let now = Instant::now();
+        if now >= deadline {
             return Err("Docker response exceeded the wall-clock deadline".to_string());
         }
         if response_bytes.len() >= cap {
             return Err("Docker response exceeded the size cap".to_string());
         }
+        let remaining = deadline.saturating_duration_since(now);
+        let per_read = read_timeout.min(remaining).max(Duration::from_millis(1));
+        stream
+            .set_read_timeout(Some(per_read))
+            .map_err(|e| format!("Failed to set docker socket timeout: {}", e))?;
         match stream.read(&mut chunk) {
             Ok(0) => return Ok(response_bytes),
             Ok(n) => response_bytes.extend_from_slice(&chunk[..n]),
-            Err(error) => return Err(format!("Failed to read from docker socket: {}", error)),
+            Err(error) => {
+                if Instant::now() >= deadline {
+                    return Err("Docker response exceeded the wall-clock deadline".to_string());
+                }
+                return Err(format!("Failed to read from docker socket: {}", error));
+            }
         }
     }
 }
@@ -741,7 +756,9 @@ mod socket_tests {
             .set_read_timeout(Some(Duration::from_millis(40)))
             .unwrap();
         let deadline = Instant::now() + Duration::from_millis(150);
-        let error = read_response_with_limits(&dribbler, deadline, 1 << 20).unwrap_err();
+        let error =
+            read_response_with_limits(&dribbler, deadline, Duration::from_millis(40), 1 << 20)
+                .unwrap_err();
         assert!(error.contains("wall-clock deadline"), "{error}");
         // A server that sends past the cap is cut off by the cap.
         let dir2 = tempfile::tempdir().unwrap();
@@ -757,8 +774,13 @@ mod socket_tests {
         gusher
             .set_read_timeout(Some(Duration::from_secs(1)))
             .unwrap();
-        let error = read_response_with_limits(&gusher, Instant::now() + Duration::from_secs(5), 64)
-            .unwrap_err();
+        let error = read_response_with_limits(
+            &gusher,
+            Instant::now() + Duration::from_secs(5),
+            Duration::from_secs(1),
+            64,
+        )
+        .unwrap_err();
         assert!(error.contains("size cap"), "{error}");
         // A server that never sends anything trips the per-read timeout — a
         // read error, distinct from the wall-clock deadline above.
@@ -774,11 +796,31 @@ mod socket_tests {
         silent
             .set_read_timeout(Some(Duration::from_millis(40)))
             .unwrap();
-        let error = read_response_with_limits(&silent, Instant::now() + Duration::from_secs(5), 64)
-            .unwrap_err();
+        let error = read_response_with_limits(
+            &silent,
+            Instant::now() + Duration::from_secs(5),
+            Duration::from_millis(40),
+            64,
+        )
+        .unwrap_err();
         assert!(
             error.contains("Failed to read from docker socket"),
             "{error}"
         );
+        // An already-expired deadline is reported before any read.
+        let error =
+            read_response_with_limits(&silent, Instant::now(), Duration::from_millis(40), 64)
+                .unwrap_err();
+        assert!(error.contains("wall-clock deadline"), "{error}");
+        // A peer that stalls past the deadline is cut off at the deadline by
+        // the per-read cap, not at the full read timeout (200 ms < 1 s).
+        let error = read_response_with_limits(
+            &silent,
+            Instant::now() + Duration::from_millis(200),
+            Duration::from_secs(1),
+            64,
+        )
+        .unwrap_err();
+        assert!(error.contains("wall-clock deadline"), "{error}");
     }
 }

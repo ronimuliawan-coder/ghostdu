@@ -1912,7 +1912,18 @@ fn render_confirm_modal(f: &mut Frame, app: &App, screen: Rect) {
     // shows a page with scroll hints instead of rebuilding per frame.
     let show_targets = !app.action_safety_blocked && app.action_targets.len() > 1;
     let popup_width = 65.min(screen.width.saturating_sub(4));
-    let popup_height = if show_targets { 21 } else { 14 }.min(screen.height.saturating_sub(4));
+    // The itemized Docker modal carries eleven information lines (four
+    // categories plus copy) against ten rows in the 14-row non-target layout;
+    // it gets two extra rows so the last warning is not clipped (Qodo round 1
+    // on PR #12).
+    let popup_height = if show_targets {
+        21
+    } else if matches!(action, ConfirmAction::DockerPrune) {
+        16
+    } else {
+        14
+    }
+    .min(screen.height.saturating_sub(4));
 
     let area = Rect {
         x: (screen.width.saturating_sub(popup_width)) / 2,
@@ -2166,19 +2177,19 @@ fn render_confirm_modal(f: &mut Frame, app: &App, screen: Rect) {
                 }
                 infos.push(Line::from(""));
                 infos.push(Line::from(Span::styled(
-                    "Images prune filtered to dangling only.",
+                    "Images: dangling only. Build cache: unused only.",
                     Style::default().fg(Color::LightGreen),
                 )));
                 infos.push(Line::from(Span::styled(
-                    "Containers, volumes and build cache prune UNFILTERED —",
+                    "Containers: stopped ones (incl. kept-for-logs) removed;",
                     Style::default().fg(Color::DarkGray),
                 )));
                 infos.push(Line::from(Span::styled(
-                    "running containers and named volumes survive, but kept-for-logs",
+                    "running containers survive.",
                     Style::default().fg(Color::DarkGray),
                 )));
                 infos.push(Line::from(Span::styled(
-                    "stopped containers and unused anonymous volumes do not.",
+                    "Volumes: unused only; Docker <23 also removes named ones.",
                     Style::default().fg(Color::DarkGray),
                 )));
 
@@ -3436,6 +3447,20 @@ mod render_sweep_tests {
         }];
         let out = render(&app, 140, 30);
         assert!(!out.contains('\u{1b}'), "ESC reached the deleted-open tab");
+    }
+
+    /// Qodo round 1 on PR #12: the itemized Docker modal must fit all eleven
+    /// information lines at a normal 80x24 terminal, including the volume
+    /// warning, instead of clipping the last row.
+    #[test]
+    fn docker_prune_modal_is_not_clipped_at_80x24() {
+        let mut fx = fixture();
+        fx.app.prompt_docker_prune();
+        let out = render(&fx.app, 80, 24);
+        for text in ["images", "containers", "volumes", "build cache"] {
+            assert!(out.contains(text), "missing category {text}");
+        }
+        assert!(out.contains("Docker <23 also removes named ones."));
     }
 
     /// Audit M1: the scan-progress path is untrusted too.
