@@ -162,6 +162,24 @@ pub struct DetailedItemInfo {
     pub cow_sharing: Option<(u64, u64)>,
 }
 
+/// Bytes to display for an entry. A directory reports its scanned subtree
+/// total when the caller has one; everything else reports its own inode
+/// allocation. Split out so the choice is testable on any filesystem, without
+/// depending on how a particular one accounts for directory inodes.
+fn display_disk_usage(is_dir: bool, inode_usage: u64, subtree_disk_usage: Option<u64>) -> u64 {
+    if is_dir {
+        subtree_disk_usage.unwrap_or(inode_usage)
+    } else {
+        inode_usage
+    }
+}
+
+/// A file occupying zero blocks is sparse (or stored inline), not broken.
+/// Directories are excluded: their inode figure says nothing about contents.
+fn is_zero_block_file(is_dir: bool, blocks: u64) -> bool {
+    !is_dir && blocks == 0
+}
+
 /// `subtree_disk_usage` is the scanned total for a directory, or `None` when
 /// the caller has no tree entry (the entry was rescanned away). Passing it
 /// keeps the panel honest for directories without changing file semantics.
@@ -187,12 +205,8 @@ pub fn get_detailed_item_info(
     // their own allocation: that is the only figure that makes sense for a
     // hard-link duplicate, whose tree entry is deliberately zeroed so the
     // parent aggregate counts it once.
-    let disk_usage = if is_dir {
-        subtree_disk_usage.unwrap_or(inode_disk_usage)
-    } else {
-        inode_disk_usage
-    };
-    let is_zero_block = !is_dir && meta.blocks() == 0;
+    let disk_usage = display_disk_usage(is_dir, inode_disk_usage, subtree_disk_usage);
+    let is_zero_block = is_zero_block_file(is_dir, meta.blocks());
 
     let mode_str = format_mode(mode, is_dir, is_symlink);
     let mode_octal = mode & 0o7777;
@@ -407,26 +421,59 @@ mod coverage_tests {
         assert!(info.cow_sharing.is_none());
     }
 
-    /// UFI#3: a directory's own inode reports no data blocks, so the panel
-    /// showed "0 B" for a directory full of files. The scanned subtree total
-    /// must win for directories.
+    /// UFI#3: a directory's own inode blocks say nothing about its contents.
+    /// On btrfs the inode reports zero data blocks, which showed a folder full
+    /// of files as "0 B"; other filesystems report a small inode allocation.
+    /// Either way the scanned subtree total must win.
+    ///
+    /// Asserted directly on the decision so it holds on every filesystem: CI's
+    /// filesystem gives directories `blocks=8`, so a precondition claiming
+    /// zero would be testing the host, not the code.
     #[test]
-    fn dir_item_info_prefers_scanned_subtree_total() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("payload.bin"), vec![7u8; 5000]).unwrap();
-        // The inode itself allocates nothing on btrfs (and often elsewhere).
+    fn dir_disk_usage_prefers_scanned_subtree_total() {
         assert_eq!(
-            std::fs::symlink_metadata(dir.path()).unwrap().blocks(),
-            0,
-            "precondition: the directory inode should report zero blocks"
-        );
-        let info = get_detailed_item_info(dir.path(), 2, Some(123_456), false).unwrap();
-        assert!(info.is_dir);
-        assert_eq!(
-            info.disk_usage, 123_456,
+            display_disk_usage(true, 4096, Some(123_456)),
+            123_456,
             "subtree total wins for a directory"
         );
+        assert_eq!(
+            display_disk_usage(true, 4096, None),
+            4096,
+            "no scanned total falls back to the inode figure"
+        );
+        assert_eq!(
+            display_disk_usage(false, 4096, Some(123_456)),
+            4096,
+            "a file keeps its own inode figure even with a subtree total"
+        );
+        assert_eq!(
+            display_disk_usage(false, 0, Some(123_456)),
+            0,
+            "a hard-link duplicate's zeroed inode must not become the parent total"
+        );
+    }
+
+    /// The real `get_detailed_item_info` path also wires the decision in.
+    #[test]
+    fn dir_item_info_reports_subtree_total_end_to_end() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("payload.bin"), vec![7u8; 5000]).unwrap();
+        let inode_usage = std::fs::symlink_metadata(dir.path()).unwrap().blocks() * 512;
+        let subtree = inode_usage + 4096;
+        let info = get_detailed_item_info(dir.path(), 2, Some(subtree), false).unwrap();
+        assert!(info.is_dir);
+        assert_eq!(info.disk_usage, subtree);
         assert!(!info.is_zero_block, "directories are never flagged sparse");
+    }
+
+    #[test]
+    fn zero_block_detection_excludes_directories() {
+        assert!(is_zero_block_file(false, 0), "a zero-block file is flagged");
+        assert!(!is_zero_block_file(false, 8), "an allocated file is not");
+        assert!(
+            !is_zero_block_file(true, 0),
+            "a directory is never flagged, whatever its inode says"
+        );
     }
 
     /// A caller without a tree entry (the entry was rescanned away) still gets
@@ -453,7 +500,13 @@ mod coverage_tests {
         drop(file);
 
         let meta = std::fs::symlink_metadata(&sparse).unwrap();
-        assert_eq!(meta.blocks(), 0, "precondition: sparse file has no blocks");
+        if meta.blocks() != 0 {
+            // Filesystem allocates for set_len (or lacks sparse support), so
+            // there is no zero-block file to assert about here. The behaviour
+            // under test is what happens *when* blocks() == 0, which this host
+            // cannot produce; CI's filesystem does.
+            return;
+        }
 
         // Pass a large subtree total to prove files ignore it.
         let info = get_detailed_item_info(&sparse, 0, Some(999_999), false).unwrap();
@@ -469,10 +522,11 @@ mod coverage_tests {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("allocated.bin");
         std::fs::write(&file, vec![1u8; 848]).unwrap();
-        assert!(
-            std::fs::symlink_metadata(&file).unwrap().blocks() > 0,
-            "precondition: a written 848 B file should allocate blocks"
-        );
+        if std::fs::symlink_metadata(&file).unwrap().blocks() == 0 {
+            // A filesystem that stores small files inline gives no allocated
+            // file to compare against; the flag itself is proven above.
+            return;
+        }
         let info = get_detailed_item_info(&file, 0, None, false).unwrap();
         assert!(!info.is_zero_block);
         assert!(info.disk_usage > 0);
