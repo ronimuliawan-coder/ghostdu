@@ -239,8 +239,8 @@ fn run_interactive(
         target_path,
         cli,
         scan_options,
-        &|d| crossterm::event::poll(d),
-        &crossterm::event::read,
+        &live_source(),
+        &live_source(),
         &|d| crossterm::event::poll(d),
         &crossterm::event::read,
         &run_subshell,
@@ -255,119 +255,208 @@ fn run_interactive(
     app_result
 }
 
+/// How a cancellable scan phase ended. A scan failure is a value, not an
+/// error: the tree on screen is still valid, so a refresh reports it and keeps
+/// browsing instead of discarding the session. Terminal and input I/O
+/// failures remain `Err` and propagate exactly as before.
+enum ScanOutcome {
+    Completed(fs::FileEntry),
+    Cancelled,
+    Failed(String),
+}
+
+/// Scans `target` on a worker thread while drawing the live progress screen.
+/// Shared by the opening scan and in-place refreshes, so both get the same
+/// spinner, throttled progress, and `q`/Ctrl+C cancel.
+fn scan_with_progress<B: ratatui::backend::Backend>(
+    terminal: &mut Terminal<B>,
+    target: &std::path::Path,
+    options: &ScannerOptions,
+    scan_poll: &dyn Fn(Duration) -> Result<bool, std::io::Error>,
+    scan_read: &dyn Fn() -> Result<Event, std::io::Error>,
+) -> Result<ScanOutcome, Box<dyn std::error::Error>> {
+    let (progress_tx, progress_rx) = unbounded::<ScanProgress>();
+    let stop_signal = Arc::new(AtomicBool::new(false));
+    let stop_clone = stop_signal.clone();
+
+    let scan_path = target.to_path_buf();
+    let thread_options = options.clone();
+    let scan_handle = thread::spawn(move || {
+        scan_directory_with_options(&scan_path, Some(progress_tx), stop_clone, thread_options)
+    });
+
+    let mut last_progress = ScanProgress {
+        files_scanned: 0,
+        bytes_scanned: 0,
+        current_path: target.to_path_buf(),
+        is_finished: false,
+    };
+
+    let scan_start = Instant::now();
+    let mut spinner_idx = 0;
+    let spinners = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
+    loop {
+        while let Ok(prog) = progress_rx.try_recv() {
+            last_progress = prog;
+        }
+
+        if scan_handle.is_finished() {
+            // The scanner never panics (all channel sends are best-effort),
+            // so `expect` keeps this a single covered line: the message
+            // only materializes on a cannot-happen thread panic, which the
+            // panic hook then restores the terminal for. A scanner error is
+            // the reported tree failure, not a session-ending condition.
+            return Ok(match scan_handle.join().expect("Scan thread panicked") {
+                Ok(entry) => ScanOutcome::Completed(entry),
+                Err(error) => ScanOutcome::Failed(error),
+            });
+        }
+
+        // Draw scanning progress screen
+        let spinner = spinners[spinner_idx % spinners.len()];
+        spinner_idx += 1;
+        let elapsed = scan_start.elapsed().as_secs_f32();
+
+        terminal.draw(|f| render_scan_progress(f, spinner, &last_progress, elapsed))?;
+
+        if scan_poll(Duration::from_millis(60))? {
+            if let Event::Key(key) = scan_read()? {
+                if key.code == KeyCode::Char('q')
+                    || (key.modifiers.contains(KeyModifiers::CONTROL)
+                        && key.code == KeyCode::Char('c'))
+                {
+                    stop_signal.store(true, Ordering::Relaxed);
+                    return Ok(ScanOutcome::Cancelled);
+                }
+            }
+        }
+    }
+}
+
 /// Runs the user's shell for `!`. A named alias keeps the injected-seam
 /// signatures readable for clippy's complexity lint.
 type SubshellRunner<B> =
     dyn Fn(&mut Terminal<B>, &std::path::Path) -> Result<(), Box<dyn std::error::Error>>;
 
-/// How one main-loop iteration ends: quit the session or rescan from root.
-/// Compared at the bottom of the loop, so no diverging statement is needed.
+/// One phase's injected event source: a poll/read pair. Each cancellable
+/// phase (opening scan, in-place refresh, browse) gets its own, so a test can
+/// script and cancel one without disturbing the phases around it.
+struct ScanSource<'a> {
+    poll: &'a dyn Fn(Duration) -> Result<bool, std::io::Error>,
+    read: &'a dyn Fn() -> Result<Event, std::io::Error>,
+}
+
+/// The live crossterm event source, used by every cancellable phase of a real
+/// session. A function rather than a constant, so each call site borrows an
+/// independent pair. Terminal-only wiring like `run_interactive`: every caller
+/// already requires a real terminal, so there is no body to cover.
+#[cfg(not(tarpaulin_include))]
+fn live_source() -> ScanSource<'static> {
+    ScanSource {
+        poll: &|d| crossterm::event::poll(d),
+        read: &crossterm::event::read,
+    }
+}
+
+/// Builds a fresh session, or `None` when the opening scan was cancelled.
+/// A preloaded snapshot tree skips scanning entirely (and implies read-only).
+fn fresh_app<B: ratatui::backend::Backend>(
+    terminal: &mut Terminal<B>,
+    target: &std::path::Path,
+    scan_options: &ScannerOptions,
+    scan: &ScanSource,
+    preload: Option<fs::FileEntry>,
+) -> Result<Option<App>, Box<dyn std::error::Error>> {
+    let imported = preload.is_some();
+    let root_entry = match preload {
+        Some(root) => root,
+        None => match scan_with_progress(terminal, target, scan_options, scan.poll, scan.read)? {
+            ScanOutcome::Completed(root) => root,
+            // Cancelled during the opening scan: end the session.
+            ScanOutcome::Cancelled => return Ok(None),
+            // Nothing to show yet, so a failed opening scan is fatal.
+            ScanOutcome::Failed(error) => return Err(error.into()),
+        },
+    };
+
+    let mut app = App::new(root_entry);
+    app.imported = imported;
+    app.scan_options = scan_options.clone();
+    Ok(Some(app))
+}
+
+/// How one main-loop iteration ends: quit, rescan from root, or refresh the
+/// current subtree in place (which keeps the `App` and its navigation).
 #[derive(PartialEq)]
 enum MainFlow {
     Quit,
     Rescan,
+    Refresh,
 }
 
 /// Interactive scan/browse loop. The event source and subshell runner are
 /// injected so headless tests can drive every arm with scripted events;
 /// production passes the live crossterm globals (see `run_interactive`).
 /// Scan and browse phases take separate sources so tests script each phase
-/// exactly, with no timing or oversupply involved. A preloaded tree skips
-/// scanning entirely (snapshot imports); it implies the read-only flag.
+/// exactly, with no timing or oversupply involved. In-place refreshes get
+/// their own source too: they reuse the opening scan's shape but a test must
+/// be able to cancel a refresh without touching the phases around it. A
+/// preloaded tree skips scanning entirely (snapshot imports); it implies the
+/// read-only flag.
 #[allow(clippy::too_many_arguments)]
 fn run_app<B: ratatui::backend::Backend>(
     terminal: &mut Terminal<B>,
     mut target_path: PathBuf,
     cli: &Cli,
     scan_options: &ScannerOptions,
-    scan_poll: &dyn Fn(Duration) -> Result<bool, std::io::Error>,
-    scan_read: &dyn Fn() -> Result<Event, std::io::Error>,
+    scan: &ScanSource,
+    refresh: &ScanSource,
     main_poll: &dyn Fn(Duration) -> Result<bool, std::io::Error>,
     main_read: &dyn Fn() -> Result<Event, std::io::Error>,
     subshell: &SubshellRunner<B>,
     mut preload: Option<fs::FileEntry>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut saved_current_path: Option<PathBuf> = None;
+    // Set by an in-place refresh: the session continues with the same App, so
+    // navigation, filters, and selection scope survive the rescan.
+    let mut carried_app: Option<App> = None;
 
     loop {
-        // Step 1: Progressive Scanning with Live Progress UI. A preloaded
-        // snapshot tree skips scanning (and implies read-only); rescans
-        // afterwards always scan live.
-        let imported = preload.is_some();
-        let root_entry = match preload.take() {
-            Some(root) => root,
-            None => {
-                let (progress_tx, progress_rx) = unbounded::<ScanProgress>();
-                let stop_signal = Arc::new(AtomicBool::new(false));
-                let stop_clone = stop_signal.clone();
-
-                let scan_path = target_path.clone();
-                let thread_options = scan_options.clone();
-                let scan_handle = thread::spawn(move || {
-                    scan_directory_with_options(
-                        &scan_path,
-                        Some(progress_tx),
-                        stop_clone,
-                        thread_options,
-                    )
-                });
-
-                let mut last_progress = ScanProgress {
-                    files_scanned: 0,
-                    bytes_scanned: 0,
-                    current_path: target_path.clone(),
-                    is_finished: false,
-                };
-
-                let scan_start = Instant::now();
-                let mut spinner_idx = 0;
-                let spinners = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-
-                loop {
-                    while let Ok(prog) = progress_rx.try_recv() {
-                        last_progress = prog;
-                    }
-
-                    if scan_handle.is_finished() {
-                        // The scanner never panics (all channel sends are best-effort),
-                        // so `expect` keeps this a single covered line: the message
-                        // only materializes on a cannot-happen thread panic, which the
-                        // panic hook then restores the terminal for.
-                        break scan_handle.join().expect("Scan thread panicked")?;
-                    }
-
-                    // Draw scanning progress screen
-                    let spinner = spinners[spinner_idx % spinners.len()];
-                    spinner_idx += 1;
-                    let elapsed = scan_start.elapsed().as_secs_f32();
-
-                    terminal.draw(|f| render_scan_progress(f, spinner, &last_progress, elapsed))?;
-
-                    if scan_poll(Duration::from_millis(60))? {
-                        if let Event::Key(key) = scan_read()? {
-                            if key.code == KeyCode::Char('q')
-                                || (key.modifiers.contains(KeyModifiers::CONTROL)
-                                    && key.code == KeyCode::Char('c'))
-                            {
-                                stop_signal.store(true, Ordering::Relaxed);
-                                return Ok(());
-                            }
-                        }
-                    }
+        // Step 1: Progressive Scanning with Live Progress UI. A carried App
+        // means this iteration refreshes an existing session in place; a
+        // preloaded snapshot tree skips scanning (and implies read-only);
+        // otherwise this is a fresh scan, which re-roots the tree.
+        let mut app = if let Some(mut app) = carried_app.take() {
+            let (target, options) = app.refresh_plan();
+            // A scan failure must not end the session: the tree on screen is
+            // still valid. Only terminal/input errors stay fatal.
+            match scan_with_progress(terminal, &target, &options, refresh.poll, refresh.read)? {
+                ScanOutcome::Completed(scanned) => app.apply_refresh(&target, scanned),
+                // Cancelled mid-refresh: keep the tree and navigation as-is.
+                ScanOutcome::Cancelled => app.set_status("Refresh cancelled"),
+                ScanOutcome::Failed(error) => app.set_status(format!("Refresh failed: {error}")),
+            }
+            app
+        } else {
+            match fresh_app(terminal, &target_path, scan_options, scan, preload.take())? {
+                Some(mut app) => {
+                    apply_cli_display(&mut app, cli);
+                    app
                 }
+                // Cancelled during the opening scan: end the session.
+                None => return Ok(()),
             }
         };
 
-        // Step 2: Main interactive loop
-        let mut app = App::new(root_entry);
-        app.imported = imported;
-        app.scan_options = scan_options.clone();
-        apply_cli_display(&mut app, cli);
-        if let Some(ref saved) = saved_current_path.take() {
-            app.navigate_to_path(saved);
+        // The opening scan only applies to the first iteration; later
+        // iterations either refresh in place or re-root via `target_path`.
+        if let Some(saved) = saved_current_path.take() {
+            app.navigate_to_path(&saved);
             app.set_status("⚡ Rescanned entire tree from root");
         }
 
+        // Step 2: Main interactive loop
         let flow = loop {
             terminal.draw(|f| render_ui(f, &app))?;
 
@@ -396,6 +485,18 @@ fn run_app<B: ratatui::backend::Backend>(
                             } else {
                                 target_path = new_path;
                                 break MainFlow::Rescan;
+                            }
+                        }
+                        // In-place refresh: hand the App to the scan phase, so
+                        // the scan runs off this thread under the same
+                        // progress screen while navigation and selection
+                        // survive.
+                        EventResult::RefreshRequested => {
+                            if app.imported {
+                                app.set_status("Refresh is disabled for imported snapshots");
+                            } else {
+                                carried_app = Some(app);
+                                break MainFlow::Refresh;
                             }
                         }
                         EventResult::Subshell(dir) => {
@@ -1236,8 +1337,8 @@ mod pty_session_tests {
             big.path().to_path_buf(),
             &cli,
             &options,
-            &|d| crossterm::event::poll(d),
-            &crossterm::event::read,
+            &live_source(),
+            &live_source(),
             &|d| crossterm::event::poll(d),
             &crossterm::event::read,
             &run_subshell,
@@ -1257,8 +1358,8 @@ mod pty_session_tests {
             small.path().to_path_buf(),
             &cli,
             &options,
-            &|d| crossterm::event::poll(d),
-            &crossterm::event::read,
+            &live_source(),
+            &live_source(),
             &|d| crossterm::event::poll(d),
             &crossterm::event::read,
             &run_subshell,
@@ -1328,6 +1429,8 @@ mod interactive_driver_tests {
     struct Driver {
         scan_polls: RefCell<VecDeque<bool>>,
         scan_reads: RefCell<VecDeque<Event>>,
+        refresh_polls: RefCell<VecDeque<bool>>,
+        refresh_reads: RefCell<VecDeque<Event>>,
         main_polls: RefCell<VecDeque<bool>>,
         main_reads: RefCell<VecDeque<Event>>,
     }
@@ -1347,9 +1450,19 @@ mod interactive_driver_tests {
             Self {
                 scan_polls: RefCell::new(scan_polls.into()),
                 scan_reads: RefCell::new(scan_reads.into()),
+                refresh_polls: RefCell::new(VecDeque::new()),
+                refresh_reads: RefCell::new(VecDeque::new()),
                 main_polls: RefCell::new(main_polls.into()),
                 main_reads: RefCell::new(main_reads.into()),
             }
+        }
+
+        /// Script the in-place refresh phase, which is otherwise empty (no
+        /// polls means the refresh scan simply runs to completion).
+        fn with_refresh(mut self, polls: Vec<bool>, reads: Vec<Event>) -> Self {
+            self.refresh_polls = RefCell::new(polls.into());
+            self.refresh_reads = RefCell::new(reads.into());
+            self
         }
 
         fn scan_poll(&self) -> Result<bool, std::io::Error> {
@@ -1359,6 +1472,18 @@ mod interactive_driver_tests {
         fn scan_read(&self) -> Result<Event, std::io::Error> {
             Ok(self
                 .scan_reads
+                .borrow_mut()
+                .pop_front()
+                .unwrap_or(Event::Resize(80, 24)))
+        }
+
+        fn refresh_poll(&self) -> Result<bool, std::io::Error> {
+            Ok(self.refresh_polls.borrow_mut().pop_front().unwrap_or(false))
+        }
+
+        fn refresh_read(&self) -> Result<Event, std::io::Error> {
+            Ok(self
+                .refresh_reads
                 .borrow_mut()
                 .pop_front()
                 .unwrap_or(Event::Resize(80, 24)))
@@ -1404,8 +1529,14 @@ mod interactive_driver_tests {
             target,
             &cli,
             &options,
-            &|_| driver.scan_poll(),
-            &|| driver.scan_read(),
+            &ScanSource {
+                poll: &|_| driver.scan_poll(),
+                read: &|| driver.scan_read(),
+            },
+            &ScanSource {
+                poll: &|_| driver.refresh_poll(),
+                read: &|| driver.refresh_read(),
+            },
             &|_| driver.main_poll(),
             &|| driver.main_read(),
             subshell,
@@ -1460,8 +1591,14 @@ mod interactive_driver_tests {
             dir.path().to_path_buf(),
             &cli,
             &options,
-            &|_| boom_bool(),
-            &|| boom_event(),
+            &ScanSource {
+                poll: &|_| boom_bool(),
+                read: &|| boom_event(),
+            },
+            &ScanSource {
+                poll: &|_| boom_bool(),
+                read: &|| boom_event(),
+            },
             &|_| boom_bool(),
             &|| boom_event(),
             &subshell_ok,
@@ -1486,8 +1623,14 @@ mod interactive_driver_tests {
             dir.path().to_path_buf(),
             &cli,
             &options,
-            &|_| Ok(true),
-            &|| boom_event(),
+            &ScanSource {
+                poll: &|_| Ok(true),
+                read: &|| boom_event(),
+            },
+            &ScanSource {
+                poll: &|_| Ok(false),
+                read: &|| panic!("refresh must not run here"),
+            },
             &|_| boom_bool(),
             &|| boom_event(),
             &subshell_ok,
@@ -1509,8 +1652,14 @@ mod interactive_driver_tests {
             dir.path().to_path_buf(),
             &cli,
             &options,
-            &|_| Ok(false),
-            &|| panic!("scan read must not run on false polls"),
+            &ScanSource {
+                poll: &|_| Ok(false),
+                read: &|| panic!("scan read must not run on false polls"),
+            },
+            &ScanSource {
+                poll: &|_| Ok(false),
+                read: &|| panic!("refresh read must not run on false polls"),
+            },
             &|_| Ok(true),
             &|| Err::<Event, _>(std::io::Error::other("main read boom")),
             &subshell_ok,
@@ -1560,7 +1709,10 @@ mod interactive_driver_tests {
     }
 
     #[test]
-    fn session_continue_key_then_quit() {
+    fn session_refresh_key_then_quit() {
+        // `r` hands the App to the scan phase for an in-place refresh, then
+        // the same session resumes and quits. Empty scan scripts are fine:
+        // surplus false polls simply let the refresh scan run to completion.
         let dir = fixture(20);
         let driver = Driver::new(
             vec![],
@@ -1569,6 +1721,71 @@ mod interactive_driver_tests {
             vec![key(KeyCode::Char('r')), Driver::quit()],
         );
         run(dir.path().to_path_buf(), &driver, &subshell_ok).unwrap();
+    }
+
+    #[test]
+    fn session_refresh_cancel_keeps_tree_then_quit() {
+        // Cancelling the refresh scan (`q` on a refresh poll) must not end
+        // the session: the old tree stays browsable and the next key quits.
+        // The refresh phase has its own script, so this cancels the refresh
+        // rather than the opening scan.
+        let dir = fixture(1500);
+        let driver = Driver::new(
+            vec![],
+            vec![],
+            vec![true, true],
+            vec![key(KeyCode::Char('r')), Driver::quit()],
+        )
+        .with_refresh(vec![false, false, true], vec![key(KeyCode::Char('q'))]);
+        run(dir.path().to_path_buf(), &driver, &subshell_ok).unwrap();
+    }
+
+    #[test]
+    fn refresh_scan_failure_keeps_the_session() {
+        // A refresh target can vanish between scans (deleted, renamed, made
+        // unreadable). The tree on screen is still valid, so the failure must
+        // be reported and browsing must continue: previously the `?` on the
+        // scan ended the session and discarded navigation and selections.
+        let dir = fixture(20);
+        let target = dir.path().to_path_buf();
+        let driver = Driver::new(
+            vec![],
+            vec![],
+            vec![true, true],
+            vec![key(KeyCode::Char('r')), Driver::quit()],
+        );
+        let (cli, options) = test_cli(target.clone());
+        let mut terminal = test_terminal();
+        // Delete the scan target on the first browse poll, so the opening scan
+        // succeeds and the refresh that follows cannot resolve its target.
+        let removed = std::cell::Cell::new(false);
+        let result = run_app(
+            &mut terminal,
+            target.clone(),
+            &cli,
+            &options,
+            &ScanSource {
+                poll: &|_| driver.scan_poll(),
+                read: &|| driver.scan_read(),
+            },
+            &ScanSource {
+                poll: &|_| driver.refresh_poll(),
+                read: &|| driver.refresh_read(),
+            },
+            &|_| {
+                if !removed.replace(true) {
+                    std::fs::remove_dir_all(&target).unwrap();
+                }
+                driver.main_poll()
+            },
+            &|| driver.main_read(),
+            &subshell_ok,
+            None,
+        );
+        assert!(
+            result.is_ok(),
+            "a failed refresh must not end the session: {result:?}"
+        );
     }
 
     #[test]
@@ -1680,8 +1897,14 @@ mod interactive_driver_tests {
             sub.clone(),
             &cli,
             &options,
-            &|_| panic!("scan must not run for a preloaded tree"),
-            &|| panic!("scan must not run for a preloaded tree"),
+            &ScanSource {
+                poll: &|_| panic!("scan must not run for a preloaded tree"),
+                read: &|| panic!("scan must not run for a preloaded tree"),
+            },
+            &ScanSource {
+                poll: &|_| panic!("refresh must not run for a preloaded tree"),
+                read: &|| panic!("refresh must not run for a preloaded tree"),
+            },
             &|_| driver.main_poll(),
             &|| driver.main_read(),
             &subshell_ok,
