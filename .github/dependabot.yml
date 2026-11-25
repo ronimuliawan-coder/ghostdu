@@ -18,11 +18,11 @@ updates:
         update-types:
           - "minor"
           - "patch"
-    ignore:
-      # Pinned deliberately by rust-toolchain.toml: a stable bump broke a
-      # previously green revision once (clippy 1.100 needless_bool). Toolchain
-      # upgrades are a deliberate change with gate evidence, not an auto-PR.
-      - dependency-name: "rust"
+    # No `ignore` entry for the toolchain: the Cargo ecosystem cannot see it.
+    # `rust-toolchain.toml` is not a Cargo manifest and there is no crate named
+    # "rust", so an ignore rule here would be inert while implying the pin is
+    # protected. Toolchain upgrades stay a deliberate change with gate evidence
+    # (a stable bump once broke a green revision: clippy 1.100 needless_bool).
 
   # GitHub Actions. These are pinned by commit SHA in the workflows; Dependabot
   # updates both the SHA and its trailing version comment.
