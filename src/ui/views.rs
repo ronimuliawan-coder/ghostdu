@@ -2162,12 +2162,15 @@ fn render_confirm_modal(f: &mut Frame, app: &App, screen: Rect) {
                     } else {
                         "[ ]"
                     };
-                    let line = format!(
-                        " {} {:<12} {:>10}",
-                        marker,
-                        label,
+                    // The volume total counts unused named volumes too, while a
+                    // default prune removes only anonymous ones on modern
+                    // daemons; show it as an upper bound (Qodo round 1).
+                    let size = if label == "volumes" {
+                        format!("≤{}", format_size(sizes[index]))
+                    } else {
                         format_size(sizes[index])
-                    );
+                    };
+                    let line = format!(" {} {:<12} {:>10}", marker, label, size);
                     let style = if index == app.docker_prune_cursor {
                         Style::default().fg(Color::Black).bg(Color::Yellow)
                     } else {
@@ -2189,7 +2192,7 @@ fn render_confirm_modal(f: &mut Frame, app: &App, screen: Rect) {
                     Style::default().fg(Color::DarkGray),
                 )));
                 infos.push(Line::from(Span::styled(
-                    "Volumes: unused only; Docker <23 also removes named ones.",
+                    "Volumes: unused anonymous; Docker <23 removes named too.",
                     Style::default().fg(Color::DarkGray),
                 )));
 
@@ -3460,7 +3463,9 @@ mod render_sweep_tests {
         for text in ["images", "containers", "volumes", "build cache"] {
             assert!(out.contains(text), "missing category {text}");
         }
-        assert!(out.contains("Docker <23 also removes named ones."));
+        assert!(out.contains("Docker <23 removes named too."));
+        // The volume total counts named volumes too: shown as an upper bound.
+        assert!(out.contains('≤'));
     }
 
     /// Audit M1: the scan-progress path is untrusted too.
