@@ -2587,6 +2587,16 @@ fn render_item_info_modal(f: &mut Frame, app: &App, screen: Rect) {
             ),
             Style::default().fg(Color::White),
         ),
+        // A sparse or inline-extent file really does occupy no blocks, so the
+        // zero is honest; without this it reads as a broken figure.
+        Span::styled(
+            if info.is_zero_block {
+                "  (sparse or inline)"
+            } else {
+                ""
+            },
+            Style::default().fg(Color::DarkGray),
+        ),
     ]));
 
     lines.push(Line::from(vec![
@@ -3693,6 +3703,7 @@ mod render_sweep_tests {
         app.item_info = crate::fs::mount_info::get_detailed_item_info(
             std::path::Path::new("/etc/hosts"),
             0,
+            None,
             true,
         );
         assert!(app.item_info.is_some(), "/etc/hosts must exist");
