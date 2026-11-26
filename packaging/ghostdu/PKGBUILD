@@ -10,7 +10,7 @@ depends=('libgcc')
 makedepends=('cargo')
 # Upstream tags are stable; run `updpkgsums` when bumping pkgver.
 source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
-sha256sums=('8d929c2dc84986f791a5ff7f9e0286fc8e6c07c7bae51b80dd7aa42eb655ad62')
+sha256sums=('584a033a3045f6fb1be91d3514212c2888878a120d4d045eb46e8ebed8e857d5')
 
 build() {
   cd "$pkgname-$pkgver"

@@ -1,0 +1,66 @@
+#!/usr/bin/env bash
+# Commit-message law for ghostdu.
+#
+# Enforced rules (see docs/GIT_WORKFLOW.md "Commit messages"):
+#   1. Conventional Commits 1.0.0 format.
+#   2. No review-round or review-process references.
+#   3. No third-party review tool or service names.
+#   4. No attribution trailers for assistants, bots, or tools.
+#
+# Bypass is deliberately awkward: `git commit --no-verify`. That flag is reserved
+# for a genuine emergency and must be disclosed in the work record.
+set -euo pipefail
+
+msg_file="${1:?commit message file required}"
+subject="$(head -n1 "$msg_file")"
+
+# Platform-generated merge commits are exempt.
+case "$subject" in
+  "Merge pull request #"*|"Merge branch "*|"Merge remote-tracking branch "*|"Revert \"")
+    exit 0 ;;
+esac
+
+fail() {
+  printf '\ncommit-msg rejected: %s\n\n' "$1" >&2
+  printf 'Subject: %s\n\n' "$subject" >&2
+  printf 'See docs/GIT_WORKFLOW.md -> "Commit messages" for the full law.\n' >&2
+  exit 1
+}
+
+# --- 1. Conventional Commits format -----------------------------------------
+# <type>[(scope)][!]: <description>
+types='feat|fix|docs|style|refactor|perf|test|build|ci|chore|revert'
+if ! printf '%s' "$subject" | grep -qE "^($types)(\([a-z0-9._/-]+\))?!?: .+"; then
+  fail "subject is not a Conventional Commit (<type>[scope][!]: <description>)"
+fi
+
+# Description: lower-case start, no trailing period.
+desc="$(printf '%s' "$subject" | sed -E "s/^($types)(\([^)]*\))?!?: //")"
+if printf '%s' "$desc" | grep -qE '^[A-Z]'; then
+  fail "description must start lower-case"
+fi
+if printf '%s' "$desc" | grep -qE '\.$'; then
+  fail "description must not end with a period"
+fi
+
+# --- 2. No review-round / review-process references --------------------------
+# The subject describes the change, so any pull/merge-request reference in it is
+# review scaffolding. Bodies keep standard issue footers (`Fixes #12`) working.
+if printf '%s' "$subject" | grep -qiE '\b(PR|MR) ?#[0-9]+|\b(issue|ticket) #[0-9]+'; then
+  fail "subject references a pull/merge request or issue; describe the change instead"
+fi
+if grep -qiE 'review round|round [0-9]+ ?[bB]?\b|review[ -]finding|review feedback|address(ed|es)? review|per review|fix(es|ed)? review|review remediation|\bF[0-9]+ (finding|fix|bug)|finding[s]? [A-Z]?[0-9]' "$msg_file"; then
+  fail "message references a review round or review process; describe the change instead"
+fi
+
+# --- 3. No third-party review tool or service names -------------------------
+if grep -qiE '\b(qodo|coderabbit|cubic|macroscope|greptile|copilot|sourcery|codeium|tabnine|amazon q)\b' "$msg_file"; then
+  fail "message names a third-party review tool or service"
+fi
+
+# --- 4. No attribution trailers ---------------------------------------------
+if grep -qiE '^[[:space:]]*(co-authored-by|co-developed-by|generated-by|assisted-by|signed-off-by)[[:space:]]*:' "$msg_file"; then
+  fail "message carries an attribution trailer; the contributor list is the set of human owners"
+fi
+
+exit 0
