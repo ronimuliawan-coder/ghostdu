@@ -98,7 +98,12 @@ jobs:
           merge-multiple: true
 
       - name: Verify artifact round trip
+        shell: bash
         run: |
+          # -o pipefail: without it a failing tar is masked by a succeeding
+          # sort, and the checksums cannot catch a corrupt archive because they
+          # are computed from that same archive.
+          set -euo pipefail
           ls -l
           # Both architectures must arrive, each with its checksum file, and the
           # bytes must still match what the build job hashed before upload.
@@ -107,16 +112,22 @@ jobs:
             sha256sum -c "ghostdu-"*"-$arch.tar.gz.sha256"
             tar -tzf "ghostdu-"*"-$arch.tar.gz" | sort
           done
-          # The x86_64 binary runs here; the tarball is flat, so it sits at the
-          # archive root next to its man page and completions.
-          mkdir -p unpacked && tar -xzf "ghostdu-"*"-x86_64.tar.gz" -C unpacked
-          ./unpacked/ghostdu --version
+          # Every archive listed above must also actually extract, so a corrupt
+          # aarch64 asset cannot ride along on the x86_64 binary running here.
+          for arch in x86_64 aarch64; do
+            mkdir -p "unpacked-$arch"
+            tar -xzf "ghostdu-"*"-$arch.tar.gz" -C "unpacked-$arch"
+          done
+          # The x86_64 binary executes on this runner; the tarball is flat, so
+          # it sits at the archive root next to its man page and completions.
+          ./unpacked-x86_64/ghostdu --version
 
   publish:
     needs: [build, verify]
-    # A manual dispatch is a dry run: it must exercise upload -> download
-    # without ever creating a release for a branch ref.
-    if: github.ref_type == 'tag'
+    # Only a tag *push* publishes. ref_type alone is not enough: a manual
+    # dispatch may target a tag ref, which would pass that gate and create a
+    # release during what is meant to be a dry run.
+    if: github.event_name == 'push' && github.ref_type == 'tag'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
