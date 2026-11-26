@@ -274,7 +274,10 @@ fn scan_with_progress<B: ratatui::backend::Backend>(
     options: &ScannerOptions,
     scan_poll: &dyn Fn(Duration) -> Result<bool, std::io::Error>,
     scan_read: &dyn Fn() -> Result<Event, std::io::Error>,
-) -> Result<ScanOutcome, Box<dyn std::error::Error>> {
+) -> Result<ScanOutcome, Box<dyn std::error::Error>>
+where
+    B::Error: 'static,
+{
     let (progress_tx, progress_rx) = unbounded::<ScanProgress>();
     let stop_signal = Arc::new(AtomicBool::new(false));
     let stop_clone = stop_signal.clone();
@@ -367,7 +370,10 @@ fn fresh_app<B: ratatui::backend::Backend>(
     scan_options: &ScannerOptions,
     scan: &ScanSource,
     preload: Option<fs::FileEntry>,
-) -> Result<Option<App>, Box<dyn std::error::Error>> {
+) -> Result<Option<App>, Box<dyn std::error::Error>>
+where
+    B::Error: 'static,
+{
     let imported = preload.is_some();
     let root_entry = match preload {
         Some(root) => root,
@@ -416,7 +422,10 @@ fn run_app<B: ratatui::backend::Backend>(
     main_read: &dyn Fn() -> Result<Event, std::io::Error>,
     subshell: &SubshellRunner<B>,
     mut preload: Option<fs::FileEntry>,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<(), Box<dyn std::error::Error>>
+where
+    B::Error: 'static,
+{
     let mut saved_current_path: Option<PathBuf> = None;
     // Set by an in-place refresh: the session continues with the same App, so
     // navigation, filters, and selection scope survive the rescan.
