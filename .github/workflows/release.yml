@@ -14,6 +14,12 @@ name: Release
 on:
   push:
     tags: ["v*"]
+  # Manual dry run. The artifact actions (upload/download) appear only in this
+  # workflow, which a tag push is otherwise the only way to reach, so a green
+  # ordinary PR proves nothing about them. Dispatching runs the full
+  # build -> upload -> download path and skips only the publish step, which
+  # would otherwise try to `gh release create` a branch name.
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -34,11 +40,19 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Refuse tag/version drift
+      - name: Resolve version
+        id: version
         run: |
           cargo_ver="$(cargo metadata --format-version 1 --no-deps | python3 -c "import json,sys; print(json.load(sys.stdin)['packages'][0]['version'])")"
-          test "${GITHUB_REF_NAME#v}" = "$cargo_ver" || \
-            { echo "tag ${GITHUB_REF_NAME} does not match Cargo.toml version ${cargo_ver}"; exit 1; }
+          # A tag must match the manifest; a dispatch has no tag, so the
+          # manifest is the only honest source and no drift to refuse.
+          if [ "$GITHUB_REF_TYPE" = tag ]; then
+            test "${GITHUB_REF_NAME#v}" = "$cargo_ver" || \
+              { echo "tag ${GITHUB_REF_NAME} does not match Cargo.toml version ${cargo_ver}"; exit 1; }
+          else
+            echo "Manual dry run on ${GITHUB_REF_NAME}: building ${cargo_ver}, publish step skipped"
+          fi
+          echo "version=$cargo_ver" >> "$GITHUB_OUTPUT"
 
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
 
@@ -47,7 +61,7 @@ jobs:
 
       - name: Assemble tarball
         run: |
-          dist="ghostdu-${GITHUB_REF_NAME#v}-${{ matrix.arch }}"
+          dist="ghostdu-${{ steps.version.outputs.version }}-${{ matrix.arch }}"
           mkdir "$dist"
           cp target/release/ghostdu README.md LICENSE "$dist/"
           "./$dist/ghostdu" --print-manpage > "$dist/ghostdu.1"
@@ -69,8 +83,40 @@ jobs:
             ghostdu-*-aarch64.tar.gz
             ghostdu-*-aarch64.tar.gz.sha256
 
-  publish:
+  # Proves the upload -> download round trip on every path, including a manual
+  # dry run. The publish job below cannot serve as that proof: it is skipped on
+  # a dispatch, and a release is the one side effect a dry run must not have.
+  verify:
     needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Download tarballs
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: release-tarball-*
+          merge-multiple: true
+
+      - name: Verify artifact round trip
+        run: |
+          ls -l
+          # Both architectures must arrive, each with its checksum file, and the
+          # bytes must still match what the build job hashed before upload.
+          for arch in x86_64 aarch64; do
+            ls "ghostdu-"*"-$arch.tar.gz" "ghostdu-"*"-$arch.tar.gz.sha256"
+            sha256sum -c "ghostdu-"*"-$arch.tar.gz.sha256"
+            tar -tzf "ghostdu-"*"-$arch.tar.gz" | sort
+          done
+          # The x86_64 binary runs here; the tarball is flat, so it sits at the
+          # archive root next to its man page and completions.
+          mkdir -p unpacked && tar -xzf "ghostdu-"*"-x86_64.tar.gz" -C unpacked
+          ./unpacked/ghostdu --version
+
+  publish:
+    needs: [build, verify]
+    # A manual dispatch is a dry run: it must exercise upload -> download
+    # without ever creating a release for a branch ref.
+    if: github.ref_type == 'tag'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
