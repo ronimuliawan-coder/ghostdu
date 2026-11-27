@@ -127,6 +127,29 @@ impl SortMode {
     }
 }
 
+/// Builds the status line for a trash action.
+///
+/// Pure so the degraded-destination and partial-failure wordings are testable
+/// without performing a real move.
+fn trash_status_message(
+    moved: usize,
+    failed: usize,
+    first_failure: Option<&str>,
+    warning: Option<&str>,
+) -> String {
+    if failed > 0 {
+        let reason = first_failure.unwrap_or("unknown error");
+        return format!("Moved {moved} to wastebin, {failed} failed: {reason}");
+    }
+    // A successful move can still carry a note, e.g. the shared trash was
+    // unusable and the per-user one was used instead. Surface it rather than
+    // silently accepting a degraded destination.
+    match warning {
+        Some(note) => format!("✔ Moved {moved} items to Wastebin — {note}"),
+        None => format!("✔ Moved {moved} items to Wastebin"),
+    }
+}
+
 #[derive(Debug)]
 pub enum ConfirmAction {
     MoveToTrash,
@@ -1681,14 +1704,12 @@ impl App {
                     self.refresh_fs_info();
                 }
 
-                if failed_count == 0 {
-                    self.set_status(format!("✔ Moved {} items to Wastebin", count));
-                } else {
-                    self.set_status(format!(
-                        "Moved {} to wastebin, {} failed: {}",
-                        count, failed_count, result.failed[0].1
-                    ));
-                }
+                self.set_status(trash_status_message(
+                    count,
+                    failed_count,
+                    result.failed.first().map(|(_, reason)| reason.as_str()),
+                    result.warnings.first().map(|(_, reason)| reason.as_str()),
+                ));
             }
             ConfirmAction::PermanentDelete => {
                 let targets = std::mem::take(&mut self.action_targets);
@@ -2150,6 +2171,43 @@ impl App {
                 return None;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod trash_status_tests {
+    use super::trash_status_message;
+
+    #[test]
+    fn clean_move_reports_only_the_count() {
+        assert_eq!(
+            trash_status_message(3, 0, None, None),
+            "✔ Moved 3 items to Wastebin"
+        );
+    }
+
+    #[test]
+    fn degraded_destination_is_surfaced_on_a_successful_move() {
+        assert_eq!(
+            trash_status_message(2, 0, None, Some("shared trash unusable; used .Trash-1000")),
+            "✔ Moved 2 items to Wastebin — shared trash unusable; used .Trash-1000"
+        );
+    }
+
+    #[test]
+    fn failure_takes_precedence_and_names_the_reason() {
+        assert_eq!(
+            trash_status_message(1, 2, Some("permission denied"), Some("ignored note")),
+            "Moved 1 to wastebin, 2 failed: permission denied"
+        );
+    }
+
+    #[test]
+    fn missing_failure_reason_still_reads_sensibly() {
+        assert_eq!(
+            trash_status_message(0, 1, None, None),
+            "Moved 0 to wastebin, 1 failed: unknown error"
+        );
     }
 }
 
