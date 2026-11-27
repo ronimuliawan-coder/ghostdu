@@ -324,29 +324,107 @@ fn open_child(parent: &File, name: &CStr) -> io::Result<File> {
     )?))
 }
 
-fn directory_entries(target: &File) -> io::Result<(File, Vec<CString>)> {
-    let directory = File::from(openat2(
+/// Maximum directory nesting a destructive walk will traverse.
+///
+/// The walk is iterative, so this is not a stack-safety limit; it is a
+/// deliberate refusal. A target nested deeper than this is almost certainly not
+/// what the user meant to delete, and a destructive operation should fail closed
+/// rather than act on a surprise.
+///
+/// The ceiling also keeps descriptor use bounded: each level holds one directory
+/// handle, so 512 levels stays inside the common 1024-descriptor soft limit. The
+/// pre-flight `inspect_tree` enforces the same bound *before* any `unlinkat`, so
+/// a refused target is never partially deleted.
+const MAX_TRAVERSAL_DEPTH: usize = 512;
+
+/// One directory level of the destructive walk.
+///
+/// `dir` is a readable handle on the directory itself, used to iterate and open
+/// its children and to confirm the level's identity before unlinking it. The
+/// containing handle is not stored: it is the previous level's `dir`, or the
+/// caller's pinned parent for the root level. That keeps exactly one descriptor
+/// open per level rather than two.
+struct WalkLevel {
+    name: CString,
+    dir: File,
+    children: Vec<CString>,
+    next_child: usize,
+}
+
+/// Opens `target` as a readable directory handle for entry iteration.
+fn open_directory_for_read(target: &File) -> io::Result<File> {
+    Ok(File::from(openat2(
         target,
         ".",
         OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
         Mode::empty(),
         ResolveFlags::BENEATH | ResolveFlags::NO_SYMLINKS | ResolveFlags::NO_XDEV,
-    )?);
+    )?))
+}
+
+/// Reads a directory's entry names from an already-open handle.
+fn names_in(directory: &File) -> io::Result<Vec<CString>> {
     let mut names = Vec::new();
-    for entry in Dir::read_from(&directory)? {
+    for entry in Dir::read_from(directory)? {
         let entry = entry?;
         if !matches!(entry.file_name().to_bytes(), b"." | b"..") {
             names.push(entry.file_name().to_owned());
         }
     }
-    Ok((directory, names))
+    Ok(names)
 }
 
+fn depth_error() -> io::Error {
+    io::Error::other(format!(
+        "Target nests deeper than {MAX_TRAVERSAL_DEPTH} directories; refusing to delete it"
+    ))
+}
+
+/// Pre-flight walk that rejects a target containing an existing mount (or any
+/// unreadable subtree) before anything is unlinked.
+///
+/// Iterative on an explicit stack: the recursive form held a descriptor and a
+/// stack frame per level, so a sufficiently deep tree overflowed the stack and
+/// aborted the process instead of reporting a failure.
 pub(super) fn inspect_tree(target: &File) -> io::Result<()> {
-    if target.metadata()?.is_dir() {
-        let (directory, names) = directory_entries(target)?;
-        for name in names {
-            inspect_tree(&open_child(&directory, &name)?)?;
+    if !target.metadata()?.is_dir() {
+        return Ok(());
+    }
+    let root = open_directory_for_read(target)?;
+    let mut stack: Vec<(File, Vec<CString>, usize)> = vec![(root, Vec::new(), 0)];
+    {
+        let (dir, names, _) = stack.last_mut().expect("just pushed");
+        *names = names_in(dir)?;
+    }
+    while !stack.is_empty() {
+        let next = {
+            let (_, names, index) = stack.last_mut().expect("checked non-empty");
+            names.get(*index).map(|name| {
+                *index += 1;
+                name.clone()
+            })
+        };
+        match next {
+            Some(name) => {
+                // Open the child relative to the *current* level without cloning
+                // its descriptor: the handle stays owned by the stack entry.
+                let child = {
+                    let (dir, _, _) = stack.last().expect("checked non-empty");
+                    open_child(dir, &name)?
+                };
+                if child.metadata()?.is_dir() {
+                    if stack.len() >= MAX_TRAVERSAL_DEPTH {
+                        return Err(depth_error());
+                    }
+                    let dir = open_directory_for_read(&child)?;
+                    stack.push((dir, Vec::new(), 0));
+                    let (dir, names, _) = stack.last_mut().expect("just pushed");
+                    *names = names_in(dir)?;
+                }
+            }
+            None => {
+                stack.pop();
+            }
         }
     }
     Ok(())
@@ -372,16 +450,85 @@ fn remove_at_with_hook(
     after_verification: &impl Fn(&File, &CStr),
 ) -> io::Result<()> {
     verify_identity(parent, name, target)?;
-    let is_dir = target.metadata()?.is_dir();
-    if is_dir {
-        let (directory, names) = directory_entries(target)?;
-        for child_name in names {
-            let child = open_child(&directory, &child_name)?;
-            remove_at_with_hook(&directory, &child_name, &child, after_verification)?;
+    if !target.metadata()?.is_dir() {
+        after_verification(parent, name);
+        return unlink_entry(parent, name, false);
+    }
+
+    // Iterative post-order: descend first, then unlink each directory only after
+    // all of its children are gone. The recursive form kept a stack frame and a
+    // descriptor per level, so a deep tree overflowed the stack and aborted the
+    // process mid-deletion with no result to report. Each level owns the handle
+    // of the directory it walks, so exactly one descriptor is open per level and
+    // the containing handle is derived from the level below rather than stored.
+    let mut stack: Vec<WalkLevel> = vec![WalkLevel {
+        name: CString::new(name.to_bytes())?,
+        dir: open_directory_for_read(target)?,
+        children: Vec::new(),
+        next_child: 0,
+    }];
+    {
+        let level = stack.last_mut().expect("just pushed");
+        level.children = names_in(&level.dir)?;
+    }
+    loop {
+        // Either descend into the next child of the deepest level, or remove that
+        // level once every child is gone.
+        let next = {
+            let level = stack.last_mut().expect("stack is non-empty here");
+            level.children.get(level.next_child).map(|name| {
+                level.next_child += 1;
+                name.clone()
+            })
+        };
+        match next {
+            Some(child_name) => {
+                let child = {
+                    let level = stack.last().expect("checked non-empty");
+                    open_child(&level.dir, &child_name)?
+                };
+                {
+                    let level = stack.last().expect("checked non-empty");
+                    verify_identity(&level.dir, &child_name, &child)?;
+                }
+                if child.metadata()?.is_dir() {
+                    if stack.len() >= MAX_TRAVERSAL_DEPTH {
+                        return Err(depth_error());
+                    }
+                    let dir = open_directory_for_read(&child)?;
+                    let children = names_in(&dir)?;
+                    stack.push(WalkLevel {
+                        name: child_name,
+                        dir,
+                        children,
+                        next_child: 0,
+                    });
+                } else {
+                    let level = stack.last().expect("checked non-empty");
+                    after_verification(&level.dir, &child_name);
+                    unlink_entry(&level.dir, &child_name, false)?;
+                }
+            }
+            None => {
+                let done = stack.pop().expect("stack is non-empty here");
+                // The containing handle is the parent level's `dir`, or the
+                // caller's pinned parent when this was the root.
+                let containing: &File = match stack.last() {
+                    Some(parent_level) => &parent_level.dir,
+                    None => parent,
+                };
+                verify_identity(containing, &done.name, &done.dir)?;
+                after_verification(containing, &done.name);
+                unlink_entry(containing, &done.name, true)?;
+                if stack.is_empty() {
+                    return Ok(());
+                }
+            }
         }
     }
-    verify_identity(parent, name, target)?;
-    after_verification(parent, name);
+}
+
+fn unlink_entry(parent: &File, name: &CStr, is_dir: bool) -> io::Result<()> {
     // Security Threat Model Note:
     // In POSIX/Linux, `unlinkat` takes a directory file descriptor and an entry name.
     // There is no kernel-level atomic compare-and-unlink syscall.
@@ -832,5 +979,123 @@ mod tests {
             fs::read_to_string(victim.join("keep")).unwrap(),
             "untouched"
         );
+    }
+
+    /// Builds `depth` nested directories beneath `root`, returning the top-level
+    /// entry and the deepest directory that holds the leaf file.
+    ///
+    /// Built with ordinary paths: at `MAX_TRAVERSAL_DEPTH` the total length stays
+    /// well under `PATH_MAX`, so no process-global `chdir` is needed and the tests
+    /// stay parallel-safe.
+    fn nested_tree(root: &Path, depth: usize) -> (PathBuf, PathBuf) {
+        let mut current = root.to_path_buf();
+        for i in 0..depth {
+            current = current.join(format!("d{}", i % 10));
+        }
+        fs::create_dir_all(&current).unwrap();
+        fs::write(current.join("leaf.txt"), "payload").unwrap();
+        (root.join("d0"), current)
+    }
+
+    #[test]
+    fn deeply_nested_target_is_refused_and_left_intact() {
+        let temp = tempfile::tempdir().unwrap();
+        let (target_path, deepest) = nested_tree(temp.path(), MAX_TRAVERSAL_DEPTH + 64);
+        let (parent, name, target) = prepare_target_with_mount_roots(
+            &target_path,
+            &read_mount_roots().unwrap(),
+            &protected_dir_identities(),
+        )
+        .unwrap();
+
+        // The pre-flight walk must refuse before anything is unlinked, so the
+        // recursive walk can never abort the process halfway through a tree.
+        let error = inspect_tree(&target).unwrap_err();
+        assert!(
+            error.to_string().contains("nests deeper than"),
+            "unexpected error: {error}"
+        );
+
+        // The destructive walk applies the same bound and also refuses.
+        let error = remove_at(&parent, &name, &target).unwrap_err();
+        assert!(
+            error.to_string().contains("nests deeper than"),
+            "unexpected error: {error}"
+        );
+        assert!(target_path.exists(), "a refused target must not be altered");
+        assert!(
+            deepest.join("leaf.txt").exists(),
+            "children must survive a refused deletion"
+        );
+    }
+
+    #[test]
+    fn shallow_nesting_is_still_deleted() {
+        let temp = tempfile::tempdir().unwrap();
+        let (target_path, _) = nested_tree(temp.path(), 32);
+        let (parent, name, target) = prepare_target_with_mount_roots(
+            &target_path,
+            &read_mount_roots().unwrap(),
+            &protected_dir_identities(),
+        )
+        .unwrap();
+        inspect_tree(&target).unwrap();
+        remove_at(&parent, &name, &target).unwrap();
+        assert!(!target_path.exists());
+    }
+
+    #[test]
+    fn wide_directory_is_deleted_without_exhausting_descriptors() {
+        // Many siblings at one level: the recursive form held a descriptor per
+        // level, so widening a tree must not accumulate handles either.
+        let temp = tempfile::tempdir().unwrap();
+        let target_path = temp.path().join("wide");
+        let nested = target_path.join("nested");
+        fs::create_dir_all(&nested).unwrap();
+        for i in 0..256 {
+            fs::write(nested.join(format!("f{i}")), "x").unwrap();
+        }
+        let (parent, name, target) = prepare_target_with_mount_roots(
+            &target_path,
+            &read_mount_roots().unwrap(),
+            &protected_dir_identities(),
+        )
+        .unwrap();
+        inspect_tree(&target).unwrap();
+        remove_at(&parent, &name, &target).unwrap();
+        assert!(!target_path.exists());
+    }
+
+    #[test]
+    fn children_are_removed_before_their_parent_directory() {
+        // Post-order is load-bearing: removing a directory before its contents
+        // would fail with ENOTEMPTY. Observe the unlink order through the hook.
+        let temp = tempfile::tempdir().unwrap();
+        let target_path = temp.path().join("ordered");
+        let inner = target_path.join("inner");
+        fs::create_dir_all(&inner).unwrap();
+        fs::write(inner.join("leaf.txt"), "x").unwrap();
+
+        let (parent, name, target) = prepare_target_with_mount_roots(
+            &target_path,
+            &read_mount_roots().unwrap(),
+            &protected_dir_identities(),
+        )
+        .unwrap();
+
+        let observed = std::cell::RefCell::new(Vec::new());
+        remove_at_with_hook(&parent, &name, &target, &|_, entry_name| {
+            observed
+                .borrow_mut()
+                .push(entry_name.to_string_lossy().into_owned());
+        })
+        .unwrap();
+
+        let order = observed.into_inner();
+        let leaf = order.iter().position(|n| n == "leaf.txt").unwrap();
+        let inner = order.iter().position(|n| n == "inner").unwrap();
+        let root = order.iter().position(|n| n == "ordered").unwrap();
+        assert!(leaf < inner, "leaf must precede its directory: {order:?}");
+        assert!(inner < root, "inner must precede the root: {order:?}");
     }
 }

@@ -18,6 +18,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 pub struct TrashResult {
     pub succeeded: Vec<PathBuf>,
     pub failed: Vec<(PathBuf, String)>,
+    /// Non-fatal notes about a move that did succeed, such as a shared trash
+    /// directory that was unusable so the per-user one was used instead.
+    pub warnings: Vec<(PathBuf, String)>,
 }
 
 pub fn move_to_trash<P: AsRef<Path>>(paths: &[P]) -> TrashResult {
@@ -43,7 +46,7 @@ fn trash_with_verification<P: AsRef<Path>>(
 fn trash_with_destination<P: AsRef<Path>>(
     paths: &[P],
     verify: impl Fn(&Path, &File) -> io::Result<()>,
-    resolve: impl FnMut(&File) -> io::Result<(File, Option<PathBuf>)>,
+    resolve: impl FnMut(&File) -> io::Result<(File, Option<PathBuf>, Option<String>)>,
 ) -> TrashResult {
     trash_with_destination_impl(
         paths,
@@ -57,7 +60,7 @@ fn trash_with_destination<P: AsRef<Path>>(
 fn trash_with_destination_impl<P: AsRef<Path>>(
     paths: &[P],
     verify: impl Fn(&Path, &File) -> io::Result<()>,
-    mut resolve: impl FnMut(&File) -> io::Result<(File, Option<PathBuf>)>,
+    mut resolve: impl FnMut(&File) -> io::Result<(File, Option<PathBuf>, Option<String>)>,
     mountinfo: io::Result<Vec<u8>>,
     protected: Vec<(PathBuf, u64, u64)>,
 ) -> TrashResult {
@@ -80,7 +83,9 @@ fn trash_with_destination_impl<P: AsRef<Path>>(
     let topology = MountTopology::from_mountinfo(&mountinfo);
     for path in paths {
         let path = path.as_ref();
-        let moved: io::Result<()> = (|| {
+        // The warning is produced by a successful resolve, so it is carried out
+        // alongside the move result and only recorded when the move also worked.
+        let moved: io::Result<Option<String>> = (|| {
             let (parent, name, target) =
                 prepare_target_with_mount_roots(path, &mount_roots, &protected)?;
             verify(path, &target)?;
@@ -89,19 +94,28 @@ fn trash_with_destination_impl<P: AsRef<Path>>(
             let destination = match destinations.entry(mount_id(&parent)?) {
                 std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
                 std::collections::hash_map::Entry::Vacant(entry) => {
-                    let (trash, topdir) = resolve(&parent)?;
-                    entry.insert(TrashDestination::open(&parent, trash, topdir)?)
+                    let (trash, topdir, warning) = resolve(&parent)?;
+                    entry.insert(TrashDestination::open(&parent, trash, topdir, warning)?)
                 }
             };
+            let resolve_warning = destination.warning.clone();
             let restore_path = match &destination.topdir {
                 Some(topdir) => original.strip_prefix(topdir).map_err(io::Error::other)?,
                 None => &original,
             };
             let noop = |_: MovePhase, _: &File, _: &str| {};
-            move_prepared_with_hook(&parent, &name, &target, destination, restore_path, noop)
+            combine_notes(
+                move_prepared_with_hook(&parent, &name, &target, destination, restore_path, noop),
+                resolve_warning,
+            )
         })();
         match moved {
-            Ok(()) => result.succeeded.push(path.to_path_buf()),
+            Ok(warning) => {
+                if let Some(reason) = warning {
+                    result.warnings.push((path.to_path_buf(), reason));
+                }
+                result.succeeded.push(path.to_path_buf());
+            }
             Err(error) => result.failed.push((path.to_path_buf(), error.to_string())),
         }
     }
@@ -172,10 +186,18 @@ struct TrashDestination {
     files: File,
     info: File,
     topdir: Option<PathBuf>,
+    /// Why this destination is degraded, if it is. Cached with the destination so
+    /// every move that reuses it reports the same cause, not just the first.
+    warning: Option<String>,
 }
 
 impl TrashDestination {
-    fn open(source: &File, trash: File, topdir: Option<PathBuf>) -> io::Result<Self> {
+    fn open(
+        source: &File,
+        trash: File,
+        topdir: Option<PathBuf>,
+        warning: Option<String>,
+    ) -> io::Result<Self> {
         let files = private_directory(&trash, Path::new("files"))?;
         let info = private_directory(&trash, Path::new("info"))?;
         Ok(Self {
@@ -184,6 +206,7 @@ impl TrashDestination {
             files,
             info,
             topdir,
+            warning,
         })
     }
 
@@ -231,13 +254,66 @@ fn effective_uid() -> u32 {
     unsafe { libc::geteuid() }
 }
 
-fn private_directory(parent: &File, name: &Path) -> io::Result<File> {
-    match mkdirat(parent, name, Mode::RWXU) {
-        Ok(()) | Err(rustix::io::Errno::EXIST) => {}
-        Err(error) => return Err(error.into()),
+/// Flushes a directory's own entries to stable storage.
+///
+/// The walk handles are opened `O_PATH` (`open_directory` above), which the
+/// kernel refuses to `fsync`. Durability therefore needs a separate readable
+/// handle on the same directory: `O_RDONLY|O_DIRECTORY` on the pinned descriptor
+/// via `openat2(".")` re-opens the same inode without re-resolving a path.
+fn sync_directory(directory: &File) -> io::Result<()> {
+    let readable = File::from(openat2(
+        directory,
+        ".",
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+        Mode::empty(),
+        ResolveFlags::BENEATH | ResolveFlags::NO_SYMLINKS,
+    )?);
+    readable.sync_all()
+}
+
+/// Describes a durability shortfall after the move already happened.
+///
+/// This is a warning, not an error: once `renameat` succeeds the payload is in the
+/// trash and gone from its source, so reporting a failure would leave the source
+/// visible in the tree and invite a retry of a file that is no longer there.
+fn durability_warning(stage: &str, error: io::Error) -> String {
+    format!(
+        "moved, but its {stage} could not be made durable ({error}); \
+         the entry exists and its survival across a crash is not guaranteed"
+    )
+}
+
+/// Merges the two independent notes a move can carry.
+///
+/// A degraded destination and a durability shortfall are separate facts and
+/// neither implies the other, so a move that has both reports both. A failed
+/// move keeps its error and drops the destination note, which only described
+/// where a successful move would have gone.
+fn combine_notes(
+    outcome: io::Result<Option<String>>,
+    destination: Option<String>,
+) -> io::Result<Option<String>> {
+    match (outcome?, destination) {
+        (Some(durable), Some(resolve)) => Ok(Some(format!("{resolve}; {durable}"))),
+        (Some(durable), None) => Ok(Some(durable)),
+        (None, warning) => Ok(warning),
     }
+}
+
+fn private_directory(parent: &File, name: &Path) -> io::Result<File> {
+    let created = match mkdirat(parent, name, Mode::RWXU) {
+        Ok(()) => true,
+        Err(rustix::io::Errno::EXIST) => false,
+        Err(error) => return Err(error.into()),
+    };
     let directory = open_directory(parent, name, true)?;
     validate_private(&directory)?;
+    // A freshly created directory lives only as an entry in `parent`; without a
+    // flush of `parent` a crash can lose it even though the move that used it was
+    // synced. Best-effort: an unsyncable parent must not fail a usable directory.
+    if created {
+        let _ = sync_directory(parent);
+    }
     Ok(directory)
 }
 
@@ -275,9 +351,15 @@ fn home_trash(data_home: &Path) -> io::Result<File> {
         match component {
             Component::RootDir => {}
             Component::Normal(name) => {
-                match mkdirat(&directory, name, Mode::RWXU) {
-                    Ok(()) | Err(rustix::io::Errno::EXIST) => {}
+                let created = match mkdirat(&directory, name, Mode::RWXU) {
+                    Ok(()) => true,
+                    Err(rustix::io::Errno::EXIST) => false,
                     Err(error) => return Err(error.into()),
+                };
+                // Flush the containing directory so a freshly created component is
+                // durable before anything is placed inside it. Best-effort.
+                if created {
+                    let _ = sync_directory(&directory);
                 }
                 directory = open_directory(&directory, Path::new(name), false)?;
             }
@@ -319,18 +401,18 @@ fn data_home_mount(data_home: &Path) -> io::Result<File> {
     Err(io::Error::other("Cannot identify the home trash mount"))
 }
 
-fn trash_directory(parent: &File) -> io::Result<(File, Option<PathBuf>)> {
+fn trash_directory(parent: &File) -> io::Result<(File, Option<PathBuf>, Option<String>)> {
     trash_directory_for_data_home(parent, &data_home_path()?)
 }
 
 fn trash_directory_for_data_home(
     parent: &File,
     data_home: &Path,
-) -> io::Result<(File, Option<PathBuf>)> {
+) -> io::Result<(File, Option<PathBuf>, Option<String>)> {
     match home_trash(data_home) {
         Ok(home) => {
             if same_mount(&home, parent)? {
-                return Ok((home, None));
+                return Ok((home, None, None));
             }
         }
         Err(error) => {
@@ -362,23 +444,43 @@ fn trash_directory_for_data_home(
     }
     let topdir = fd_path(&top)?;
     // FreeDesktop specifies .Trash/<uid> (sticky shared directory) before .Trash-<uid>.
-    if let Some(trash) = shared_trash_entry(&top)? {
-        return Ok((trash, Some(topdir)));
+    if let Some((trash, warning)) = shared_trash_entry(&top)? {
+        return Ok((trash, Some(topdir), warning));
     }
     let trash = private_directory(&top, Path::new(&format!(".Trash-{}", effective_uid())))?;
-    Ok((trash, Some(topdir)))
+    Ok((trash, Some(topdir), None))
 }
 
-/// Probe for a shared sticky `.Trash` directory. `None` falls through to the
-/// per-user `.Trash-<uid>` directory.
-fn shared_trash_entry(top: &File) -> io::Result<Option<File>> {
+/// Probe for a shared sticky `.Trash` directory.
+///
+/// `Ok(None)` means there is genuinely no usable shared trash here (absent, or
+/// not a sticky directory), which is the ordinary case on a home filesystem.
+/// `Ok(Some((dir, None)))` is the shared directory. `Ok(Some((dir, Some(reason))))`
+/// reports that a shared `.Trash` exists but its per-user directory could not be
+/// used, so the caller falls through to `.Trash-<uid>` while telling the user why.
+fn shared_trash_entry(top: &File) -> io::Result<Option<(File, Option<String>)>> {
     let Ok(shared) = open_directory(top, Path::new(".Trash"), true) else {
         return Ok(None);
     };
     if shared.metadata()?.mode() & 0o1000 == 0 {
         return Ok(None);
     }
-    Ok(private_directory(&shared, Path::new(&effective_uid().to_string())).ok())
+    match private_directory(&shared, Path::new(&effective_uid().to_string())) {
+        Ok(directory) => Ok(Some((directory, None))),
+        // Deliberately not `?`: the spec allows falling back to `.Trash-<uid>`,
+        // but discarding the cause hides a full or read-only shared trash.
+        Err(error) => {
+            let fallback =
+                private_directory(top, Path::new(&format!(".Trash-{}", effective_uid())))?;
+            Ok(Some((
+                fallback,
+                Some(format!(
+                    "shared trash unusable ({error}); used .Trash-{} instead",
+                    effective_uid()
+                )),
+            )))
+        }
+    }
 }
 
 fn encode_path(path: &Path) -> String {
@@ -402,10 +504,10 @@ fn move_verified(
     trash: &File,
     original: &Path,
 ) -> io::Result<()> {
-    move_verified_with_hook(parent, name, target, trash, original, |_, _, _| {})
+    move_verified_with_hook(parent, name, target, trash, original, |_, _, _| {}).map(|_note| ())
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MovePhase {
     Reserved,
     MetadataSynced,
@@ -421,8 +523,8 @@ fn move_verified_with_hook(
     trash: &File,
     original: &Path,
     hook: impl Fn(MovePhase, &File, &str),
-) -> io::Result<()> {
-    let destination = TrashDestination::open(parent, trash.try_clone()?, None)?;
+) -> io::Result<Option<String>> {
+    let destination = TrashDestination::open(parent, trash.try_clone()?, None, None)?;
     move_prepared_with_hook(parent, name, target, &destination, original, hook)
 }
 
@@ -464,7 +566,7 @@ fn move_prepared_with_hook(
     destination: &TrashDestination,
     original: &Path,
     hook: impl Fn(MovePhase, &File, &str),
-) -> io::Result<()> {
+) -> io::Result<Option<String>> {
     destination.validate()?;
     let files = &destination.files;
     let info = &destination.info;
@@ -477,6 +579,9 @@ fn move_prepared_with_hook(
         let info_text = format!("[Trash Info]\nPath={encoded}\nDeletionDate={deletion_date}\n");
         metadata.write_all(info_text.as_bytes())?;
         metadata.sync_all()?;
+        // Make the new `.trashinfo` name durable before the payload moves: a crash
+        // here must not leave moved data behind with no metadata to restore it.
+        sync_directory(info)?;
         hook(MovePhase::MetadataSynced, info, &info_name);
         verify_identity(parent, name, target)?;
         hook(MovePhase::Verified, info, &info_name);
@@ -497,6 +602,10 @@ fn move_prepared_with_hook(
         hook(MovePhase::Renamed, info, &info_name);
         Ok(())
     })();
+    // A files-entry collision (orphan from a crashed run meeting a recycled
+    // pid+sequence) fails closed here instead of silently retrying: the user
+    // retries and mints a fresh sequence. Info-side collisions still retry
+    // inside `reserve_info_fd`.
     if let Err(error) = &moved {
         if let Err(_cleanup) = unlinkat(info, &info_name, AtFlags::empty()) {
             let location = fd_path(info)
@@ -507,12 +616,43 @@ fn move_prepared_with_hook(
             message.push_str("; inspect this orphaned entry");
             return Err(io::Error::other(message));
         }
+        // The creation of this name was already flushed. Flush the removal too,
+        // otherwise a crash can resurrect metadata for a payload that never moved.
+        let _ = sync_directory(info);
+        return moved.map(|_| None);
     }
-    // A files-entry collision (orphan from a crashed run meeting a recycled
-    // pid+sequence) fails closed here instead of silently retrying: the user
-    // retries and mints a fresh sequence. Info-side collisions still retry
-    // inside `reserve_info_fd`.
-    moved
+
+    // The payload is in the trash. Both directories are flushed regardless of
+    // whether the other failed: a source-side shortfall must not stop the arrival
+    // from being made durable, or the payload could vanish while being reported as
+    // moved. The first shortfall supplies the message.
+    Ok(flush_after_move(
+        |stage, directory| {
+            sync_directory(directory).map_err(|error| durability_warning(stage, error))
+        },
+        [
+            ("removal from the source", parent),
+            ("arrival in the trash", files),
+        ],
+    ))
+}
+
+/// Flushes every directory after a completed move, keeping the first shortfall.
+///
+/// Split out so the "try every directory" property is directly testable: a
+/// guard that stopped after the first failure would silently skip making the
+/// payload's arrival durable.
+fn flush_after_move<'a>(
+    flush: impl Fn(&str, &'a File) -> Result<(), String>,
+    stages: [(&'a str, &'a File); 2],
+) -> Option<String> {
+    let mut warning = None;
+    for (stage, directory) in stages {
+        if let Err(message) = flush(stage, directory) {
+            warning.get_or_insert(message);
+        }
+    }
+    warning
 }
 
 #[cfg(test)]
@@ -542,7 +682,7 @@ mod tests {
         let result = trash_with_destination_impl(
             &[&source],
             |_, _| Ok(()),
-            |parent| Ok((private_directory(parent, Path::new("Trash"))?, None)),
+            |parent| Ok((private_directory(parent, Path::new("Trash"))?, None, None)),
             fs::read("/proc/self/mountinfo"),
             protected_dir_identities(),
         );
@@ -584,7 +724,7 @@ mod tests {
             },
             |parent| {
                 resolutions += 1;
-                Ok((private_directory(parent, Path::new("Trash"))?, None))
+                Ok((private_directory(parent, Path::new("Trash"))?, None, None))
             },
         );
         assert_eq!(resolutions, 1);
@@ -628,7 +768,7 @@ mod tests {
             },
             |parent| {
                 resolutions += 1;
-                Ok((private_directory(parent, Path::new("Trash"))?, None))
+                Ok((private_directory(parent, Path::new("Trash"))?, None, None))
             },
         );
         assert_eq!(resolutions, 1);
@@ -1047,7 +1187,7 @@ mod coverage_tests {
         let result = trash_with_destination_impl(
             std::slice::from_ref(&victim),
             |_, _| Ok(()),
-            |parent| Ok((private_directory(parent, Path::new("Trash"))?, None)),
+            |parent| Ok((private_directory(parent, Path::new("Trash"))?, None, None)),
             Err(io::Error::other("mountinfo boom")),
             Vec::new(),
         );
@@ -1142,7 +1282,7 @@ mod coverage_tests {
         )
         .unwrap();
         let trash_file = File::open(&trash_dir).unwrap();
-        let destination = TrashDestination::open(&parent, trash_file, None).unwrap();
+        let destination = TrashDestination::open(&parent, trash_file, None, None).unwrap();
         std::fs::remove_dir_all(trash_dir.join("info")).unwrap();
         let error =
             move_prepared_with_hook(&parent, &name, &target, &destination, &source, |_, _, _| {})
@@ -1168,7 +1308,7 @@ mod coverage_tests {
         )
         .unwrap();
         let trash_file = File::open(&trash_dir).unwrap();
-        let destination = TrashDestination::open(&parent, trash_file, None).unwrap();
+        let destination = TrashDestination::open(&parent, trash_file, None, None).unwrap();
         let sabotage = |phase: MovePhase, info: &File, info_name: &str| {
             if phase == MovePhase::Reserved {
                 let stored = info_name.strip_suffix(".trashinfo").unwrap_or(info_name);
@@ -1380,7 +1520,8 @@ mod coverage_tests {
         let parent = open_dir(fixture.path());
         let home_data = fixture.path().join("data-home");
         std::fs::create_dir(&home_data).unwrap();
-        let (trash, topdir) = trash_directory_for_data_home(&parent, &home_data).unwrap();
+        let (trash, topdir, warning) = trash_directory_for_data_home(&parent, &home_data).unwrap();
+        assert!(warning.is_none(), "home trash must not warn");
         assert!(topdir.is_none());
         drop(trash);
     }
@@ -1448,5 +1589,404 @@ mod coverage_tests {
         assert!(source.exists());
         std::fs::set_permissions(trash.join("info"), std::fs::Permissions::from_mode(0o755))
             .unwrap();
+    }
+
+    #[test]
+    fn durability_sync_follows_the_metadata_and_the_rename() {
+        // Ordering is the point: the `.trashinfo` name must be durable before the
+        // payload moves, and the result must be reported only after the payload
+        // and its source removal are durable.
+        use std::os::unix::fs::PermissionsExt;
+        let fixture = tempfile::tempdir().unwrap();
+        let trash = fixture.path().join("Trash");
+        std::fs::create_dir_all(trash.join("files")).unwrap();
+        std::fs::create_dir_all(trash.join("info")).unwrap();
+        // `validate_private` requires the trash and both subdirectories private.
+        for dir in [&trash, &trash.join("files"), &trash.join("info")] {
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let source = fixture.path().join("source");
+        std::fs::write(&source, "payload").unwrap();
+        let trash_fd = open_dir(&trash);
+        let (parent, name, target) = prepare_target_with_mount_roots(
+            &source,
+            &read_mount_roots().unwrap(),
+            &protected_dir_identities(),
+        )
+        .unwrap();
+
+        let phases = std::cell::RefCell::new(Vec::new());
+        move_verified_with_hook(
+            &parent,
+            &name,
+            &target,
+            &trash_fd,
+            &source,
+            |phase, _, _| phases.borrow_mut().push(phase),
+        )
+        .unwrap();
+        let phases = phases.into_inner();
+
+        // All four boundaries are reached, in order, with the rename last. The
+        // durability syncs sit between `synced` and `renamed`, and after it, so
+        // the recorded phase sequence pins the sequence they are part of.
+        assert_eq!(
+            phases,
+            vec![
+                MovePhase::Reserved,
+                MovePhase::MetadataSynced,
+                MovePhase::Verified,
+                MovePhase::Renamed
+            ]
+        );
+        // The move really happened and the source is gone.
+        assert!(!source.exists());
+        let moved = std::fs::read_dir(trash.join("files"))
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .count();
+        assert_eq!(moved, 1, "payload should be in the trash");
+    }
+
+    #[test]
+    fn unusable_shared_trash_falls_back_with_a_warning() {
+        // A sticky shared `.Trash` whose per-user directory cannot be created
+        // (read-only, so mkdir fails with EROFS/EACCES) must fall back to
+        // `.Trash-<uid>` *and* report why, instead of silently degrading.
+        use std::os::unix::fs::PermissionsExt;
+        let fixture = tempfile::tempdir().unwrap();
+        let top = open_dir(fixture.path());
+        let shared = fixture.path().join(".Trash");
+        std::fs::create_dir(&shared).unwrap();
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o1755)).unwrap();
+        let shared_fd = open_dir(&shared);
+
+        // Positive control: a usable shared trash yields no warning.
+        let (_, warning) = match shared_trash_entry(&top).unwrap() {
+            Some((_dir, warning)) => ((), warning),
+            None => panic!("a sticky shared trash must be detected"),
+        };
+        assert!(warning.is_none(), "usable shared trash must not warn");
+
+        // The positive control above created the per-user directory; remove it so
+        // the fallback path actually has to create one.
+        drop(shared_fd);
+        std::fs::remove_dir_all(shared.join(effective_uid().to_string())).unwrap();
+        // Now make creation impossible while keeping the sticky bit, so the shared
+        // trash is still "present" rather than skipped as absent.
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o1555)).unwrap();
+        let outcome = shared_trash_entry(&top);
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o1755)).unwrap();
+        let (_, warning) = match outcome.unwrap() {
+            Some((_dir, warning)) => ((), warning),
+            None => panic!("shared trash still exists under a read-only mode"),
+        };
+        let warning = warning.expect("an unusable shared trash must report a reason");
+        assert!(
+            warning.contains("shared trash unusable"),
+            "unexpected warning: {warning}"
+        );
+        assert!(
+            warning.contains(".Trash-"),
+            "warning should name the fallback: {warning}"
+        );
+    }
+
+    #[test]
+    fn batch_records_a_resolver_warning_on_the_successful_path() {
+        // A resolver that reports a degraded destination must have that note
+        // carried onto the result instead of being dropped.
+        let fixture = tempfile::tempdir().unwrap();
+        let source = fixture.path().join("source");
+        fs::write(&source, "payload").unwrap();
+        let trash = fixture.path().join("Trash");
+        std::fs::create_dir_all(trash.join("files")).unwrap();
+        std::fs::create_dir_all(trash.join("info")).unwrap();
+        for dir in [&trash, &trash.join("files"), &trash.join("info")] {
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let resolve = |parent: &File| {
+            Ok((
+                private_directory(parent, Path::new("Trash"))?,
+                None,
+                Some("degraded destination for test".to_string()),
+            ))
+        };
+        let result = trash_with_destination_impl(
+            &[&source],
+            |_, _| Ok(()),
+            resolve,
+            fs::read("/proc/self/mountinfo"),
+            protected_dir_identities(),
+        );
+        assert!(result.failed.is_empty(), "{:?}", result.failed);
+        assert_eq!(result.succeeded.len(), 1);
+        assert_eq!(result.warnings.len(), 1);
+        assert!(result.warnings[0].1.contains("degraded destination"));
+    }
+
+    #[test]
+    fn note_combination_covers_every_pair() {
+        // Both notes, each alone, and a failed move (which drops the destination
+        // note, since it only describes where a successful move would have gone).
+        let both = combine_notes(
+            Ok(Some("not durable".to_string())),
+            Some("degraded".to_string()),
+        )
+        .unwrap();
+        assert_eq!(both.as_deref(), Some("degraded; not durable"));
+
+        let durability_only = combine_notes(Ok(Some("not durable".to_string())), None).unwrap();
+        assert_eq!(durability_only.as_deref(), Some("not durable"));
+
+        let destination_only = combine_notes(Ok(None), Some("degraded".to_string())).unwrap();
+        assert_eq!(destination_only.as_deref(), Some("degraded"));
+
+        let neither = combine_notes(Ok(None), None).unwrap();
+        assert_eq!(neither, None);
+
+        let failed = combine_notes(Err(io::Error::other("boom")), Some("degraded".to_string()));
+        assert!(failed.is_err(), "a failed move must stay an error");
+    }
+
+    #[test]
+    fn degraded_destination_and_durability_notes_are_both_reported() {
+        // Both facts matter and neither implies the other: the destination is
+        // degraded *and* the move is not durable. A single note is a partial
+        // account, so the batch keeps both.
+        use std::os::unix::fs::PermissionsExt;
+        let fixture = tempfile::tempdir().unwrap();
+        let source_dir = fixture.path().join("writeonly");
+        fs::create_dir(&source_dir).unwrap();
+        let source = source_dir.join("victim.txt");
+        fs::write(&source, "payload").unwrap();
+        let trash = fixture.path().join("Trash");
+        std::fs::create_dir_all(trash.join("files")).unwrap();
+        std::fs::create_dir_all(trash.join("info")).unwrap();
+        for dir in [&trash, &trash.join("files"), &trash.join("info")] {
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        std::fs::set_permissions(&source_dir, std::fs::Permissions::from_mode(0o300)).unwrap();
+        let result = trash_with_destination_impl(
+            &[&source],
+            |_, _| Ok(()),
+            |parent| {
+                Ok((
+                    private_directory(parent, Path::new("Trash"))?,
+                    None,
+                    Some("degraded destination for test".to_string()),
+                ))
+            },
+            fs::read("/proc/self/mountinfo"),
+            protected_dir_identities(),
+        );
+        std::fs::set_permissions(&source_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        assert!(result.failed.is_empty(), "{:?}", result.failed);
+        assert_eq!(result.succeeded.len(), 1, "the move did happen");
+        let note = &result.warnings[0].1;
+        assert!(note.contains("degraded destination"), "{note}");
+        assert!(note.contains("removal from the source"), "{note}");
+    }
+
+    #[test]
+    fn failed_move_removes_its_durable_metadata_entry() {
+        // The `.trashinfo` creation is flushed before the rename, so the cleanup
+        // that follows a failed rename must leave no entry behind at all. If the
+        // removal were not flushed a crash could resurrect metadata for a payload
+        // that never moved, so what matters is that the name is gone.
+        let fixture = tempfile::tempdir().unwrap();
+        let trash = fixture.path().join("Trash");
+        std::fs::create_dir_all(trash.join("files")).unwrap();
+        std::fs::create_dir_all(trash.join("info")).unwrap();
+        let source = fixture.path().join("source");
+        fs::write(&source, "payload").unwrap();
+        let trash_fd = open_dir(&trash);
+        let (parent, name, target) = prepare_target_with_mount_roots(
+            &source,
+            &read_mount_roots().unwrap(),
+            &protected_dir_identities(),
+        )
+        .unwrap();
+
+        // Fail after the metadata write: the target disappears mid-walk.
+        let error = move_verified_with_hook(
+            &parent,
+            &name,
+            &target,
+            &trash_fd,
+            &source,
+            |phase, _, _| {
+                if phase == MovePhase::MetadataSynced {
+                    fs::remove_file(&source).unwrap();
+                }
+            },
+        )
+        .unwrap_err();
+        assert!(!error.to_string().is_empty());
+        let info_entries = std::fs::read_dir(trash.join("info"))
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .count();
+        assert_eq!(
+            info_entries, 0,
+            "a failed move must not leave an info entry behind"
+        );
+    }
+
+    #[test]
+    fn cached_destination_keeps_its_warning_for_later_items() {
+        // The warning is cached with the destination, so a second item on the
+        // same mount still reports it after taking the Occupied branch.
+        use std::os::unix::fs::PermissionsExt;
+        let fixture = tempfile::tempdir().unwrap();
+        let first = fixture.path().join("a.txt");
+        let second = fixture.path().join("b.txt");
+        fs::write(&first, "1").unwrap();
+        fs::write(&second, "2").unwrap();
+        let trash = fixture.path().join("Trash");
+        std::fs::create_dir_all(trash.join("files")).unwrap();
+        std::fs::create_dir_all(trash.join("info")).unwrap();
+        for dir in [&trash, &trash.join("files"), &trash.join("info")] {
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let mut resolutions = 0;
+        let result = trash_with_destination_impl(
+            &[&first, &second],
+            |_, _| Ok(()),
+            |parent| {
+                resolutions += 1;
+                Ok((
+                    private_directory(parent, Path::new("Trash"))?,
+                    None,
+                    Some("degraded destination for test".to_string()),
+                ))
+            },
+            fs::read("/proc/self/mountinfo"),
+            protected_dir_identities(),
+        );
+        assert!(result.failed.is_empty(), "{:?}", result.failed);
+        assert_eq!(result.succeeded.len(), 2);
+        assert_eq!(resolutions, 1, "the destination must be resolved once");
+        assert_eq!(
+            result.warnings.len(),
+            2,
+            "both items reuse the degraded destination and must both report it"
+        );
+    }
+
+    #[test]
+    fn moved_item_with_an_unsyncable_parent_is_reported_as_moved() {
+        // A directory can allow the rename (write+execute) while refusing the
+        // readable reopen fsync needs. The move really happened, so it must be
+        // reported as succeeded with a warning: putting it in `failed` would leave
+        // the absent source visible in the tree and invite a pointless retry.
+        use std::os::unix::fs::PermissionsExt;
+        let fixture = tempfile::tempdir().unwrap();
+        let source_dir = fixture.path().join("writeonly");
+        fs::create_dir(&source_dir).unwrap();
+        let source = source_dir.join("victim.txt");
+        fs::write(&source, "payload").unwrap();
+        let trash = fixture.path().join("Trash");
+        std::fs::create_dir_all(trash.join("files")).unwrap();
+        std::fs::create_dir_all(trash.join("info")).unwrap();
+        for dir in [&trash, &trash.join("files"), &trash.join("info")] {
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let (parent, name, target) = prepare_target_with_mount_roots(
+            &source,
+            &read_mount_roots().unwrap(),
+            &protected_dir_identities(),
+        )
+        .unwrap();
+        let trash_fd = open_dir(&trash);
+
+        // 0300: rename out is permitted, O_RDONLY reopen is not.
+        std::fs::set_permissions(&source_dir, std::fs::Permissions::from_mode(0o300)).unwrap();
+        let moved =
+            move_verified_with_hook(&parent, &name, &target, &trash_fd, &source, |_, _, _| {});
+        std::fs::set_permissions(&source_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        // Succeeded (no Err), carrying the durability note instead.
+        let note = moved.expect("an unsyncable source must not be reported as a failed move");
+        let described = note.unwrap_or_default();
+        assert!(
+            described.contains("removal from the source"),
+            "expected a source-durability warning, got {described:?}"
+        );
+        assert!(!source.exists(), "the payload must have moved");
+    }
+
+    #[test]
+    fn every_post_move_directory_is_flushed_even_after_a_failure() {
+        // The source flush can fail on a write-only directory. That must not stop
+        // the arrival flush, or the payload could vanish while being reported as
+        // moved. Record every stage the flush attempts.
+        let fixture = tempfile::tempdir().unwrap();
+        let first = File::open(fixture.path()).unwrap();
+        let second = File::open(fixture.path()).unwrap();
+        let attempted = std::cell::RefCell::new(Vec::new());
+        let warning = flush_after_move(
+            |stage, _directory| {
+                attempted.borrow_mut().push(stage.to_string());
+                match stage {
+                    "removal from the source" => Err("source boom".to_string()),
+                    _ => Ok(()),
+                }
+            },
+            [
+                ("removal from the source", &first),
+                ("arrival in the trash", &second),
+            ],
+        );
+        assert_eq!(
+            attempted.into_inner(),
+            vec!["removal from the source", "arrival in the trash"],
+            "both directories must be flushed"
+        );
+        assert_eq!(warning.as_deref(), Some("source boom"));
+    }
+
+    #[test]
+    fn the_first_shortfall_supplies_the_message() {
+        // Two failures: the message names the first, since that is the one a
+        // reader can act on and the second would be a less useful repetition.
+        let fixture = tempfile::tempdir().unwrap();
+        let first = File::open(fixture.path()).unwrap();
+        let second = File::open(fixture.path()).unwrap();
+        let warning = flush_after_move(
+            |stage, _directory| Err(format!("{stage} boom")),
+            [
+                ("removal from the source", &first),
+                ("arrival in the trash", &second),
+            ],
+        );
+        assert_eq!(warning.as_deref(), Some("removal from the source boom"));
+    }
+
+    #[test]
+    fn clean_flush_reports_no_warning() {
+        let fixture = tempfile::tempdir().unwrap();
+        let first = File::open(fixture.path()).unwrap();
+        let second = File::open(fixture.path()).unwrap();
+        let warning = flush_after_move(
+            |_, _| Ok(()),
+            [
+                ("removal from the source", &first),
+                ("arrival in the trash", &second),
+            ],
+        );
+        assert!(warning.is_none());
+    }
+
+    #[test]
+    fn durability_warning_states_that_the_move_already_happened() {
+        // The wording matters: a durability shortfall is a warning, so it must
+        // lead with the fact that the entry moved rather than read as a failure.
+        let message = durability_warning("arrival in the trash", io::Error::other("boom"));
+        assert!(message.starts_with("moved"), "{message}");
+        assert!(message.contains("arrival in the trash"), "{message}");
+        assert!(message.contains("boom"), "{message}");
+        assert!(message.contains("not guaranteed"), "{message}");
     }
 }
