@@ -622,21 +622,37 @@ fn move_prepared_with_hook(
         return moved.map(|_| None);
     }
 
-    // The payload is in the trash. Everything below only strengthens durability,
-    // so a shortfall here becomes a warning: reporting it as a failure would keep
-    // the already-moved source visible in the tree and invite a pointless retry.
+    // The payload is in the trash. Both directories are flushed regardless of
+    // whether the other failed: a source-side shortfall must not stop the arrival
+    // from being made durable, or the payload could vanish while being reported as
+    // moved. The first shortfall supplies the message.
+    Ok(flush_after_move(
+        |stage, directory| {
+            sync_directory(directory).map_err(|error| durability_warning(stage, error))
+        },
+        [
+            ("removal from the source", parent),
+            ("arrival in the trash", files),
+        ],
+    ))
+}
+
+/// Flushes every directory after a completed move, keeping the first shortfall.
+///
+/// Split out so the "try every directory" property is directly testable: a
+/// guard that stopped after the first failure would silently skip making the
+/// payload's arrival durable.
+fn flush_after_move<'a>(
+    flush: impl Fn(&str, &'a File) -> Result<(), String>,
+    stages: [(&'a str, &'a File); 2],
+) -> Option<String> {
     let mut warning = None;
-    for (stage, directory) in [
-        ("removal from the source", parent),
-        ("arrival in the trash", files),
-    ] {
-        if warning.is_none() {
-            if let Err(error) = sync_directory(directory) {
-                warning = Some(durability_warning(stage, error));
-            }
+    for (stage, directory) in stages {
+        if let Err(message) = flush(stage, directory) {
+            warning.get_or_insert(message);
         }
     }
-    Ok(warning)
+    warning
 }
 
 #[cfg(test)]
@@ -1899,6 +1915,68 @@ mod coverage_tests {
             "expected a source-durability warning, got {described:?}"
         );
         assert!(!source.exists(), "the payload must have moved");
+    }
+
+    #[test]
+    fn every_post_move_directory_is_flushed_even_after_a_failure() {
+        // The source flush can fail on a write-only directory. That must not stop
+        // the arrival flush, or the payload could vanish while being reported as
+        // moved. Record every stage the flush attempts.
+        let fixture = tempfile::tempdir().unwrap();
+        let first = File::open(fixture.path()).unwrap();
+        let second = File::open(fixture.path()).unwrap();
+        let attempted = std::cell::RefCell::new(Vec::new());
+        let warning = flush_after_move(
+            |stage, _directory| {
+                attempted.borrow_mut().push(stage.to_string());
+                match stage {
+                    "removal from the source" => Err("source boom".to_string()),
+                    _ => Ok(()),
+                }
+            },
+            [
+                ("removal from the source", &first),
+                ("arrival in the trash", &second),
+            ],
+        );
+        assert_eq!(
+            attempted.into_inner(),
+            vec!["removal from the source", "arrival in the trash"],
+            "both directories must be flushed"
+        );
+        assert_eq!(warning.as_deref(), Some("source boom"));
+    }
+
+    #[test]
+    fn the_first_shortfall_supplies_the_message() {
+        // Two failures: the message names the first, since that is the one a
+        // reader can act on and the second would be a less useful repetition.
+        let fixture = tempfile::tempdir().unwrap();
+        let first = File::open(fixture.path()).unwrap();
+        let second = File::open(fixture.path()).unwrap();
+        let warning = flush_after_move(
+            |stage, _directory| Err(format!("{stage} boom")),
+            [
+                ("removal from the source", &first),
+                ("arrival in the trash", &second),
+            ],
+        );
+        assert_eq!(warning.as_deref(), Some("removal from the source boom"));
+    }
+
+    #[test]
+    fn clean_flush_reports_no_warning() {
+        let fixture = tempfile::tempdir().unwrap();
+        let first = File::open(fixture.path()).unwrap();
+        let second = File::open(fixture.path()).unwrap();
+        let warning = flush_after_move(
+            |_, _| Ok(()),
+            [
+                ("removal from the source", &first),
+                ("arrival in the trash", &second),
+            ],
+        );
+        assert!(warning.is_none());
     }
 
     #[test]
