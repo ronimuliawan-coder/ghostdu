@@ -59,7 +59,17 @@ if grep -qiE '\b(qodo|coderabbit|cubic|macroscope|greptile|copilot|sourcery|code
 fi
 
 # --- 4. No attribution trailers ---------------------------------------------
-if grep -qiE '^[[:space:]]*(co-authored-by|co-developed-by|generated-by|assisted-by|signed-off-by)[[:space:]]*:' "$msg_file"; then
+# One narrow carve-out: Dependabot's machine sign-off on dependency commits.
+# GitHub attributes contributions from the commit author and `Co-authored-by:`
+# trailers only, so a `Signed-off-by:` from that bot cannot alter the human
+# contributor list -- the interest this rule exists to protect. The trailer also
+# cannot be removed without rewriting the dependency branch. The allowance is the
+# exact line below and nothing wider: a different address, an extra word, or any
+# other trailer keeps the message rejected.
+attribution_allow='^[[:space:]]*signed-off-by:[[:space:]]*dependabot\[bot\][[:space:]]*<support@github\.com>[[:space:]]*$'
+stripped="$(tr -d '\r' < "$msg_file" | grep -viE "$attribution_allow" || true)"
+if printf '%s\n' "$stripped" \
+   | grep -qiE '^[[:space:]]*(co-authored-by|co-developed-by|generated-by|assisted-by|signed-off-by)[[:space:]]*:'; then
   fail "message carries an attribution trailer; the contributor list is the set of human owners"
 fi
 
