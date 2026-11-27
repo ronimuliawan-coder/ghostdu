@@ -15,12 +15,13 @@ request as the change. See `docs/QA.md` §6.
 
 ## [Unreleased]
 
-Nothing yet. `main` and `dev` are at the `v0.1.1` release plus the deletion-path work described
-below, which has not been tagged.
+Merged to `main` after the `v0.1.1` release and not yet tagged. The next tag will be the first to
+exercise the release workflow's `verify` job and `download-artifact@v8` through the publish path.
 
 ### Added
 
-- A QA and manual-verification guide at `docs/QA.md`, and this changelog.
+- A manual verification guide at `docs/QA.md`, and this changelog. (`docs/` is excluded from git in
+  this repository, so the guide is a local document; this changelog is tracked.)
 
 ### Fixed
 
