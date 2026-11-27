@@ -137,17 +137,18 @@ fn trash_status_message(
     first_failure: Option<&str>,
     warning: Option<&str>,
 ) -> String {
+    // A note can belong to moves that *did* succeed, so a batch that also has
+    // failures must still report it; otherwise a degraded destination is hidden
+    // for exactly the runs the user is most likely to inspect.
+    let note = match warning {
+        Some(note) => format!(" — {note}"),
+        None => String::new(),
+    };
     if failed > 0 {
         let reason = first_failure.unwrap_or("unknown error");
-        return format!("Moved {moved} to wastebin, {failed} failed: {reason}");
+        return format!("Moved {moved} to wastebin, {failed} failed: {reason}{note}");
     }
-    // A successful move can still carry a note, e.g. the shared trash was
-    // unusable and the per-user one was used instead. Surface it rather than
-    // silently accepting a degraded destination.
-    match warning {
-        Some(note) => format!("✔ Moved {moved} items to Wastebin — {note}"),
-        None => format!("✔ Moved {moved} items to Wastebin"),
-    }
+    format!("✔ Moved {moved} items to Wastebin{note}")
 }
 
 #[derive(Debug)]
@@ -2195,9 +2196,25 @@ mod trash_status_tests {
     }
 
     #[test]
-    fn failure_takes_precedence_and_names_the_reason() {
+    fn failure_names_the_reason_and_still_surfaces_the_warning() {
+        // The warning belongs to moves that succeeded, so a mixed batch must
+        // report both: hiding the note would conceal a degraded destination in
+        // exactly the runs a user is most likely to look at.
         assert_eq!(
-            trash_status_message(1, 2, Some("permission denied"), Some("ignored note")),
+            trash_status_message(
+                1,
+                2,
+                Some("permission denied"),
+                Some("shared trash unusable")
+            ),
+            "Moved 1 to wastebin, 2 failed: permission denied — shared trash unusable"
+        );
+    }
+
+    #[test]
+    fn failure_without_a_warning_reads_cleanly() {
+        assert_eq!(
+            trash_status_message(1, 2, Some("permission denied"), None),
             "Moved 1 to wastebin, 2 failed: permission denied"
         );
     }
