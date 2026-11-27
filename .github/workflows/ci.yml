@@ -2,9 +2,18 @@ name: CI
 
 on:
   push:
+    # Release branches only. `dev` is fast-forwarded from `main` after every
+    # promotion, so a push-triggered run there would re-test an identical tree
+    # that this trigger already covered on `main`. Feature branches are covered
+    # by the pull-request trigger below.
     branches: [ "main", "master" ]
-  pull_request:
-    branches: [ "main", "master" ]
+  # Every pull request is checked, whatever its base. Filtering on the base
+  # branch previously skipped the documented flow entirely: `docs/GIT_WORKFLOW.md`
+  # sends feature and fix branches to `dev`, and those pull requests reported no
+  # checks at all, so two of them had to be retargeted at `main` just to obtain a
+  # CI result. The filter is intentionally omitted rather than extended, so a
+  # stacked or otherwise unusual base is covered too.
+  pull_request: {}
 
 # Least privilege: both jobs only read the repo, and nothing keeps git
 # credentials while untrusted dependency build scripts and the test-run
